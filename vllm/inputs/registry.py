@@ -5,7 +5,8 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, Mapping, NamedTuple,
                     Optional, Protocol, Type, cast)
 
 from torch import nn
-from transformers import PretrainedConfig, ProcessorMixin
+from transformers.configuration_utils import PretrainedConfig
+from transformers.processing_utils import ProcessorMixin
 from typing_extensions import TypeVar, assert_never
 
 from vllm.logger import init_logger

@@ -32,6 +32,8 @@ def get_model_architecture(
             and "MixtralForCausalLM" in architectures):
         architectures = ["QuantMixtralForCausalLM"]
 
+    if True:
+        architectures = ["TransformersModel"]
     return ModelRegistry.resolve_model_cls(architectures)
 
 
