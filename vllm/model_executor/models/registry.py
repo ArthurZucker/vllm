@@ -132,6 +132,7 @@ _VLLM_MODELS = {
     **_EMBEDDING_MODELS,
     **_MULTIMODAL_MODELS,
     **_SPECULATIVE_DECODING_MODELS,
+    "TransformersModel": ("transformers", "AutoModelForCausalLM")
 }
 
 # Models not supported by ROCm.
