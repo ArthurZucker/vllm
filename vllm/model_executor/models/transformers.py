@@ -70,6 +70,9 @@ def vllm_flash_attention_forward(
 modeling_flash_attention_utils._flash_attention_forward = vllm_flash_attention_forward
 generic.KwargsForCausalLM = VllmKwargsForCausalLM
 
+# TODO, LLAMA_ATTENTION_FUNCTION would be the best place to put this
+# TODO, should we also add a VllmCacheClass? Because otherwise the DynamicCache initiated by default is used
+# and we have to set `use_cache=False` while we are actually using it
 
 class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
     def __init__(
