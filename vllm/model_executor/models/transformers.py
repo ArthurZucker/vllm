@@ -96,7 +96,7 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
         self.attention_interface = Attention(
             config.num_attention_heads,
             config.head_dim,
-            1.0,
+            config.head_dim**-0.5,
             num_kv_heads=config.num_key_value_heads,
             cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
