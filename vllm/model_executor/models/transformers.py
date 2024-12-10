@@ -34,7 +34,7 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, make_empty_intermediate_tensors_factory,
                     maybe_prefix)
 
-
+from torch.nn.parameter import Parameter, UninitializedParameter
 
 
 from transformers.models.auto import AutoModel
@@ -143,8 +143,21 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
             softmax=False)
 
     def _init_model(self, vllm_config, prefix: str = ""):
-        return AutoModel.from_config(vllm_config)
+        model = AutoModel.from_config(vllm_config)
+        # if get_pp_group().is_last_rank:
+        #     # Detect the accelerator on the machine. If no accelerator is available, it returns CPU.
+        #     device_type = torch._C._get_accelerator().type
+        #     device_module = torch.get_device_module(device_type)
+        #     # Get device with index assuming equal number of devices per host
+        #     tp_device = torch.device(device_type, torch.distributed.get_rank() % device_module.device_count())
+        #     world_size = torch.distributed.get_world_size()
+        #     device_mesh = torch.distributed.init_device_mesh(tp_device.type, (world_size,))
+        #     # Apply Tensor Parallelism
+        #     model.tensor_parallel(device_mesh)
+        return model
     
+
+
     def _autoset_attn_implementation(self, config,
         use_flash_attention_2: bool = False,
         torch_dtype: Optional[torch.dtype] = None,
@@ -163,7 +176,7 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         model_output = self.model(
-            input_ids[None,...], position_ids=positions[None,...], kv_caches=kv_caches, attn_metadata=attn_metadata, intermediate_tensors=intermediate_tensors, attention_interface = self.attention_interface, return_dict=False
+            input_ids[None,...], use_cache=False, position_ids=positions[None,...], kv_caches=kv_caches, attn_metadata=attn_metadata, intermediate_tensors=intermediate_tensors, attention_interface = self.attention_interface.forward, return_dict=False
         )[0][0,...] # we remove batch dimension for now
         return model_output
 
@@ -195,6 +208,29 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
         self.model.load_kv_cache_scales(quantization_param_path)
 
 
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        output_dim = getattr(param, "output_dim", None)
+        if isinstance(param, UninitializedParameter):
+            shape = list(loaded_weight.shape)
+            if output_dim is not None:
+                shape[output_dim] = shape[output_dim] // self.tp_size
+            param.materialize(tuple(shape), dtype=loaded_weight.dtype)
+        return param
+    
     def load_weights(self, weights):
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        params_dict = dict(self.named_parameters())
+        loaded_params = set()
+        for name, loaded_weight in weights:            
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    # Materialize GGUF UninitializedParameter
+            if isinstance(param, UninitializedParameter):
+                param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            # Load the weight into the parameter
+            try:
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+            except Exception as e:
+                print(f"Error loading weight for parameter '{name}': {e}")
+                loaded_params.add(name)
+        return loaded_params
