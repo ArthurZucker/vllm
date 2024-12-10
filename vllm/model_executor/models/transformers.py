@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The vLLM team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,18 +19,23 @@ import torch
 from torch import nn
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import (get_pp_group)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
+from vllm.model_executor.layers.pooler import Pooler, PoolingType
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
-from .utils import (is_pp_missing_parameter,
-                    make_empty_intermediate_tensors_factory, make_layers,
+from .utils import (PPMissingLayer, make_empty_intermediate_tensors_factory,
                     maybe_prefix)
+
+
+
 
 from transformers.models.auto import AutoModel
 from transformers.utils import generic  
@@ -64,7 +68,8 @@ def vllm_flash_attention_forward(
         layer_idx=0,
         **kwargs
     ):
-    return attention_interface(query.reshape(8192,-1), key.reshape(8192,-1), value.reshape(8192,-1), kv_cache=kv_caches[layer_idx],attn_metadata=attn_metadata)
+    hidden = query.shape[1]
+    return attention_interface(query.reshape(hidden,-1), key.reshape(hidden,-1), value.reshape(hidden,-1), kv_cache=kv_caches[layer_idx],attn_metadata=attn_metadata)
     return attention_interface(query, key, value, kv_caches[layer_idx], attn_metadata=attn_metadata)
 
 modeling_flash_attention_utils._flash_attention_forward = vllm_flash_attention_forward
@@ -77,36 +82,68 @@ generic.KwargsForCausalLM = VllmKwargsForCausalLM
 class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
     def __init__(
         self,
-        config,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        lora_config: Optional[LoRAConfig] = None,
+        *, vllm_config, prefix: str = ""
     ) -> None:
         super().__init__()
-
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
+        pooler_config = vllm_config.model_config.pooler_config
         self.config = config
         self.lora_config = lora_config
+
         self.attention_interface = Attention(
             getattr(config, "num_attention_heads", 16),
             config.head_dim,
             1.0,
             num_kv_heads=config.num_key_value_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
         )
         config._attn_implementation_internal="flash_attention_2"
-        self.model = AutoModel.from_config(config)
 
+
+        self.model = self._init_model(vllm_config=config, prefix=prefix)
         if get_pp_group().is_last_rank:
+            self.unpadded_vocab_size = config.vocab_size
+            if lora_config:
+                self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+            self.lm_head = ParallelLMHead(
+                self.unpadded_vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                padding_size=(
+                    DEFAULT_VOCAB_PADDING_SIZE
+                    # We need bigger padding if using lora for kernel
+                    # compatibility
+                    if not lora_config else
+                    lora_config.lora_vocab_padding_size),
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if config.tie_word_embeddings:
+                self.lm_head = self.lm_head.tie_weights(
+                    self.model.embed_tokens)
+
             logit_scale = getattr(config, "logit_scale", 1.0)
-            self.logits_processor = LogitsProcessor(config.vocab_size,
+            self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                     config.vocab_size,
                                                     logit_scale)
-            self.sampler = Sampler()
+            self.sampler = get_sampler()
+        else:
+            self.lm_head = PPMissingLayer()
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        self._pooler = Pooler.from_config_with_defaults(
+            pooler_config,
+            pooling_type=PoolingType.STEP,
+            normalize=False,
+            softmax=False)
 
+    def _init_model(self, vllm_config, prefix: str = ""):
+        return AutoModel.from_config(vllm_config)
+    
     def _autoset_attn_implementation(self, config,
         use_flash_attention_2: bool = False,
         torch_dtype: Optional[torch.dtype] = None,
@@ -134,12 +171,22 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.model.embed_tokens, hidden_states,
+        logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
 
+    def pooler(
+        self,
+        hidden_states: torch.Tensor,
+        pooling_metadata,
+    ):
+        logits = self.compute_logits(hidden_states, None)
+        return self._pooler(logits, pooling_metadata)
+
+
     def sample(self, logits: torch.Tensor,
                sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
+
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
@@ -148,4 +195,22 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
 
 
     def load_weights(self, weights):
-            return set([w[0] for w in weights])
+        params_dict = dict(self.named_parameters())
+        loaded_params = set()
+        for name, loaded_weight in weights:
+            # weight_loader = default_weight_loader
+            # # Skip loading extra bias for GPTQ models.
+            # if name.endswith(".bias") and name not in params_dict:
+            #     continue
+            # if name is None:
+            #     continue
+
+
+            # if is_pp_missing_parameter(name, self):
+            #     continue
+            
+            # param = params_dict["model."+name]
+            # weight_loader(param, loaded_weight)
+            # loaded_params.add("model."+name)
+            loaded_params.add(name)
+        return loaded_params
