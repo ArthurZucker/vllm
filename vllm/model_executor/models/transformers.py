@@ -31,7 +31,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
-from .utils import (PPMissingLayer, make_empty_intermediate_tensors_factory,
+from .utils import (AutoWeightsLoader, PPMissingLayer, make_empty_intermediate_tensors_factory,
                     maybe_prefix)
 
 
@@ -70,7 +70,6 @@ def vllm_flash_attention_forward(
     ):
     hidden = query.shape[1]
     return attention_interface(query.reshape(hidden,-1), key.reshape(hidden,-1), value.reshape(hidden,-1), kv_cache=kv_caches[layer_idx],attn_metadata=attn_metadata)
-    return attention_interface(query, key, value, kv_caches[layer_idx], attn_metadata=attn_metadata)
 
 modeling_flash_attention_utils._flash_attention_forward = vllm_flash_attention_forward
 generic.KwargsForCausalLM = VllmKwargsForCausalLM
@@ -95,7 +94,7 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
         self.lora_config = lora_config
 
         self.attention_interface = Attention(
-            getattr(config, "num_attention_heads", 16),
+            config.num_attention_heads,
             config.head_dim,
             1.0,
             num_kv_heads=config.num_key_value_heads,
@@ -165,7 +164,7 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         model_output = self.model(
             input_ids[None,...], position_ids=positions[None,...], kv_caches=kv_caches, attn_metadata=attn_metadata, intermediate_tensors=intermediate_tensors, attention_interface = self.attention_interface, return_dict=False
-        )[0][0,...]
+        )[0][0,...] # we remove batch dimension for now
         return model_output
 
     def compute_logits(
@@ -197,22 +196,5 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
 
 
     def load_weights(self, weights):
-        params_dict = dict(self.named_parameters())
-        loaded_params = set()
-        for name, loaded_weight in weights:
-            # weight_loader = default_weight_loader
-            # # Skip loading extra bias for GPTQ models.
-            # if name.endswith(".bias") and name not in params_dict:
-            #     continue
-            # if name is None:
-            #     continue
-
-
-            # if is_pp_missing_parameter(name, self):
-            #     continue
-            
-            # param = params_dict["model."+name]
-            # weight_loader(param, loaded_weight)
-            # loaded_params.add("model."+name)
-            loaded_params.add(name)
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
