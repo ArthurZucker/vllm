@@ -80,6 +80,8 @@ generic.KwargsForCausalLM = VllmKwargsForCausalLM
 # and we have to set `use_cache=False` while we are actually using it
 
 class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
+    embedding_padding_modules = ["lm_head"]
+
     def __init__(
         self,
         *, vllm_config, prefix: str = ""
@@ -163,7 +165,7 @@ class TransformersModel(nn.Module, SupportsLoRA, SupportsPP):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         model_output = self.model(
             input_ids[None,...], position_ids=positions[None,...], kv_caches=kv_caches, attn_metadata=attn_metadata, intermediate_tensors=intermediate_tensors, attention_interface = self.attention_interface, return_dict=False
-        )[0]
+        )[0][0,...]
         return model_output
 
     def compute_logits(
