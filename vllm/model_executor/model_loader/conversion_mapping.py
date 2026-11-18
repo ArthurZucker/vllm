@@ -2,18 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """How each model's checkpoint becomes its params: Transformers `WeightTransform`s.
 
-One explicit list per model, keyed by its vLLM class name (or HF `model_type`), like
-`transformers.conversion_mapping`. A `WeightRenaming` renames keys, a `WeightConverter`
-runs Transformers ops on them. A pattern without a param suffix (`self_attn.q_proj`)
-takes all of that module's tensors (weight, bias, scales), each into its own target
-(`qkv_proj.weight`, `qkv_proj.weight_scale`, ...).
+One explicit list per architecture, like `transformers.conversion_mapping`. Renamings
+apply in order, then at most one converter: the first whose source matches. A pattern
+without a param suffix (`.q_proj`) takes all of that module's tensors (weight, bias,
+scales), each into its own target (`.qkv_proj.weight`, `.qkv_proj.weight_scale`, ...).
 
 Tensor parallelism is not written here: every source is sharded on read, as its
-target param is (see `ops_loader.VllmShard`), before the ops run.
+target param is (`ops_loader.VllmShard`), before the ops run.
 
-To add a model: copy the closest entry, run it, read the "match no param" warning.
+To add a model: copy the closest entry, load it, read the "matching no param" warning.
 """
 
+import os
+from copy import deepcopy
+
+from torch import nn
 from transformers.core_model_loading import (
     Concatenate,
     MergeModulelist,
@@ -25,96 +28,2732 @@ from transformers.core_model_loading import (
 from vllm.model_executor.model_loader.weight_ops import OutputConcatenate
 
 
-def fused_attention(prefix: str = "self_attn") -> list[WeightTransform]:
-    return [
-        WeightConverter(
-            [f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"],
-            f"{prefix}.qkv_proj",
-            operations=[OutputConcatenate()],
+def rename(pattern: str, new: str) -> WeightRenaming:
+    return WeightRenaming(pattern, new)
+
+
+def drop(pattern: str) -> WeightRenaming:
+    """A checkpoint tensor the model does not load"""
+    return WeightRenaming(pattern, "_dropped_")
+
+
+def fused(target: str, *sources: str) -> WeightConverter:
+    """`sources` concatenated into the fused `target`, in its shard order"""
+    return WeightConverter(list(sources), target, operations=[OutputConcatenate()])
+
+
+# What experts keep per expert, each into its own fused param
+EXPERT_TENSORS = (
+    "weight",
+    "input_scale",
+    "qweight",
+    "qzeros",
+    "scales",
+    "g_idx",
+    "bias",
+)
+
+
+def experts(*names: str) -> list[WeightTransform]:
+    """Per-expert checkpoint tensors (`names`: gate, up, down; default both standard
+    sets) into the fused experts' `w13_*` / `w2_*` params, which vLLM's `FusedMoE`
+    keeps in its `routed_experts`. A `.weight` pattern also takes the scales named
+    after it (`weight_scale`, `weight_scale_inv`, ...)."""
+    if not names:
+        return [
+            *experts("gate_proj", "up_proj", "down_proj"),
+            *experts("w1", "w3", "w2"),
+        ]
+    gate, up, down = names
+    out: list[WeightTransform] = []
+    for tensor in EXPERT_TENSORS:
+        out.append(
+            WeightConverter(
+                [f"experts.*.{gate}.{tensor}", f"experts.*.{up}.{tensor}"],
+                f"experts.routed_experts.w13_{tensor}",
+                operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+            )
         )
-    ]
-
-
-def fused_mlp(prefix: str = "mlp") -> list[WeightTransform]:
-    return [
-        WeightConverter(
-            [f"{prefix}.gate_proj", f"{prefix}.up_proj"],
-            f"{prefix}.gate_up_proj",
-            operations=[OutputConcatenate()],
+        out.append(
+            WeightConverter(
+                f"experts.*.{down}.{tensor}",
+                f"experts.routed_experts.w2_{tensor}",
+                operations=[MergeModulelist(dim=0)],
+            )
         )
-    ]
+    return out
 
 
-def experts(
-    prefix: str = "mlp.experts",
-    gate: str = "gate_proj",
-    up: str = "up_proj",
-    down: str = "down_proj",
-) -> list[WeightTransform]:
-    """Per-expert checkpoint tensors into the fused experts' `w13_*` / `w2_*` params
-    (vLLM's `FusedMoE` keeps them in its `routed_experts`)"""
-    return [
-        WeightConverter(
-            [f"{prefix}.*.{gate}.weight", f"{prefix}.*.{up}.weight"],
-            f"{prefix}.routed_experts.w13_weight",
-            operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
-        ),
-        WeightConverter(
-            f"{prefix}.*.{down}.weight",
-            f"{prefix}.routed_experts.w2_weight",
-            operations=[MergeModulelist(dim=0)],
-        ),
-    ]
-
-
-DENSE = [*fused_attention(), *fused_mlp()]
-MOE = [*fused_attention(), *experts()]
+QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
+GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
 _CONVERSION_MAPPING: dict[str, list[WeightTransform]] = {
-    "LlamaForCausalLM": DENSE,
-    "MistralForCausalLM": DENSE,
-    "Qwen2ForCausalLM": DENSE,
-    "Qwen3ForCausalLM": DENSE,
-    "Qwen2MoeForCausalLM": [*MOE, *fused_mlp("mlp.shared_expert")],
-    "Qwen3MoeForCausalLM": MOE,
-    "OlmoeForCausalLM": MOE,
-    "MixtralForCausalLM": [
-        *fused_attention(),
-        *experts("block_sparse_moe.experts", "w1", "w3", "w2"),
+    "AIMv2Model": [
+        fused(".fc13", ".fc1", ".fc3"),
+    ],
+    "AXK1MoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "AXK1Model": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "AfmoeForCausalLM": [
+        rename("\\.router\\.gate\\.weight$", ".gate.weight"),
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "AfmoeMoE": [
+        *experts(),
+    ],
+    "AliceAIForCausalLM": [
+        drop("^mtp\\."),
+    ],
+    "AliceAIModel": [
+        rename("\\.linear_attn\\.a_log_bias", ".linear_attn.A_log"),
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(
+            ".linear_attn.in_proj_qkvgfab",
+            ".linear_attn.q_proj",
+            ".linear_attn.k_proj",
+            ".linear_attn.v_proj",
+            ".linear_attn.b_proj",
+            ".linear_attn.f_a_proj",
+        ),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    "AliceAISparseMoeBlock": [
+        *experts(),
+    ],
+    "Alpamayo2SuperForConditionalGeneration": [
+        rename("^vlm\\.model\\.visual\\.", "visual."),
+        rename("^vlm\\.lm_head\\.", "language_model.lm_head."),
+        rename("^vlm\\.model\\.language_model\\.", "language_model.model."),
+        drop("^expert\\."),
+    ],
+    "ApertusForCausalLM": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "AttentionProgram": [],
+    # TODO: old loader: tensor_ops
+    "BagelForConditionalGeneration": [
+        drop("^vit_pos_embed\\.pos_embed"),
+    ],
+    "BailingMoE": [
+        *experts(),
+    ],
+    "BailingMoeModel": [
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+    ],
+    "BailingMoeV25": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "BailingMoeV25MTPModel": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "BailingMoeV25Model": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "BailingMoeV3ForCausalLM": [
+        rename("\\.attention\\.", ".self_attn."),
+        rename("^attention\\.", "self_attn."),
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+        fused(".qkvb_proj", ".q_proj", ".k_proj", ".v_proj", ".b_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "BailingMoeV3MTPModel": [
+        rename("\\.attention\\.", ".self_attn."),
+        rename("^attention\\.", "self_attn."),
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "BailingMoeV3MoE": [
+        *experts(),
+    ],
+    "BailingMoeV3VLForConditionalGeneration": [
+        rename("\\.attention\\.", ".self_attn."),
+        rename("^attention\\.", "self_attn."),
+        rename("^model\\.visual", "visual"),
+        rename("^model\\.linear_proj", "linear_proj"),
+        rename("^linear_proj\\.0", "linear_proj.linear_fc1"),
+        rename("^linear_proj\\.2", "linear_proj.linear_fc2"),
+        rename("^lm_head", "language_model.lm_head"),
+        rename("^model\\.", "language_model.model."),
+    ],
+    "BeamForCausalLM": [
+        rename("\\.self_attn\\.gate_proj", ".self_attn.output_gate_proj"),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+    ],
+    "BeamModel": [
+        rename("\\.self_attn\\.gate_proj", ".self_attn.output_gate_proj"),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+    ],
+    "BeamSparseMoeBlock": [
+        *experts(),
+    ],
+    "BeeForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^model\\.image_newline", "image_newline"),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "BertEmbeddingModel": [
+        rename("^bert\\.", "model."),
+        rename("^roberta\\.", "model."),
+        rename("^encoder\\.", "model.encoder."),
+        rename("^embeddings\\.", "model.embeddings."),
+    ],
+    "BertForMaskedLM": [
+        drop("cls\\.seq_relationship"),
+        drop("cls\\.predictions\\.decoder\\.bias"),
+        rename(
+            "cls\\.predictions\\.transform\\.LayerNorm\\.gamma",
+            "mlm_head.layer_norm.weight",
+        ),
+        rename(
+            "cls\\.predictions\\.transform\\.LayerNorm\\.beta",
+            "mlm_head.layer_norm.bias",
+        ),
+        rename("cls\\.predictions\\.transform\\.LayerNorm", "mlm_head.layer_norm"),
+        rename("cls\\.predictions\\.transform\\.dense", "mlm_head.dense"),
+        rename("cls\\.predictions\\.decoder", "mlm_head.decoder"),
+        rename("cls\\.predictions\\.bias", "mlm_head.decoder.bias"),
+    ],
+    "BertModel": [
+        rename("LayerNorm\\.gamma", "LayerNorm.weight"),
+        rename("LayerNorm\\.beta", "LayerNorm.bias"),
+        drop("^pooler\\."),
+        fused(".self.qkv_proj", ".self.query", ".self.key", ".self.value"),
+    ],
+    # TODO: mapper replace(BertModel.hf_to_vllm_mapper, orig_to_new_prefix={}) not literal
+    "BertPoolingModel": [],
+    "BertWithRope": [
+        rename("^model\\.", ""),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "BlipVisionModel": [
+        fused(".qkv", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "CLIPEmbeddingModel": [
+        drop("\\.position_ids"),
+    ],
+    "CLIPTextTransformer": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "CLIPVisionTransformer": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "CanaryForConditionalGeneration": [
+        rename(
+            "(decoder\\.layers\\.\\d+\\.\\w+_attn)\\.o_proj\\.", "\\1.out_projection."
+        ),
+        rename("(decoder\\.layers\\.\\d+\\.mlp)\\.fc1\\.", "\\1.dense_in."),
+        rename("(decoder\\.layers\\.\\d+\\.mlp)\\.fc2\\.", "\\1.dense_out."),
+        drop("\\.num_batches_tracked$"),
+        fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    "ChatGLMModel": [
+        rename("\\.word_embeddings", ""),
+    ],
+    "Cohere2Moe": [
+        *experts(),
+    ],
+    "Cohere2MoeForCausalLM": [
+        drop("^lm_head\\."),
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Cohere2VisionForConditionalGeneration": [
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+    ],
+    "CohereASRModel": [
+        fused(
+            ".second_sub_layer.kv_proj",
+            ".second_sub_layer.key_net",
+            ".second_sub_layer.value_net",
+        ),
+        fused(
+            ".first_sub_layer.qkv_proj",
+            ".first_sub_layer.query_net",
+            ".first_sub_layer.key_net",
+            ".first_sub_layer.value_net",
+        ),
+    ],
+    "CohereAsrForConditionalGeneration": [
+        rename("\\.fc1\\.", ".mlp.fc1."),
+        rename("\\.fc2\\.", ".mlp.fc2."),
+        drop("model\\.conv\\.batch_norm\\.num_batches_tracked"),
+        drop("^model\\.preprocessor\\.featurizer\\.fb"),
+        drop("^model\\.preprocessor\\.featurizer\\.window"),
+    ],
+    "CohereCompassForConditionalGeneration": [
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+    ],
+    "CohereForCausalLM": [
+        drop("_quantizer\\."),
+        drop("^lm_head"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Cohere_VisionTransformer": [
+        fused(".qkv.", ".q.", ".k.", ".v."),
+    ],
+    "ColModernVBertForRetrieval": [
+        rename("^model\\.text_model\\.layers\\.", "text_layers."),
+        rename("^model\\.text_model\\.embeddings\\.", "text_embeddings."),
+        rename("^model\\.text_model\\.final_norm\\.", "text_final_norm."),
+        rename("^model\\.connector\\.modality_projection\\.", "connector.proj."),
+        rename("^model\\.custom_text_proj\\.", "custom_text_proj."),
+        rename("^model\\.vision_model\\.vision_model\\.", "vision_model.vision_model."),
+        rename("^model\\.", ""),
+    ],
+    # TODO: old loader: tensor_ops
+    "ColPaliModel": [
+        rename("^vlm\\.vision_tower\\.", "vision_tower."),
+        rename("^vlm\\.language_model\\.", "language_model."),
+        rename("^vlm\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.language_model\\.", "language_model."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    # TODO: old loader: tensor_ops
+    "ColQwen3Model": [
+        rename("^vlm\\.model\\.visual\\.", "visual."),
+        rename("^vlm\\.lm_head\\.", "language_model.lm_head."),
+        rename("^vlm\\.model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.model\\.", "language_model.model."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+    ],
+    # TODO: old loader: tensor_ops
+    "ColQwen3_5Model": [
+        rename("^language_model\\.", "language_model.model."),
+        drop("^mtp\\."),
+    ],
+    "ColUltraVBertForRetrieval": [
+        rename("^vision_model\\.vision_model\\.", "vision_model.vision_model."),
+        rename("^vision_model\\.", "vision_model.vision_model."),
+    ],
+    # TODO: mapper orig_to_new_prefix not literal
+    "Cosmos3EdgeForConditionalGeneration": [
+        drop("_moe_gen"),
+        drop("k_norm_und_for_gen"),
+        drop("\\.add_q_proj\\."),
+        drop("\\.add_k_proj\\."),
+        drop("\\.add_v_proj\\."),
+        drop("\\.to_add_out\\."),
+        drop("\\.norm_added_q\\."),
+        drop("\\.norm_added_k\\."),
+        rename("\\.self_attn\\.to_q\\.", ".self_attn.q_proj."),
+        rename("\\.self_attn\\.to_k\\.", ".self_attn.k_proj."),
+        rename("\\.self_attn\\.to_v\\.", ".self_attn.v_proj."),
+        rename("\\.self_attn\\.to_out\\.", ".self_attn.o_proj."),
+        rename("language_model\\.embeddings", "language_model.embed_tokens"),
+        drop("\\.input_quantizer\\."),
+        drop("\\.weight_quantizer\\."),
+        drop("\\.output_quantizer\\."),
+        fused(".qkv_proj.", ".q_proj.", ".k_proj.", ".v_proj."),
+    ],
+    # TODO: regex with several groups: '^(layers\\.|embed_tokens\\.|norm\\.)(.+)$'
+    "Cosmos3ForConditionalGeneration": [
+        rename(
+            "^(layers\\.|embed_tokens\\.|norm\\.)(.+)$", "language_model.model.\\1\\2"
+        ),
+        rename(
+            "^(blocks\\.|merger\\.|patch_embed\\.|pos_embed\\.|deepstack_merger_list\\.)",
+            "visual.\\1",
+        ),
+        drop("^audio_modality_embed(?:\\..*)?$"),
+        drop("^action_modality_embed(?:\\..*)?$"),
+        drop("_moe_gen"),
+        drop("\\.add_q_proj\\."),
+        drop("\\.add_k_proj\\."),
+        drop("\\.add_v_proj\\."),
+        drop("\\.to_add_out\\."),
+        drop("\\.norm_added_q\\."),
+        drop("\\.norm_added_k\\."),
+        rename("\\.to_q\\.", ".q_proj."),
+        rename("\\.to_k\\.", ".k_proj."),
+        rename("\\.to_v\\.", ".v_proj."),
+        rename("\\.to_out\\.", ".o_proj."),
+        rename("\\.norm_q\\.", ".q_norm."),
+        rename("\\.norm_k\\.", ".k_norm."),
+        drop("\\.input_quantizer\\."),
+        drop("\\.weight_quantizer\\."),
+        drop("\\.output_quantizer\\."),
+        drop("^proj_in\\."),
+        drop("^proj_out\\."),
+        drop("^time_embedder\\."),
+        drop("^audio_proj_in\\."),
+        drop("^audio_proj_out\\."),
+        drop("^action_proj_in\\."),
+        drop("^action_proj_out\\."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "D3ForSequenceClassification": [
+        rename("^language_model\\.", "language_model.model."),
+        drop("^mtp\\."),
+    ],
+    "DFlash2BeamModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "DFlashQwen3Model": [
+        rename("(?<![A-Za-z0-9_])midlayer(?=\\.|\\*|$)", "layers.0"),
+        rename(
+            "(?<![A-Za-z0-9_])encoder\\.output_norm_enc(?=\\.|\\*|$)", "hidden_norm"
+        ),
+        rename("(?<![A-Za-z0-9_])encoder\\.fc(?=\\.|\\*|$)", "fc"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "DSparkDeepseekV4ForCausalLM": [
+        fused("attn.fused_wqa_wkv", "attn.wq_a", "attn.wkv"),
+        fused(".gate_up_proj", ".w1", ".w3"),
+    ],
+    "DSpineQwen3Model": [
+        rename("(?<![A-Za-z0-9_])midlayer(?=\\.|\\*|$)", "layers.0"),
+        rename(
+            "(?<![A-Za-z0-9_])encoder\\.output_norm_enc(?=\\.|\\*|$)", "hidden_norm"
+        ),
+        rename("(?<![A-Za-z0-9_])encoder\\.fc(?=\\.|\\*|$)", "fc"),
+        rename("transfer_embeddings", "transfer_codebook"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "DbrxExperts": [],
+    "DbrxMoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "DbrxModel": [],
+    "DeciLMForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "DecodeGemvMxfp8LinearKernel": [],
+    # TODO: old loader: stacked_unparsed
+    "DeepSeekMTP": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "DeepSeekV4MTP": [
+        fused("attn.fused_wqa_wkv", "attn.wq_a", "attn.wkv"),
+        fused(".gate_up_proj", ".w1", ".w3"),
+    ],
+    "DeepseekOCR2ForCausalLM": [
+        rename("^model\\.embed_tokens\\.", "language_model.model.embed_tokens."),
+        rename("^model\\.layers\\.", "language_model.model.layers."),
+        rename("^model\\.norm\\.", "language_model.model.norm."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", ""),
+    ],
+    "DeepseekOCRForCausalLM": [
+        rename("^model\\.embed_tokens\\.", "language_model.model.embed_tokens."),
+        rename("^model\\.layers\\.", "language_model.model.layers."),
+        rename("^model\\.norm\\.", "language_model.model.norm."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", ""),
+    ],
+    "DeepseekV2Eagle3Model": [
+        rename("midlayer\\.", "layers.0."),
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "DeepseekV2MoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "DeepseekV2Model": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "DeepseekV32MTP": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "DeepseekV32Model": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: mapper _make_deepseek_v4_weights_mapper('fp4') not literal
+    "DeepseekV41LLMForCausalLM": [],
+    # TODO: old loader: tensor_ops
+    "DeepseekV4AiterMegaMoEExperts": [],
+    # TODO: old loader: tensor_ops
+    "DeepseekV4CPUAttention": [],
+    "DeepseekV4FP8Config": [
+        *experts(),
+    ],
+    # TODO: mapper _make_deepseek_v4_weights_mapper('fp4') not literal
+    "DeepseekV4ForCausalLM": [],
+    # TODO: old loader: tensor_ops
+    "DeepseekV4MegaMoEExperts": [],
+    "DeepseekV4MoE": [
+        *experts(),
+    ],
+    # TODO: old loader: tensor_ops
+    "DeepseekV4Model": [
+        fused("compressor.fused_wkv_wgate", "compressor.wkv", "compressor.wgate"),
+        fused("attn.fused_wqa_wkv", "attn.wq_a", "attn.wkv"),
+        fused(".gate_up_proj", ".w1", ".w3"),
+    ],
+    "DeepseekVLV2ForCausalLM": [
+        rename("^language\\.", "language_model."),
+    ],
+    "DiffusionGemmaForConditionalGeneration": [
+        rename("^model\\.decoder\\.self_conditioning\\.", "self_conditioning."),
+        rename("^model\\.decoder\\.", "model."),
+        rename("^model\\.encoder\\.language_model\\.", "model."),
+        rename("^model\\.encoder\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.encoder\\.embed_vision\\.", "embed_vision."),
+    ],
+    "DoryForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Dots3NoteForCausalLM": [
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^mtp\\.", "language_model.mtp."),
+        rename("^vision_encoder\\.", "visual."),
+        rename("^audio_encoder\\.", "audio_tower."),
+    ],
+    "DotsOCRForCausalLM": [
+        rename("\\.attn\\.qkv_proj\\.", ".attn.qkv."),
+        rename("\\.attn\\.out_proj\\.", ".attn.proj."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+        fused(".fc13.", ".fc1.", ".fc3."),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "EagleMiniCPMModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z'
+    "EagleMistralLarge3ForCausalLM": [
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention_norm\\.weight\\Z",
+            "model.layers.\\1.input_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.q_a_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.q_a_norm\\.weight\\Z",
+            "model.layers.\\1.self_attn.q_a_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.q_b_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.kv_a_proj_with_mqa.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.kv_a_norm\\.weight\\Z",
+            "model.layers.\\1.self_attn.kv_a_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.kv_b_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.o_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.ffn_norm\\.weight\\Z",
+            "model.layers.\\1.post_attention_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.gate_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.down_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.up_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.gate\\.weight\\Z", "model.layers.\\1.mlp.gate.weight"
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.shared_experts.gate_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.shared_experts.down_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.shared_experts.up_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.experts.\\2.gate_proj.\\3",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.experts.\\2.down_proj.\\3",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.experts.\\2.up_proj.\\3",
+        ),
+        rename("\\Anorm\\.weight\\Z", "model.norm.weight"),
+        rename("\\Atok_embeddings\\.weight\\Z", "model.embed_tokens.weight"),
+        rename("\\Aoutput\\.weight\\Z", "lm_head.weight"),
+        rename("\\Aeagle_linear\\.weight\\Z", "model.fc.weight"),
+        rename("\\Aeagle_linear\\.qscale_act\\Z", "model.fc.input_scale"),
+        rename("\\Aeagle_linear\\.qscale_weight\\Z", "model.fc.weight_scale"),
+        rename("\\.qscale_act$", ".input_scale"),
+        rename("\\.qscale_weight$", ".weight_scale"),
+    ],
+    # TODO: mapper _embedding_gemma2_weights_mapper() not literal
+    "EmbeddingGemma2Model": [],
+    "Ernie4_5_MoeMoE": [
+        *experts(),
+    ],
+    "Ernie4_5_MoeModel": [
+        drop("mtp"),
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "Ernie4_5_VLMoeForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Ernie4_5_VLMoeForConditionalGeneration": [
+        rename("spatial_linear\\.0\\.", "spatial_linear1."),
+        rename("spatial_linear\\.2\\.", "spatial_linear2."),
+        rename("spatial_linear\\.3\\.", "spatial_norm."),
+        rename("temporal_linear\\.0\\.", "temporal_linear1."),
+        rename("temporal_linear\\.2\\.", "temporal_linear2."),
+        rename("temporal_linear\\.3\\.", "temporal_norm."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+        rename("^language_model\\.model\\.resampler_model\\.", "resampler_model."),
+    ],
+    "Ernie4_5_VLMoeMoE": [
+        *experts(),
+    ],
+    "Exaone4ForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Exaone4_5_ForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+        drop("^mtp\\."),
+    ],
+    "ExaoneForCausalLM": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+        fused(".gate_up_proj", ".c_fc_0", ".c_fc_1"),
+    ],
+    "ExaoneMoe": [
+        *experts(),
+    ],
+    "ExaoneMoeForCausalLM": [
+        drop("^mtp\\."),
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "ExaoneMoeMultiTokenPredictor": [
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "ExtendProgram": [],
+    "FalconH1ForCausalLM": [
+        rename("A_log", "A"),
+        rename("mamba", "mamba.mamba"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "FalconModel": [],
+    "FireRedASR2ForConditionalGeneration": [
+        rename("llm\\.", "model.decoder."),
+        rename("encoder\\.", "model.encoder.audio_encoder."),
+        rename("encoder_projector\\.", "model.encoder_projector."),
+        rename("net\\.0", "pre_layer_norm"),
+        rename("net\\.1", "linear_expand"),
+        rename("net\\.4", "linear_project"),
+        drop("^model\\.encoder\\.audio_encoder\\.positional_encoding\\.pe"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "FlashModel": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "FlintForCausalLM": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "FlintSparseMoeBlock": [
+        *experts(),
+    ],
+    "FunASREncoder": [
+        fused(
+            ".self_attn.qkv",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    "FunASRForConditionalGeneration": [
+        rename("linear_q\\.", "q_proj."),
+        rename("linear_k\\.", "k_proj."),
+        rename("linear_v\\.", "v_proj."),
+        rename("linear_out\\.", "out_proj."),
+        rename("audio_adaptor\\.", "model.encoder.audio_adaptor."),
+        rename("audio_encoder\\.", "model.encoder.audio_encoder."),
+        rename("llm\\.model\\.", "model.decoder."),
+        rename("llm\\.lm_head", "lm_head"),
+    ],
+    "FunAudioChatAudioAttention": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "FunAudioChatForConditionalGeneration": [
+        drop("^audio_invert_tower\\."),
+    ],
+    "FusedMoEBlock": [
+        *experts(),
+    ],
+    "GLM4VForCausalLM": [
+        rename("\\.word_embeddings", ""),
+        fused(
+            "linear_proj.merged_proj",
+            "linear_proj.gate_proj",
+            "linear_proj.dense_h_to_4h",
+        ),
+    ],
+    "GLM4VModel": [
+        rename("\\.word_embeddings", ""),
+        fused(
+            "linear_proj.merged_proj",
+            "linear_proj.gate_proj",
+            "linear_proj.dense_h_to_4h",
+        ),
+    ],
+    "GPT2Model": [
+        drop("\\.attn\\.bias"),
+        drop("\\.attn\\.masked_bias"),
+    ],
+    "GPTJForCausalLM": [
+        rename("(?<!\\.attn)\\.attn\\.([qkv]_(?:scale|zero_point))$", ".attn.attn.\\1"),
+        drop("attn\\.bias"),
+        drop("attn\\.masked_bias"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Gemma2ForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Gemma3ForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Gemma3ForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "Gemma3Model": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Gemma3nForCausalLM": [
+        drop("embed_audio\\."),
+        drop("embed_vision\\."),
+        drop("audio_tower\\."),
+        drop("vision_tower\\."),
+    ],
+    "Gemma3nForConditionalGeneration": [
+        rename("^model\\.embed_audio\\.", "embed_audio."),
+        rename("^model\\.embed_vision\\.", "embed_vision."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.audio_tower\\.", "audio_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model", "language_model.model"),
+    ],
+    "Gemma3nTextModel": [
+        rename("^embed_tokens\\.", "self_decoder.embed_tokens."),
+        rename("^embed_tokens_per_layer\\.", "self_decoder.embed_tokens_per_layer."),
+        rename(
+            "^per_layer_model_projection\\.", "self_decoder.per_layer_model_projection."
+        ),
+        rename(
+            "^per_layer_projection_norm\\.", "self_decoder.per_layer_projection_norm."
+        ),
+        rename("^altup_projections\\.", "self_decoder.altup_projections."),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "Gemma4DSparkForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "Gemma4DecoderLayer": [
+        *experts(),
+    ],
+    "Gemma4ForCausalLM": [
+        drop("audio_tower\\."),
+        drop("vision_tower\\."),
+        drop("embed_audio\\."),
+        drop("embed_vision\\."),
+        rename("^model\\.language_model\\.", "model."),
+    ],
+    "Gemma4ForConditionalGeneration": [
+        rename("^model\\.vision_tower", "vision_tower"),
+        rename("^model\\.embed_vision", "embed_vision"),
+        rename("^model\\.audio_tower\\.", "audio_tower."),
+        rename("^model\\.embed_audio\\.", "embed_audio."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model", "language_model.model"),
+    ],
+    "Gemma4MTP": [
+        rename("^pre_projection\\.", "model.pre_projection."),
+        rename("^post_projection\\.", "model.post_projection."),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "Gemma4UnifiedForConditionalGeneration": [
+        rename("^model\\.embed_audio\\.", "embed_audio."),
+        rename("^model\\.embed_vision\\.", "embed_vision."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_embedder\\.", "vision_embedder."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model", "language_model.model"),
+    ],
+    "Glm4MoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "Glm4MoeLiteMTP": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "Glm4MoeLiteModel": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "Glm4MoeMTP": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Glm4MoeModel": [
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Glm4vForConditionalGeneration": [
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+    ],
+    "Glm4vVisionTransformer": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "Glm5NextMTP": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "Glm5NextMoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "Glm5NextModel": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(
+            ".in_proj_qkvbfg_a",
+            ".q_proj",
+            ".k_proj",
+            ".v_proj",
+            ".b_proj",
+            ".f_a_proj",
+            ".g_a_proj",
+        ),
+        fused(".conv1d", ".q_conv1d", ".k_conv1d", ".v_conv1d"),
+    ],
+    "Glm5NextVisionTransformer": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
+    ],
+    "GlmAsrEncoder": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "GlmAsrForConditionalGeneration": [
+        drop("^audio_tower\\.embed_positions"),
+    ],
+    "GlmOcrMTP": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
     "GptOssForCausalLM": [
-        WeightRenaming("self_attn", "attn"),
-        WeightRenaming("embed_tokens", "embedding"),
-        *fused_attention("attn"),
-        # Experts fused on disk (MXFP4 blocks + scales), gate/up interleaved: their
-        # contiguous TP slice keeps both, so they are only renamed
-        WeightRenaming(
-            "mlp.experts.gate_up_proj_blocks", "mlp.experts.routed_experts.w13_weight"
+        rename("\\.self_attn\\.", ".attn."),
+        rename("\\.embed_tokens\\.weight$", ".embedding.weight"),
+        rename("\\.gate_up_proj_blocks$", ".routed_experts.w13_weight"),
+        rename("\\.down_proj_blocks$", ".routed_experts.w2_weight"),
+        rename("\\.gate_up_proj_scales$", ".routed_experts.w13_weight_scale"),
+        rename("\\.down_proj_scales$", ".routed_experts.w2_weight_scale"),
+        rename("\\.gate_up_proj$", ".routed_experts.w13_weight"),
+        rename("\\.down_proj$", ".routed_experts.w2_weight"),
+        rename("\\.gate_up_proj_bias$", ".routed_experts.w13_bias"),
+        rename("\\.down_proj_bias$", ".routed_experts.w2_bias"),
+        rename("\\.gate_up_proj\\.weight$", ".routed_experts.w13_weight"),
+        rename("\\.gate_up_proj\\.weight_scale$", ".routed_experts.w13_weight_scale"),
+        rename("\\.gate_up_proj\\.bias$", ".routed_experts.w13_bias"),
+        rename("\\.gate_up_proj\\.input_scale$", ".routed_experts.w13_input_scale"),
+        rename("\\.down_proj\\.weight$", ".routed_experts.w2_weight"),
+        rename("\\.down_proj\\.weight_scale$", ".routed_experts.w2_weight_scale"),
+        rename("\\.down_proj\\.bias$", ".routed_experts.w2_bias"),
+        rename("\\.down_proj\\.input_scale$", ".routed_experts.w2_input_scale"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "GptOssModel": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "GptOssRoutedExperts": [],
+    "Granite4VisionForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.layerwise_projectors\\.", "layerwise_projectors."),
+        rename("^model\\.spatial_projectors\\.", "spatial_projectors."),
+        rename("^model\\.image_newline", "image_newline"),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "GraniteForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "GraniteModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "GraniteMoeHybridModel": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "GraniteMoeMoE": [
+        *experts(),
+    ],
+    "GraniteMoeModel": [
+        rename("moe\\.input_linear\\.weight$", "moe.experts.gate_up_proj"),
+        rename("moe\\.output_linear\\.weight$", "moe.experts.down_proj"),
+        rename("\\.router\\.layer\\.weight$", ".gate.weight"),
+        rename("\\.router\\.weight$", ".gate.weight"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "GraniteMoeSharedModel": [
+        rename("moe\\.input_linear\\.weight$", "moe.experts.gate_up_proj"),
+        rename("moe\\.output_linear\\.weight$", "moe.experts.down_proj"),
+        rename("\\.router\\.layer\\.weight$", ".gate.weight"),
+        rename("\\.router\\.weight$", ".gate.weight"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "GraniteSpeechForConditionalGeneration": [
+        rename("^language_model\\.model\\.model\\.", "language_model.model."),
+    ],
+    "GteNewModel": [
+        rename("new\\.", ""),
+        rename("layer", "layers"),
+        rename("attention\\.qkv_proj", "attn.qkv_proj"),
+        rename("attention\\.o_proj", "attn.out_proj"),
+    ],
+    "HCXVisionV2ForCausalLM": [
+        drop("discrete_vision_model"),
+        rename("^model\\.", ""),
+        rename("^vision_model\\.", "visual."),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "HYV3MTP": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "HYV3MoEFused": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "HYV3Model": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "HYV4ForCausalLM": [
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
         ),
-        WeightRenaming(
-            "mlp.experts.gate_up_proj_scales",
-            "mlp.experts.routed_experts.w13_weight_scale",
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "HYV4MTP": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "HYV4MoEFused": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "HYV4Model": [],
+    "HrmTextForCausalLM": [
+        rename("\\.attn\\.", ".self_attn."),
+    ],
+    "HyperCLOVAXForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "IQuestLoopCoderModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "Idefics2VisionTransformer": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "InklingForConditionalGeneration": [
+        rename("\\.w13_dn", ".gate_up_proj"),
+        rename("\\.w2_md", ".down_proj"),
+        rename("^model\\.llm\\.layers\\.", "model.layers."),
+        rename("^model\\.llm\\.embed_norm", "model.embed_norm"),
+        rename("^model\\.llm\\.embed", "model.embed_tokens"),
+        rename("^model\\.llm\\.norm", "model.norm"),
+        rename("^model\\.llm\\.unembed", "lm_head"),
+        rename("^language_model\\.layers\\.", "model.layers."),
+        rename("^language_model\\.lm_head\\.", "lm_head."),
+        rename("^model\\.audio\\.", "audio."),
+        rename("^model\\.visual\\.", "visual.vision_encoder."),
+        rename("\\.w13_weight\\.scale$", ".routed_experts.w13_weight_scale"),
+        rename("\\.w13_weight\\.scale2$", ".routed_experts.w13_weight_scale_2"),
+        rename("\\.w2_weight\\.scale$", ".routed_experts.w2_weight_scale"),
+        rename("\\.w2_weight\\.scale2$", ".routed_experts.w2_weight_scale_2"),
+        rename(
+            "\\.w13_weight\\.input_global_scale$",
+            ".routed_experts.w13_input_global_scale",
         ),
-        WeightRenaming(
-            "mlp.experts.gate_up_proj_bias", "mlp.experts.routed_experts.w13_bias"
+        rename(
+            "\\.w13_weight\\.weight_global_scale$",
+            ".routed_experts.w13_weight_global_scale",
         ),
-        WeightRenaming(
-            "mlp.experts.down_proj_blocks", "mlp.experts.routed_experts.w2_weight"
+        rename("\\.w13_weight\\.weight_packed$", ".routed_experts.w13_weight_packed"),
+        rename("\\.w13_weight\\.weight_scale$", ".routed_experts.w13_weight_scale"),
+        rename(
+            "\\.w2_weight\\.input_global_scale$",
+            ".routed_experts.w2_input_global_scale",
         ),
-        WeightRenaming(
-            "mlp.experts.down_proj_scales", "mlp.experts.routed_experts.w2_weight_scale"
+        rename(
+            "\\.w2_weight\\.weight_global_scale$",
+            ".routed_experts.w2_weight_global_scale",
         ),
-        WeightRenaming(
-            "mlp.experts.down_proj_bias", "mlp.experts.routed_experts.w2_bias"
+        rename("\\.w2_weight\\.weight_packed$", ".routed_experts.w2_weight_packed"),
+        rename("\\.w2_weight\\.weight_scale$", ".routed_experts.w2_weight_scale"),
+        fused(
+            ".attn.qkvr.",
+            ".attn.wq_du.",
+            ".attn.wk_dv.",
+            ".attn.wv_dv.",
+            ".attn.wr_du.",
+        ),
+    ],
+    "InklingMTP": [
+        rename("\\.w13_dn", ".gate_up_proj"),
+        rename("\\.w2_md", ".down_proj"),
+        rename("^model\\.llm\\.layers\\.", "model.layers."),
+        rename("^model\\.llm\\.embed_norm", "model.embed_norm"),
+        rename("^model\\.llm\\.embed", "model.embed_tokens"),
+        rename("^model\\.llm\\.norm", "model.norm"),
+        rename("^model\\.llm\\.unembed", "lm_head"),
+        rename("^language_model\\.layers\\.", "model.layers."),
+        rename("^language_model\\.lm_head\\.", "lm_head."),
+        rename("^model\\.mtp\\.", "model."),
+        rename("\\.w13_weight\\.scale$", ".routed_experts.w13_weight_scale"),
+        rename("\\.w13_weight\\.scale2$", ".routed_experts.w13_weight_scale_2"),
+        rename("\\.w2_weight\\.scale$", ".routed_experts.w2_weight_scale"),
+        rename("\\.w2_weight\\.scale2$", ".routed_experts.w2_weight_scale_2"),
+        rename(
+            "\\.w13_weight\\.input_global_scale$",
+            ".routed_experts.w13_input_global_scale",
+        ),
+        rename(
+            "\\.w13_weight\\.weight_global_scale$",
+            ".routed_experts.w13_weight_global_scale",
+        ),
+        rename("\\.w13_weight\\.weight_packed$", ".routed_experts.w13_weight_packed"),
+        rename("\\.w13_weight\\.weight_scale$", ".routed_experts.w13_weight_scale"),
+        rename(
+            "\\.w2_weight\\.input_global_scale$",
+            ".routed_experts.w2_input_global_scale",
+        ),
+        rename(
+            "\\.w2_weight\\.weight_global_scale$",
+            ".routed_experts.w2_weight_global_scale",
+        ),
+        rename("\\.w2_weight\\.weight_packed$", ".routed_experts.w2_weight_packed"),
+        rename("\\.w2_weight\\.weight_scale$", ".routed_experts.w2_weight_scale"),
+        fused(
+            ".attn.qkvr.",
+            ".attn.wq_du.",
+            ".attn.wk_dv.",
+            ".attn.wv_dv.",
+            ".attn.wr_du.",
+        ),
+    ],
+    "InklingMoE": [
+        *experts(),
+    ],
+    # TODO: old loader: tensor_ops
+    "InklingShortConv": [],
+    "InternLM2ForCausalLM": [
+        fused(".gate_up_proj", ".w1", ".w3"),
+    ],
+    "InternLM2Model": [
+        fused(".gate_up_proj", ".w1", ".w3"),
+    ],
+    "InternS1ForConditionalGeneration": [
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+    ],
+    "InternS1ProForConditionalGeneration": [
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+    ],
+    "InternS1ProMoeSparseMoeBlock": [
+        *experts(),
+    ],
+    "InternS2MobiusMetaMoeBlock": [
+        *experts(),
+    ],
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    "InternS2MobiusModel": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "InternS2PreviewForConditionalGeneration": [
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        drop("^mtp\\."),
+        drop("^model\\.time_series\\."),
+        drop("^time_series\\."),
+    ],
+    # TODO: mapper orig_to_new_prefix not literal
+    "InternVLChatModel": [],
+    "IsaacForConditionalGeneration": [
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.text_model\\.lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.text_model\\.", "language_model.model."),
+        rename("^model\\.vision_embedding\\.0", "vision_embedding.transformer"),
+        rename("^model\\.vision_embedding\\.1", "vision_embedding.linear_fc1"),
+        rename("^model\\.vision_embedding\\.2", "vision_embedding.act"),
+        rename("^model\\.vision_embedding\\.3", "vision_embedding.linear_fc2"),
+        rename("^model\\.vision_embedding\\.", "vision_embedding."),
+        rename("^model\\.lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+    ],
+    "JambaForCausalLM": [
+        rename("\\.self_attn\\.", "."),
+        rename("\\.A_log", ".A"),
+        fused(
+            ".feed_forward.gate_up_proj",
+            ".feed_forward.gate_proj",
+            ".feed_forward.up_proj",
+        ),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "JambaMoE": [
+        *experts(),
+    ],
+    "JinaEmbeddingsV5DecoderModel": [
+        rename("^", "model."),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "JinaEmbeddingsV5EncoderModel": [
+        rename("^", "model."),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "JinaForRanking": [
+        drop("^lm_head\\."),
+    ],
+    "JinaRobertaModel": [
+        rename("emb_ln", "embeddings.LayerNorm"),
+        rename("mixer\\.Wqkv", "attn.qkv_proj"),
+        rename("mixer\\.out_proj", "attn.out_proj"),
+        rename("norm1", "attn_ln"),
+        rename("mlp\\.fc1\\.", "mlp.up_proj."),
+        rename("mlp\\.fc2", "mlp.down_proj"),
+        rename("norm2", "mlp_ln"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "K2HorizonModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "K2HorizonSparseMoeBlock": [
+        *experts(),
+    ],
+    "K3DSparkForCausalLM": [
+        drop("confidence_head"),
+        drop("embed_tokens"),
+        drop("lm_head"),
+        rename("^", "model."),
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "KimiAudioForConditionalGeneration": [
+        rename("\\.fc1\\.", ".mlp.fc1."),
+        rename("\\.fc2\\.", ".mlp.fc2."),
+        rename("^model\\.encoder\\.", "audio_tower."),
+        rename(
+            "^model\\.vq_adaptor\\.layers\\.0\\.",
+            "multi_modal_projector.vq_adaptor_layers_0.",
+        ),
+        rename(
+            "^model\\.vq_adaptor\\.layers\\.3\\.",
+            "multi_modal_projector.vq_adaptor_layers_3.",
+        ),
+        rename(
+            "^model\\.vq_adaptor\\.layers\\.4\\.",
+            "multi_modal_projector.vq_adaptor_layers_4.",
+        ),
+        rename("^model\\.layers\\.", "language_model.model.layers."),
+        rename("^model\\.embed_tokens\\.", "language_model.model.embed_tokens."),
+        rename("^model\\.norm\\.", "language_model.model.norm."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        drop("^model\\."),
+        drop("^mimo_layers\\."),
+        drop("^mimo_output\\."),
+        drop("^mimo_norm\\."),
+    ],
+    "KimiAudioWhisperEncoder": [
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    "KimiK25ForConditionalGeneration": [
+        rename("^language_model\\.layers\\.", "language_model.model.layers."),
+        rename("^mm_projector\\.proj\\.0", "mm_projector.linear_1"),
+        rename("^mm_projector\\.proj\\.2", "mm_projector.linear_2"),
+        rename(
+            "\\.self_attn\\.attn\\.q_scale$", ".self_attn.mla_attn.mla_attn.q_scale"
+        ),
+        rename(
+            "\\.self_attn\\.attn\\.k_scale$", ".self_attn.mla_attn.mla_attn.k_scale"
+        ),
+        rename(
+            "\\.self_attn\\.attn\\.v_scale$", ".self_attn.mla_attn.mla_attn.v_scale"
+        ),
+    ],
+    "KimiK3ForConditionalGeneration": [
+        rename("^language_model\\.layers\\.", "language_model.model.layers."),
+        rename("^mm_projector\\.proj\\.0", "mm_projector.linear_1"),
+        rename("^mm_projector\\.proj\\.2", "mm_projector.linear_2"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "KimiK3MTP": [],
+    # TODO: old loader: stacked_unparsed
+    "KimiLinearModel": [],
+    "KimiMoE": [
+        *experts(),
+    ],
+    "LagunaMoE": [
+        *experts(),
+    ],
+    "LagunaModel": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Lfm2ForCausalLM": [
+        rename("\\.conv\\.", ".short_conv."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+        fused(".w13", ".w1", ".w3"),
+    ],
+    "Lfm2Model": [
+        rename("\\.conv\\.", ".short_conv."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+        fused(".w13", ".w1", ".w3"),
+    ],
+    "Lfm2MoeForCausalLM": [
+        rename("\\.conv\\.", ".short_conv."),
+    ],
+    "Lfm2MoeModel": [
+        rename("\\.conv\\.", ".short_conv."),
+        rename("expert_bias", "gate.e_score_correction_bias"),
+        fused(".feed_forward.w13.", ".feed_forward.w1.", ".feed_forward.w3."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Lfm2MoeSparseMoeBlock": [
+        *experts(),
+    ],
+    "Lfm2VLForConditionalGeneration": [
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+    ],
+    "Lfm3AudioForConditionalGeneration": [
+        rename("^lfm\\.model\\.", "language_model.model."),
+        rename("^lfm\\.lm_head\\.", "language_model.lm_head."),
+        rename("^encoder\\.lfm\\.lfm\\.", "audio_encoder.lfm."),
+        rename("^encoder\\.downsample\\.", "audio_encoder.downsample."),
+        rename("^mlp\\.model\\.0\\.", "audio_projector.layer_norm."),
+        rename("^mlp\\.model\\.1\\.", "audio_projector.linear_1."),
+        rename("^mlp\\.model\\.3\\.", "audio_projector.linear_2."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.audio_encoder\\.", "audio_encoder."),
+        rename("^model\\.audio_projector\\.", "audio_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        drop("^codebook_embedding\\."),
+        drop("^depth_linear\\."),
+        drop("^depth_embeddings\\."),
+        drop("^depthformer\\."),
+        drop("^mask_embedding"),
+        drop("^model\\.codebook_embedding\\."),
+        drop("^model\\.depth_decoder\\."),
+    ],
+    "Lfm3ForCausalLM": [
+        rename("\\.conv\\.", ".short_conv."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+        fused(".w13", ".w1", ".w3"),
+    ],
+    "Lfm3Model": [
+        rename("\\.conv\\.", ".short_conv."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+        fused(".w13", ".w1", ".w3"),
+    ],
+    "Lfm3OmniForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^lfm\\.model\\.", "language_model.model."),
+        rename("^lfm\\.lm_head\\.", "language_model.lm_head."),
+        rename("^encoder\\.lfm\\.lfm\\.", "audio_encoder.lfm."),
+        rename("^encoder\\.downsample\\.", "audio_encoder.downsample."),
+        rename("^mlp\\.model\\.0\\.", "audio_projector.layer_norm."),
+        rename("^mlp\\.model\\.1\\.", "audio_projector.linear_1."),
+        rename("^mlp\\.model\\.3\\.", "audio_projector.linear_2."),
+        rename("^model\\.audio_encoder\\.", "audio_encoder."),
+        rename("^model\\.audio_projector\\.", "audio_projector."),
+        drop("^codebook_embedding\\."),
+        drop("^depth_linear\\."),
+        drop("^depth_embeddings\\."),
+        drop("^depthformer\\."),
+        drop("^mask_embedding"),
+        drop("^model\\.codebook_embedding\\."),
+        drop("^model\\.depth_decoder\\."),
+    ],
+    "Lfm3VlForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "Lfm3VlVisionModel": [
+        fused(".qkv_proj.", ".q_proj.", ".k_proj.", ".v_proj."),
+        fused(".w13.", ".w1.", ".w3."),
+    ],
+    "LightOnOCRForConditionalGeneration": [
+        rename("^model\\.vision_encoder\\.", "vision_tower."),
+        rename("^model\\.vision_projection\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+    ],
+    # TODO: old loader: tensor_ops
+    "Llama4ForConditionalGeneration": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(
+            ".feed_forward.gate_up_proj",
+            ".feed_forward.gate_proj",
+            ".feed_forward.up_proj",
+        ),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    "Llama4MoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "Llama4Model": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "LlamaForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "LlamaModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "LlamaNemotronVLChatModel": [
+        drop("norm_mean"),
+        drop("norm_std"),
+    ],
+    "LlamaNemotronVLForEmbedding": [
+        rename("^language_model\\.layers\\.", "language_model.model.layers."),
+        rename(
+            "^language_model\\.embed_tokens\\.", "language_model.model.embed_tokens."
+        ),
+        rename("^language_model\\.norm\\.", "language_model.model.norm."),
+        rename("^vision_model\\.encoder\\.", "vision_model.vision_model.encoder."),
+        rename(
+            "^vision_model\\.embeddings\\.", "vision_model.vision_model.embeddings."
+        ),
+        rename(
+            "^vision_model\\.post_layernorm\\.",
+            "vision_model.vision_model.post_layernorm.",
+        ),
+    ],
+    "LlamaNemotronVLForSequenceClassification": [
+        rename("^model\\.", ""),
+        rename("^language_model\\.layers\\.", "language_model.model.layers."),
+        rename(
+            "^language_model\\.embed_tokens\\.", "language_model.model.embed_tokens."
+        ),
+        rename("^language_model\\.norm\\.", "language_model.model.norm."),
+        rename("^vision_model\\.encoder\\.", "vision_model.vision_model.encoder."),
+        rename(
+            "^vision_model\\.embeddings\\.", "vision_model.vision_model.embeddings."
+        ),
+        rename(
+            "^vision_model\\.post_layernorm\\.",
+            "vision_model.vision_model.post_layernorm.",
+        ),
+    ],
+    "LlavaForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "LlavaNextForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^model\\.image_newline", "image_newline"),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "LlavaNextVideoForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^model\\.image_newline", "image_newline"),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "LlavaOnevision2ForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+    ],
+    "LlavaOnevisionForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^model\\.image_newline", "image_newline"),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "LongCatFlashMTP": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "LongcatFlashNgramForCausalLM": [
+        drop("^model\\.mtp\\."),
+    ],
+    "LongcatMoe": [
+        *experts(),
+    ],
+    "MBartDecoderNoPos": [
+        fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    "Mamba2ForCausalLM": [
+        rename("\\.A_log", ".A"),
+    ],
+    "MambaForCausalLM": [
+        rename("\\.A_log", ".A"),
+    ],
+    "MiMoForCausalLM": [
+        drop("^model\\.mtp_layers\\."),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "MiMoV2MTP": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "MiMoV2MoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "MiMoV2Model": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "MiMoV2OmniForCausalLM": [
+        rename("^speech_embeddings\\.", "audio_encoder.speech_embeddings."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+        drop("^audio_tokenizer\\."),
+    ],
+    "MiMoVisionTransformer": [
+        fused("mlp.gate_up_proj", "mlp.gate_proj", "mlp.up_proj"),
+    ],
+    "MingAudioEncoder": [
+        rename("blocks\\.", "layers."),
+        rename("\\.attn\\.query\\.", ".self_attn.q_proj."),
+        rename("\\.attn\\.key\\.", ".self_attn.k_proj."),
+        rename("\\.attn\\.value\\.", ".self_attn.v_proj."),
+        rename("\\.attn\\.out\\.", ".self_attn.out_proj."),
+        rename("\\.attn_ln\\.", ".self_attn_layer_norm."),
+        rename("\\.mlp_ln\\.", ".final_layer_norm."),
+        rename("\\.mlp\\.0\\.", ".mlp.fc1."),
+        rename("\\.mlp\\.2\\.", ".mlp.fc2."),
+        rename("ln_post\\.", "layer_norm."),
+        rename("positional_embedding$", "embed_positions.weight"),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    "MingV3ASRForConditionalGeneration": [
+        rename("^model\\.audio\\.", "audio_encoder."),
+        rename("^linear_proj_audio\\.", "audio_projector.proj."),
+        drop("^model\\.visual\\."),
+        drop("^linear_proj\\."),
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "MiniCPMModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "MiniCPMOBaseModel": [
+        drop("^tts"),
+    ],
+    "MiniCPMV2_6": [
+        drop("^apm\\."),
+        drop("^audio"),
+        drop("^tts"),
+    ],
+    "MiniCPMV4_0": [
+        drop("^apm\\."),
+        drop("^audio"),
+        drop("^tts"),
+    ],
+    "MiniCPMV4_5": [
+        drop("^apm\\."),
+        drop("^audio"),
+        drop("^tts"),
+    ],
+    "MiniCPMV4_6ForConditionalGeneration": [
+        rename("^model\\.vision_tower\\.vit_merger\\.", "vit_merger."),
+        rename("^model\\.vision_tower\\.", "vpm."),
+        rename("^model\\.vpm\\.", "vpm."),
+        rename("^model\\.vit_merger\\.", "vit_merger."),
+        rename("^model\\.merger\\.", "merger."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        drop("^mtp\\."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "MiniMaxM2ForCausalLM": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "MiniMaxM2MoE": [
+        *experts(),
+    ],
+    "MiniMaxM2Model": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "MiniMaxM3MTP": [
+        fused(
+            ".qkv_proj",
+            ".q_proj",
+            ".k_proj",
+            ".v_proj",
+            ".index_k_proj",
+            ".index_q_proj",
+        ),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "MiniMaxM3MoE": [
+        *experts(),
+    ],
+    "MiniMaxM3SparseForCausalLM": [
+        drop("mtp\\."),
+        rename("weight_scale_inv", "weight_scale"),
+        fused(
+            ".qkv_proj",
+            ".q_proj",
+            ".k_proj",
+            ".v_proj",
+            ".index_k_proj",
+            ".index_q_proj",
+        ),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "MiniMaxM3SparseForConditionalGeneration": [
+        rename("\\.mlp\\.fc1\\.", ".fc1."),
+        rename("\\.mlp\\.fc2\\.", ".fc2."),
+        rename("^multi_modal_projector\\.", "vision_tower.multi_modal_projector."),
+        rename("^patch_merge_mlp\\.", "vision_tower.patch_merge_mlp."),
+    ],
+    "MiniMaxVLVisionModel": [
+        fused(".qkv_proj.", ".q_proj.", ".k_proj.", ".v_proj."),
+    ],
+    "Mistral3ForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+        rename("\\.activation_scale$", ".input_scale"),
+        rename("\\.weight_scale_inv$", ".weight_scale"),
+    ],
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z'
+    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z'
+    "MistralLarge3ForCausalLM": [
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention_norm\\.weight\\Z",
+            "model.layers.\\1.input_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.q_a_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.q_a_norm\\.weight\\Z",
+            "model.layers.\\1.self_attn.q_a_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.q_b_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.kv_a_proj_with_mqa.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.kv_a_norm\\.weight\\Z",
+            "model.layers.\\1.self_attn.kv_a_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.kv_b_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z",
+            "model.layers.\\1.self_attn.o_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.ffn_norm\\.weight\\Z",
+            "model.layers.\\1.post_attention_layernorm.weight",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.gate_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.down_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.up_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.gate\\.weight\\Z", "model.layers.\\1.mlp.gate.weight"
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.shared_experts.gate_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.shared_experts.down_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.shared_experts.up_proj.\\2",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.experts.\\2.gate_proj.\\3",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.experts.\\2.down_proj.\\3",
+        ),
+        rename(
+            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z",
+            "model.layers.\\1.mlp.experts.\\2.up_proj.\\3",
+        ),
+        rename("\\Anorm\\.weight\\Z", "model.norm.weight"),
+        rename("\\Atok_embeddings\\.weight\\Z", "model.embed_tokens.weight"),
+        rename("\\Aoutput\\.weight\\Z", "lm_head.weight"),
+        rename("\\.qscale_act$", ".input_scale"),
+        rename("\\.qscale_weight$", ".weight_scale"),
+    ],
+    "MistralMoE": [
+        *experts(),
+    ],
+    "MixtralForCausalLM": [
+        rename("\\.gate_proj\\.", ".w1."),
+        rename("\\.up_proj\\.", ".w3."),
+        rename("\\.down_proj\\.", ".w2."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "MixtralMoE": [
+        *experts(),
+    ],
+    "MixtralModel": [
+        rename("\\.gate_proj\\.", ".w1."),
+        rename("\\.up_proj\\.", ".w3."),
+        rename("\\.down_proj\\.", ".w2."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "MoEMixin": [
+        *experts(),
+    ],
+    # TODO: old loader: tensor_ops
+    "MoESwiGLUFFNFP8": [],
+    # TODO: old loader: tensor_ops
+    "ModelForPooling": [],
+    "ModernBertForTokenClassification": [
+        drop("^drop"),
+    ],
+    "ModernBertModel": [
+        rename("^model\\.layers\\.", "encoder_layer.layers."),
+        rename("^layers\\.", "encoder_layer.layers."),
+        rename("^model\\.", ""),
+    ],
+    "Molmo2ForConditionalGeneration": [
+        rename("image_pooling_2d\\.wq", "image_pooling_2d.q_proj"),
+        rename("image_pooling_2d\\.wk", "image_pooling_2d.k_proj"),
+        rename("image_pooling_2d\\.wv", "image_pooling_2d.v_proj"),
+        rename("image_pooling_2d\\.wo", "image_pooling_2d.o_proj"),
+        rename("image_projector\\.w1", "image_projector.gate_proj"),
+        rename("image_projector\\.w3", "image_projector.up_proj"),
+        rename("image_projector\\.w2", "image_projector.down_proj"),
+        rename("att_proj", "qkv_proj"),
+        rename("attn_out", "o_proj"),
+        rename("q_norm", "q_norm"),
+        rename("k_norm", "k_norm"),
+        rename("ff_proj", "up_gate_proj"),
+        rename("ff_out", "down_proj"),
+        rename("attn_norm", "input_layernorm"),
+        rename("ff_norm", "post_attention_layernorm"),
+        rename("^model\\.vision_backbone\\.", "vision_backbone."),
+        rename("^model\\.transformer\\.blocks\\.", "model.layers."),
+        rename("^model\\.transformer\\.ln_f\\.", "model.norm."),
+    ],
+    "Molmo2VisionBackbone": [
+        fused(".merged_linear", ".gate_proj", ".up_proj"),
+        fused(".merged_kv", ".k_proj", ".v_proj"),
+        fused(".merged_qkv", ".wq", ".wk", ".wv"),
+    ],
+    "MolmoForCausalLM": [
+        rename("image_projector\\.w1\\.", "image_projector.gate_proj."),
+        rename("image_projector\\.w3\\.", "image_projector.up_proj."),
+        rename("image_projector\\.w2\\.", "image_projector.down_proj."),
+        rename("att_proj", "self_attn.qkv_proj"),
+        rename("attn_out", "self_attn.o_proj"),
+        rename("q_norm", "self_attn.q_norm"),
+        rename("k_norm", "self_attn.k_norm"),
+        rename("ff_proj", "mlp.gate_up_proj"),
+        rename("ff_out", "mlp.down_proj"),
+        rename("attn_norm", "input_layernorm"),
+        rename("ff_norm", "post_attention_layernorm"),
+        rename("^model\\.vision_backbone\\.", "vision_backbone."),
+        rename("^model\\.transformer\\.blocks\\.", "model.layers."),
+        rename("^model\\.transformer\\.ln_f\\.", "model.norm."),
+        rename("^model\\.transformer\\.mlp\\.down_proj\\.", "lm_head."),
+    ],
+    "MolmoVisionBackbone": [
+        fused(".merged_linear", ".gate_proj", ".up_proj"),
+    ],
+    "MossAudioModel": [
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename(
+            "^language_model\\.embed_tokens\\.", "language_model.model.embed_tokens."
+        ),
+        rename("^language_model\\.layers\\.", "language_model.model.layers."),
+        rename("^language_model\\.norm\\.", "language_model.model.norm."),
+        drop("^audio_encoder\\.embed_positions"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "MossTranscribeDiarizeForConditionalGeneration": [
+        rename("^language_model\\.layers\\.", "language_model.model.layers."),
+        rename(
+            "^language_model\\.embed_tokens\\.", "language_model.model.embed_tokens."
+        ),
+        rename("^language_model\\.norm\\.", "language_model.model.norm."),
+        rename("^model\\.language_model\\.model\\.", "language_model.model."),
+        rename("^model\\.language_model\\.lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.whisper_encoder\\.", "whisper_encoder."),
+        rename("^model\\.vq_adaptor\\.", "vq_adaptor."),
+        drop("^model\\."),
+    ],
+    "MossTranscribeDiarizeWhisperEncoder": [
+        rename("\\.fc1\\.", ".mlp.fc1."),
+        rename("\\.fc2\\.", ".mlp.fc2."),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    # TODO: old loader: tensor_ops
+    "MultiHeadLatentAttention": [],
+    "MuseGlimmerForCausalLM": [
+        rename(
+            "model\\.vision_tower\\.patch_embedder\\.position_embedding_table\\.weight",
+            "model.vision_tower.positional_embedding_vlm",
+        ),
+        rename("model\\.vision_tower\\.layers\\.", "model.vision_tower.transformer."),
+        rename("\\.norm1\\.", ".ln_1."),
+        rename("\\.norm2\\.", ".ln_2."),
+        rename("\\.attn\\.proj\\.", ".attn.o_proj."),
+        rename("\\.mlp\\.fc1\\.", ".mlp.c_fc."),
+        rename("\\.mlp\\.fc2\\.", ".mlp.c_proj."),
+        rename("\\.self_attn\\.gate_proj", ".self_attn.output_gate_proj"),
+        drop("^model\\.rotary_emb\\."),
+        rename("^model\\.language_model\\.", "model."),
+        rename("^language_model\\.", "model."),
+        rename(
+            "^model\\.vision_tower\\.patch_embedder\\.patch_embedding\\.",
+            "model.vision_tower.conv1_linear.",
+        ),
+        rename("^model\\.vision_tower\\.", "vision_encoder."),
+        rename("^vision_tower\\.", "vision_encoder."),
+        rename("^model\\.vision_encoder\\.", "vision_encoder."),
+        rename("^model\\.vision_adapter\\.fc1\\.", "model.vision_adapter.c_fc."),
+        rename("^model\\.vision_adapter\\.fc2\\.", "model.vision_adapter.c_proj."),
+        rename("^model\\.vision_adapter\\.", "vision_adapter."),
+        rename("^model\\.vision_projection\\.", "vision_projection."),
+        rename("^model\\.perception_emb_norm\\.", "perception_emb_norm."),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "MuseSparkConsolidatedRoutedExperts": [],
+    "MuseSparkDSparkForCausalLM": [
+        fused(
+            ".feed_forward.gate_up_proj.",
+            ".feed_forward.gate_proj.",
+            ".feed_forward.up_proj.",
+        ),
+        fused(
+            ".self_attn.qkv_proj.",
+            ".self_attn.q_proj.",
+            ".self_attn.k_proj.",
+            ".self_attn.v_proj.",
+            ".self_attn.o_gate_proj.",
+        ),
+    ],
+    # TODO: old loader: tensor_ops
+    "MuseSparkForCausalLM": [],
+    # TODO: mapper OMNI_WEIGHTS_MAPPER not literal
+    "MuseSparkForConditionalGeneration": [],
+    "MuseSparkMoE": [
+        *experts(),
+    ],
+    # TODO: old loader: tensor_ops
+    "MuseSparkQKVOGateParallelLinear": [],
+    "MuseSparkRoutedExperts": [
+        *experts(),
+    ],
+    "Nemotron3_5TranscribeForConditionalGeneration": [
+        rename("\\.mixer\\._fp32_params\\.", ".mixer."),
+        rename("^llm\\.model\\.norm\\.", "language_model.model.norm_f."),
+        rename("^llm\\.model\\.", "language_model.model."),
+        rename("^llm\\.lm_head\\.", "language_model.lm_head."),
+        rename("^backbone\\.", "language_model.model."),
+        rename("^lm_head", "language_model.lm_head"),
+        rename("^perception\\.", "audio_tower."),
+    ],
+    "NemotronForCausalLM": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "NemotronHForCausalLM": [
+        rename("A_log", "A"),
+        rename("embeddings", "embed_tokens"),
+        rename("^backbone", "model"),
+        drop("^mtp"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "NemotronHMTP": [
+        rename("^language_model\\.", ""),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "NemotronHMoE": [
+        *experts(),
+    ],
+    # TODO: old loader: tensor_ops
+    "NemotronH_Nano_VL_V2": [
+        rename("^language_model\\.backbone", "language_model.model"),
+    ],
+    "NemotronLabsDiffusionForBlockDiffusion": [
+        rename("^encoder\\.", "model."),
+    ],
+    # TODO: old loader: tensor_ops
+    "NemotronParseForConditionalGeneration": [],
+    "NomicBertModel": [
+        rename("emb_ln", "embeddings.LayerNorm"),
+        rename("attn\\.Wqkv", "attn.qkv_proj"),
+        rename("norm1", "attn_ln"),
+        rename("mlp\\.fc1\\.", "mlp.up_proj."),
+        rename("mlp\\.fc11", "mlp.up_proj"),
+        rename("mlp\\.fc12", "mlp.gate_proj"),
+        rename("mlp\\.fc2", "mlp.down_proj"),
+        rename("norm2", "mlp_ln"),
+        rename("experts\\.mlp\\.", ""),
+        rename("experts\\.", ""),
+        rename("router\\.layer", "router"),
+    ],
+    # TODO: old loader: tensor_ops
+    "NomicMoE": [],
+    "OPTForCausalLM": [
+        rename("^decoder\\.", "model.decoder."),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "OlmoHybridModel": [
+        fused(
+            ".linear_attn.in_proj_qkvg",
+            ".linear_attn.q_proj",
+            ".linear_attn.k_proj",
+            ".linear_attn.v_proj",
+            ".linear_attn.g_proj",
+        ),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".conv1d", ".q_conv1d", ".k_conv1d", ".v_conv1d"),
+    ],
+    "OpenAIPrivacyFilterForTokenClassification": [
+        rename("\\.self_attn\\.", ".attn."),
+        rename("\\.embed_tokens\\.weight$", ".embedding.weight"),
+        rename("\\.gate_up_proj_blocks$", ".routed_experts.w13_weight"),
+        rename("\\.down_proj_blocks$", ".routed_experts.w2_weight"),
+        rename("\\.gate_up_proj_scales$", ".routed_experts.w13_weight_scale"),
+        rename("\\.down_proj_scales$", ".routed_experts.w2_weight_scale"),
+        rename("\\.gate_up_proj$", ".routed_experts.w13_weight"),
+        rename("\\.down_proj$", ".routed_experts.w2_weight"),
+        rename("\\.gate_up_proj_bias$", ".routed_experts.w13_bias"),
+        rename("\\.down_proj_bias$", ".routed_experts.w2_bias"),
+        rename("\\.gate_up_proj\\.weight$", ".routed_experts.w13_weight"),
+        rename("\\.gate_up_proj\\.weight_scale$", ".routed_experts.w13_weight_scale"),
+        rename("\\.gate_up_proj\\.bias$", ".routed_experts.w13_bias"),
+        rename("\\.gate_up_proj\\.input_scale$", ".routed_experts.w13_input_scale"),
+        rename("\\.down_proj\\.weight$", ".routed_experts.w2_weight"),
+        rename("\\.down_proj\\.weight_scale$", ".routed_experts.w2_weight_scale"),
+        rename("\\.down_proj\\.bias$", ".routed_experts.w2_bias"),
+        rename("\\.down_proj\\.input_scale$", ".routed_experts.w2_input_scale"),
+    ],
+    "OpenCUAForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+        rename("^vision_tower\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "OpenPanguMTP": [
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "OpenPanguMoE": [
+        *experts(),
+    ],
+    # TODO: old loader: tensor_ops
+    "OpenPanguSinkAttention": [],
+    "OrionForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "PaddleOCRVLForConditionalGeneration": [
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "PaliGemmaForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "Param2MoEMoEBlock": [
+        *experts(),
+    ],
+    "Param2MoEModel": [
+        rename("word_embeddings\\.", "embed_tokens."),
+        rename("\\.attention\\.query_key_value\\.", ".self_attn.qkv_proj."),
+        rename("\\.attention\\.dense\\.", ".self_attn.o_proj."),
+        rename("\\.attention\\.query_layernorm\\.", ".self_attn.q_layernorm."),
+        rename("\\.attention\\.key_layernorm\\.", ".self_attn.k_layernorm."),
+        rename("\\.attention\\.", ".self_attn."),
+        rename("\\.mlp\\.gate\\.expert_bias", ".mlp.gate.e_score_correction_bias"),
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+    ],
+    "ParseAuxMTPModel": [
+        rename("^decoder\\.embed_tokens\\.", "model.embed_tokens."),
+        rename("^decoder\\.extra_heads\\.0\\.", "model.extra_head."),
+        rename("^decoder\\.extra_proj\\.0\\.", "model.extra_proj."),
+    ],
+    "Phi3VForCausalLM": [
+        rename("^model\\.vision_embed_tokens\\.wte", "embed_tokens"),
+        rename("^model\\.vision_embed_tokens\\.", "vision_embed_tokens."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+    ],
+    "Phi4ForCausalLMV": [
+        drop("^model\\.vision_tower\\.vision_tower\\.vision_model\\.head\\."),
+        rename("^model\\.vision_tower\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.mm_projector\\.0\\.", "multi_modal_projector.linear_1."),
+        rename("^model\\.mm_projector\\.2\\.", "multi_modal_projector.linear_2."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+    ],
+    "Phi4MMForCausalLM": [
+        rename("base_layer\\.", ""),
+        drop("lora"),
+        rename(
+            "^model\\.embed_tokens_extend\\.audio_embed\\.audio_projection\\.vision\\.",
+            "embed_tokens_extend.audio_projection_for_vision.",
+        ),
+        rename(
+            "^model\\.embed_tokens_extend\\.audio_embed\\.audio_projection\\.speech\\.",
+            "embed_tokens_extend.audio_projection.",
+        ),
+        rename("^model\\.embed_tokens_extend\\.audio_embed\\.", "embed_tokens_extend."),
+        rename("^model\\.embed_tokens_extend\\.image_embed\\.", "vision_encoder."),
+    ],
+    "PhiMoE": [
+        *experts(),
+    ],
+    "PhiMoEForCausalLM": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "PixtralForConditionalGeneration": [
+        rename(
+            "^vision_encoder\\.transformer\\.layers\\.(\\d+)\\.attention\\.wq(?=\\.|$)",
+            "vision_encoder.transformer.layers.\\1.attention.q_proj",
+        ),
+        rename(
+            "^vision_encoder\\.transformer\\.layers\\.(\\d+)\\.attention\\.wk(?=\\.|$)",
+            "vision_encoder.transformer.layers.\\1.attention.k_proj",
+        ),
+        rename(
+            "^vision_encoder\\.transformer\\.layers\\.(\\d+)\\.attention\\.wv(?=\\.|$)",
+            "vision_encoder.transformer.layers.\\1.attention.v_proj",
+        ),
+        rename(
+            "^vision_encoder\\.transformer\\.layers\\.(\\d+)\\.attention\\.wo(?=\\.|$)",
+            "vision_encoder.transformer.layers.\\1.attention.o_proj",
+        ),
+        rename(
+            "^vision_encoder\\.transformer\\.layers\\.(\\d+)\\.feed_forward\\.w1(?=\\.|$)",
+            "vision_encoder.transformer.layers.\\1.feed_forward.gate_proj",
+        ),
+        rename(
+            "^vision_encoder\\.transformer\\.layers\\.(\\d+)\\.feed_forward\\.w2(?=\\.|$)",
+            "vision_encoder.transformer.layers.\\1.feed_forward.down_proj",
+        ),
+        rename(
+            "^vision_encoder\\.transformer\\.layers\\.(\\d+)\\.feed_forward\\.w3(?=\\.|$)",
+            "vision_encoder.transformer.layers.\\1.feed_forward.up_proj",
+        ),
+        rename("\\.linear_1\\.", ".w_in."),
+        rename("\\.linear_2\\.", ".w_out."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_encoder."),
+        rename("^model\\.multi_modal_projector\\.", "vision_language_adapter."),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+        fused(".qkv_proj", ".wq", ".wk", ".wv"),
+        fused(".gate_up_proj", ".w1", ".w3"),
+    ],
+    # TODO: old loader: tensor_ops
+    "PixtralHFVisionModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen2RewardBaseModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen2VLForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+    ],
+    "Qwen2VisionTransformer": [
+        fused(".qkv", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen2_5OmniThinkerForConditionalGeneration": [
+        rename("^thinker\\.lm_head\\.", "language_model.lm_head."),
+        rename("^thinker\\.model\\.", "language_model.model."),
+        rename("^thinker\\.", ""),
+        drop("^talker\\."),
+        drop("^token2wav\\."),
+    ],
+    "Qwen2_5_VLForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.", "language_model.model."),
+    ],
+    "Qwen2_5_VisionTransformer": [
+        fused(".mlp.gate_up_proj.", ".mlp.gate_proj.", ".mlp.up_proj."),
+        fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
+    ],
+    "Qwen3ASRForConditionalGeneration": [
+        rename("^thinker\\.lm_head\\.", "language_model.lm_head."),
+        rename("^thinker\\.model\\.", "language_model.model."),
+        rename("^thinker\\.", ""),
+        rename("^model\\.audio_tower\\.", "audio_tower."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.multi_modal_projector\\.linear_1\\.", "audio_tower.proj1."),
+        rename("^model\\.multi_modal_projector\\.linear_2\\.", "audio_tower.proj2."),
+        drop("^talker\\."),
+        drop("^code2wav\\."),
+    ],
+    "Qwen3ASRForcedAlignerForTokenClassification": [
+        rename("^thinker\\.lm_head\\.", "classifier."),
+        rename("^thinker\\.model\\.", "language_model.model."),
+        rename("^thinker\\.", ""),
+        drop("^talker\\."),
+        drop("^code2wav\\."),
+    ],
+    "Qwen3Eagle3Model": [
+        rename("midlayer\\.", "layers.0."),
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3ForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3Model": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3MoeForCausalLM": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3MoeModel": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3MoeSparseMoeBlock": [
+        *experts(),
+    ],
+    "Qwen3NextForCausalLM": [
+        drop("^mtp\\."),
+    ],
+    "Qwen3NextModel": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3NextMultiTokenPredictor": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3NextSparseMoeBlock": [
+        *experts(),
+    ],
+    "Qwen3OmniMoeAudioEncoder": [
+        fused(
+            ".self_attn.qkv_proj.",
+            ".self_attn.q_proj.",
+            ".self_attn.k_proj.",
+            ".self_attn.v_proj.",
+        ),
+    ],
+    "Qwen3OmniMoeThinkerForConditionalGeneration": [
+        rename("^thinker\\.lm_head\\.", "language_model.lm_head."),
+        rename("^thinker\\.model\\.", "language_model.model."),
+        rename("^thinker\\.", ""),
+        drop("^talker\\."),
+        drop("^code2wav\\."),
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "Qwen3Omni_VisionTransformer": [
+        fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
+    ],
+    "Qwen3VLForConditionalGeneration": [
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+    ],
+    "Qwen3_5ForCausalLMBase": [
+        rename("^model\\.language_model\\.", "model."),
+        drop("^mtp\\."),
+    ],
+    "Qwen3_5ForConditionalGeneration": [
+        rename("^model\\.visual\\.", "visual."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        drop("^mtp\\."),
+    ],
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    "Qwen3_5Model": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    "Qwen3_5MultiTokenPredictor": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Qwen3_VisionTransformer": [
+        fused("attn.qkv.", "attn.q.", "attn.k.", "attn.v."),
+    ],
+    "Qwen4ExpForCausalLM": [
+        rename("^model\\.language_model\\.", "model."),
+    ],
+    # TODO: old loader: tensor_ops
+    "Qwen4ExpMegaMoEExperts": [],
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    "Qwen4ExpModel": [
+        fused(
+            "hyper_connection.input_mix_weight_down_block_inject.weight",
+            "hyper_connection.input_mix_weight_down.weight",
+            "hyper_connection.block_inject_weight.weight",
+        ),
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused("ple.kv_proj", "ple.key_proj", "ple.value_proj"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: mapper _EXTRA_WEIGHTS_MAPPER not literal
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
+    "Qwen4ExpMultiTokenPredictor": [
+        fused(
+            ".shared_expert.gate_up_proj",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "RForConditionalGeneration": [
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.vision_tower\\.", "vision_tower."),
+        rename("^model\\.multi_modal_projector\\.", "multi_modal_projector."),
+        rename("^model\\.image_newline", "image_newline"),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "RadioModel": [
+        rename(
+            "radio_model\\.model\\.patch_generator\\.video_embedder",
+            "embeddings.video_patch_projection",
+        ),
+        rename(
+            "radio_model\\.model\\.patch_generator\\.embedder",
+            "embeddings.patch_projection",
+        ),
+        rename(
+            "radio_model\\.model\\.patch_generator\\.pos_embed",
+            "embeddings.position_embedding",
+        ),
+        rename(
+            "radio_model\\.model\\.patch_generator\\.cls_token\\.token",
+            "embeddings.cls_register_token",
+        ),
+        rename("radio_model\\.model\\.blocks", "encoder.layer"),
+        rename("\\.attn\\.", ".attention."),
+        rename("\\.ls1", ".layer_scale1.lambda1"),
+        rename("\\.ls2", ".layer_scale2.lambda1"),
+        rename("attention\\.output\\.dense", "attention.proj"),
+        rename("attention\\.o_proj", "attention.proj"),
+        drop("input_conditioner"),
+        drop("summary_idxs"),
+        fused(
+            "attention.qkv",
+            "attention.attention.query",
+            "attention.attention.key",
+            "attention.attention.value",
+        ),
+        fused(
+            "attention.qkv", "attention.q_proj", "attention.k_proj", "attention.v_proj"
+        ),
+    ],
+    # TODO: old loader: tensor_ops
+    "RadioWithNeck": [],
+    "RicursiveForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkg_proj", ".q_proj", ".k_proj", ".g_proj"),
+    ],
+    "Rnj1ForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "SarvamMLAMoE": [
+        *experts(),
+    ],
+    "SarvamMLAModel": [
+        fused(
+            ".shared_experts.gate_up_proj",
+            ".shared_experts.gate_proj",
+            ".shared_experts.up_proj",
+        ),
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+    ],
+    # TODO: old loader: tensor_ops
+    "Siglip2Model": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Siglip2NavitModel": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Siglip2VisionTransformer": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "SiglipEmbeddingModel": [
+        drop("\\.position_ids"),
+    ],
+    "SiglipTextTransformer": [
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "SiglipVisionModel": [
+        drop("head\\.attention"),
+        drop("head\\.layernorm"),
+        drop("head\\.mlp"),
+        drop("head\\.probe"),
+        drop("packing_position_embedding"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: mapper orig_to_new_prefix not literal
+    "SkyworkR1VChatModel": [],
+    "SnowflakeGteNewModel": [
+        rename("layer", "layers"),
+        rename("attention\\.qkv_proj", "attn.qkv_proj"),
+        rename("attention\\.o_proj", "attn.out_proj"),
+    ],
+    "SolarForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Step1ForCausalLM": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Step3TextDecoderLayer": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "Step3TextModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+    ],
+    "Step3VLForConditionalGeneration": [
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "Step3p5DecoderLayer": [
+        *experts(),
+    ],
+    "Step3p5ForCausalLM": [
+        rename("\\.share_expert\\.", ".moe.share_expert."),
+    ],
+    # TODO: old loader: stacked_unparsed
+    "Step3p5MTP": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "Step3p5Model": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "Step3p7ForConditionalGeneration": [
+        rename("\\.attn\\.in_proj_weight", ".attn.qkv_proj.weight"),
+        rename("\\.attn\\.in_proj_bias", ".attn.qkv_proj.bias"),
+        rename("\\.mlp\\.c_fc", ".mlp.fc1"),
+        rename("\\.mlp\\.c_proj", ".mlp.fc2"),
+        rename("^model\\.vision_model\\.", "vision_model."),
+        rename("^model\\.vit_large_projector\\.", "vit_large_projector."),
+        rename("^model\\.vit_large_projector", "vit_large_projector"),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.language_model", "language_model.model"),
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^lm_head", "language_model.lm_head"),
+    ],
+    "Step5ForCausalLM": [
+        drop("^vit_large_projector\\.weight$"),
+        rename("(?<!\\.moe)\\.share_expert\\.", ".moe.share_expert."),
+    ],
+    # TODO: mapper STEP5_SHARE_EXPERT_MAPPER not literal
+    "Step5ForConditionalGeneration": [
+        rename("\\.attn\\.in_proj_weight", ".attn.qkv_proj.weight"),
+        rename("\\.attn\\.in_proj_bias", ".attn.qkv_proj.bias"),
+        rename("\\.mlp\\.c_fc", ".mlp.fc1"),
+        rename("\\.mlp\\.c_proj", ".mlp.fc2"),
+        rename("^model\\.vision_model\\.", "vision_model."),
+        rename("^model\\.vit_large_projector\\.", "vit_large_projector."),
+        rename("^model\\.vit_large_projector", "vit_large_projector"),
+        rename("^model\\.language_model\\.", "language_model.model."),
+        rename("^model\\.language_model", "language_model.model"),
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+        rename("^lm_head", "language_model.lm_head"),
+    ],
+    # TODO: old loader: tensor_ops
+    "Step5FusedQKVIndexerLinear": [],
+    # TODO: old loader: tensor_ops
+    "Step5MegaMoEExperts": [],
+    "Step5MoE": [
+        *experts(),
+    ],
+    # TODO: old loader: stacked_unparsed
+    # TODO: old loader: tensor_ops
+    "Step5Model": [],
+    # TODO: old loader: tensor_ops
+    "Step5SparseIndexerIndexTPLinear": [],
+    "StepVLForConditionalGeneration": [
+        rename("\\.attn\\.in_proj_weight", ".attn.qkv_proj.weight"),
+        rename("\\.attn\\.in_proj_bias", ".attn.qkv_proj.bias"),
+        rename("\\.mlp\\.c_fc", ".mlp.fc1"),
+        rename("\\.mlp\\.c_proj", ".mlp.fc2"),
+        rename("^model\\.", "language_model.model."),
+        rename("^lm_head\\.", "language_model.lm_head."),
+    ],
+    "UltraBertModel": [
+        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
+        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
+    ],
+    "UltravoxModel": [
+        rename("^audio_tower\\.model\\.encoder\\.", "audio_tower."),
+        drop("^audio_tower\\.model\\."),
+        drop("^audio_tower\\.proj_out\\."),
+    ],
+    # TODO: mapper weights_transforms not literal
+    "WhisperForConditionalGeneration": [
+        rename("\\.fc1\\.", ".mlp.fc1."),
+        rename("\\.fc2\\.", ".mlp.fc2."),
+        drop("^proj_out\\."),
+        fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    # TODO: old loader: tensor_ops
+    "XPressRefinerHead": [],
+    "Zamba2ForCausalLM": [
+        rename("A_log", "A"),
+        rename("0\\.weight", "A.weight"),
+        rename("1\\.weight", "B.weight"),
+        fused(
+            ".self_attn.qkv_proj",
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+        ),
+    ],
+    # TODO: old loader: tensor_ops
+    "ZayaForCausalLM": [],
+    "ZayaSparseMoeBlock": [
+        *experts(),
+    ],
+    "_TmlForCausalLMBase": [
+        rename("\\.w13_dn", ".gate_up_proj"),
+        rename("\\.w2_md", ".down_proj"),
+        rename("^model\\.llm\\.layers\\.", "model.layers."),
+        rename("^model\\.llm\\.embed_norm", "model.embed_norm"),
+        rename("^model\\.llm\\.embed", "model.embed_tokens"),
+        rename("^model\\.llm\\.norm", "model.norm"),
+        rename("^model\\.llm\\.unembed", "lm_head"),
+        rename("^language_model\\.layers\\.", "model.layers."),
+        rename("^language_model\\.lm_head\\.", "lm_head."),
+        rename("\\.w13_weight\\.scale$", ".routed_experts.w13_weight_scale"),
+        rename("\\.w13_weight\\.scale2$", ".routed_experts.w13_weight_scale_2"),
+        rename("\\.w2_weight\\.scale$", ".routed_experts.w2_weight_scale"),
+        rename("\\.w2_weight\\.scale2$", ".routed_experts.w2_weight_scale_2"),
+        rename(
+            "\\.w13_weight\\.input_global_scale$",
+            ".routed_experts.w13_input_global_scale",
+        ),
+        rename(
+            "\\.w13_weight\\.weight_global_scale$",
+            ".routed_experts.w13_weight_global_scale",
+        ),
+        rename("\\.w13_weight\\.weight_packed$", ".routed_experts.w13_weight_packed"),
+        rename("\\.w13_weight\\.weight_scale$", ".routed_experts.w13_weight_scale"),
+        rename(
+            "\\.w2_weight\\.input_global_scale$",
+            ".routed_experts.w2_input_global_scale",
+        ),
+        rename(
+            "\\.w2_weight\\.weight_global_scale$",
+            ".routed_experts.w2_weight_global_scale",
+        ),
+        rename("\\.w2_weight\\.weight_packed$", ".routed_experts.w2_weight_packed"),
+        rename("\\.w2_weight\\.weight_scale$", ".routed_experts.w2_weight_scale"),
+        fused(
+            ".attn.qkvr.",
+            ".attn.wq_du.",
+            ".attn.wk_dv.",
+            ".attn.wv_dv.",
+            ".attn.wr_du.",
         ),
     ],
 }
 
 
-def get_conversion_mapping(model) -> list[WeightTransform]:
-    """The model's conversions, by class name then HF `model_type`; none: as is"""
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    for key in (type(model).__name__, model_type):
-        if key in _CONVERSION_MAPPING:
-            return _CONVERSION_MAPPING[key]
-    return []
+def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
+    """The entries of the model's classes, each scoped to where its instances live
+    (e.g. a vision tower's to `visual`), outermost first: its renamings see the
+    checkpoint's names, its converters the model's"""
+    instances: dict[str, list[str]] = {}
+    for name, module in model.named_modules():
+        if type(module).__name__ in _CONVERSION_MAPPING:
+            instances.setdefault(type(module).__name__, []).append(name)
+    out = []
+    for cls, names in sorted(instances.items(), key=lambda kv: min(map(len, kv[1]))):
+        parts = os.path.commonprefix([name.split(".") for name in names])
+        scope = ".".join(p for p in parts if not p.isdigit())
+        for transform in _CONVERSION_MAPPING[cls]:
+            transform = deepcopy(transform)
+            if scope:
+                transform.scope_prefix, transform.base_model_prefix = scope, ""
+            out.append(transform)
+    return out
