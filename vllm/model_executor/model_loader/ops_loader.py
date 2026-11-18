@@ -240,7 +240,11 @@ def load_with_ops(
     if conversions is None:
         conversions = get_conversion_mapping(model)
 
-    def get_sharding_op(target, param, converter, source_pattern):
+    # the live params: `state_dict()` (what Transformers passes) drops their attributes
+    params = dict(model.named_parameters()) | dict(model.named_buffers())
+
+    def get_sharding_op(target, _detached, converter, source_pattern):
+        param = params[target]
         if isinstance(converter, WeightConverter):
             if len(converter.target_patterns) > 1:  # split: each output sharded after
                 if not any(isinstance(op, ShardOutputs) for op in converter.operations):
