@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import itertools
 from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -29,24 +28,6 @@ if TYPE_CHECKING:
 _T = TypeVar("_T", bound=nn.Module)
 
 logger = init_logger(__name__)
-
-# Load formats whose weight iterators yield tensors that are never reused
-_OWNED_TENSOR_LOAD_FORMATS = frozenset(
-    {
-        "auto",
-        "hf",
-        "safetensors",
-        "mistral",
-        "pt",
-        "npcache",
-        "instanttensor",
-        "tensorizer",
-        "sharded_state",
-        "modelexpress",
-        "runai_streamer",
-        "runai_streamer_sharded",
-    }
-)
 
 _GENERATE_SUFFIXES = [
     "ForCausalLM",
@@ -197,70 +178,11 @@ def _create_pooling_model_cls(orig_cls: type[_T]) -> type[_T]:
         def _load_pooling_model_weights(
             self, weights: Iterable[tuple[str, torch.Tensor]]
         ):
-            params_dict = dict(self.named_parameters())
-            # Use model-owned remapping only for the probe membership check
-            # (e.g. Gemma4 model.language_model.* -> language_model.model.*)
-            # so the "" / "model." scan can early-exit. Forwarded names stay
-            # unmapped to avoid double-applying the mapper in the parent loader.
-            hf_to_vllm_mapper = rename_mapper(self)
-
-            # We support loading from both `*ForCausalLM` and `*Model`
-            candidate_prefixes = ["", "model."]
-            target_prefix = ""
-
-            seen_weights = list[tuple[str, torch.Tensor]]()
-            owned = (
-                self.vllm_config.load_config.load_format in _OWNED_TENSOR_LOAD_FORMATS
-            )
-            for name, loaded_weight in weights:
-                # Clone because the iterator may reuse the tensor buffer
-                seen_weights.append(
-                    (name, loaded_weight if owned else loaded_weight.clone())
-                )
-
-                lookup_name = name
-                if hf_to_vllm_mapper is not None:
-                    mapped = hf_to_vllm_mapper._map_name(name)
-                    if mapped is None:
-                        continue
-                    lookup_name = mapped
-
-                try:
-                    target_prefix = next(
-                        prefix
-                        for prefix in candidate_prefixes
-                        if prefix + lookup_name in params_dict
-                    )
-                    break
-                except StopIteration:
-                    # The weight might not exist on the model
-                    # (to be handled by AutoWeightsLoader)
-                    pass
-
-            if target_prefix:
-                target_model = self
-                for attr in target_prefix.split("."):
-                    if attr:
-                        target_model = getattr(self, attr)
-
-                logger.info(
-                    "Mapping weights to %s as they are "
-                    "relative to this model instead of %s.",
-                    target_model._get_name(),
-                    self._get_name(),
-                )
-
-            # Lazy chain so buffer-reusing weight iterators are consumed
-            # one tensor at a time.
-            mapped_weights = (
-                (target_prefix + name, weight)
-                for name, weight in itertools.chain(seen_weights, weights)
-            )
-
+            # a `*ForCausalLM` checkpoint into a `*Model` or the reverse: Transformers
+            # strips or adds the `base_model_prefix`
             from vllm.model_executor.model_loader.ops_loader import load_with_ops
 
-            return load_with_ops(self, mapped_weights)
-
+            return load_with_ops(self, weights)
 
     return ModelForPooling
 
@@ -394,7 +316,6 @@ def as_seq_cls_model(cls: type[_T]) -> type[_T]:
             assert pooler_config is not None
 
             return DispatchPooler.for_seq_cls(pooler_config, classifier=self.score)
-
 
     ModelForSequenceClassification.__name__ = _get_pooling_model_name(
         cls.__name__, "ForSequenceClassification"
