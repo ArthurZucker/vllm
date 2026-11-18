@@ -24,6 +24,7 @@ from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import (
     Concatenate,
     MergeModulelist,
+    Transpose,
     WeightConverter,
     WeightRenaming,
     WeightTransform,
@@ -34,7 +35,6 @@ from vllm.model_executor.model_loader.weight_ops import (
     OutputConcatenate,
     RepeatLastSource,
     SwapHalves,
-    TransposeFull,
     ZeroMissingSource,
 )
 
@@ -166,9 +166,7 @@ TRANSFORMER_PREFIX = rename(r"^(?!transformer\.|lm_head\.|score\.)", "transforme
 GPT2 = [
     TRANSFORMER_PREFIX,
     *(
-        WeightConverter(
-            f".{proj}.weight", f".{proj}.weight", operations=[TransposeFull()]
-        )
+        WeightConverter(f".{proj}.weight", f".{proj}.weight", operations=[Transpose()])
         for proj in ("c_attn", "c_proj", "c_fc")
     ),
 ]

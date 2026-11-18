@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from transformers.core_model_loading import (
     ConversionOps,
+    Transpose,
     WeightConverter,
     WeightTransform,
     convert_and_load_state_dict_in_model,
@@ -44,7 +45,14 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.conversion_mapping import get_conversion_mapping
-from vllm.model_executor.model_loader.weight_ops import PadToParam
+from vllm.model_executor.model_loader.weight_ops import (
+    Deinterleave,
+    PadToParam,
+    SwapHalves,
+)
+
+# ops reordering a whole tensor: the loader shards their output, not their input
+NEEDS_FULL = (Transpose, SwapHalves, Deinterleave)
 
 logger = init_logger(__name__)
 
@@ -281,7 +289,7 @@ def load_with_ops(
         param = params.get(target)
         param = model.get_parameter(target) if param is None else param  # tied
         if isinstance(converter, WeightConverter):
-            full = any(getattr(op, "needs_full", False) for op in converter.operations)
+            full = any(isinstance(op, NEEDS_FULL) for op in converter.operations)
             if len(converter.target_patterns) > 1 or full:  # each output sharded after
                 if not any(isinstance(op, ShardOutputs) for op in converter.operations):
                     converter.operations = [*converter.operations, ShardOutputs(model)]
