@@ -96,13 +96,16 @@ class VllmShard:
     `DtensorShardOperation` interface: `shard_tensor(source, tensor_idx)` is this
     rank's slice, `None` if the rank holds none of it (another rank's expert)."""
 
-    def __init__(self, model, name: str, param, sources: int, index: int, expert: bool):
+    def __init__(
+        self, model, name, param, sources: int, index: int, expert: bool, shards=None
+    ):
         self.param, self.sources, self.index, self.expert = (
             param,
             sources,
             index,
             expert,
         )
+        self.covers = shards  # shards each source fills (`conversion_mapping.Fused`)
         self.layer = model.get_submodule(name.rpartition(".")[0])
 
     def shard_tensor(self, source, tensor_idx=None, device=None, dtype=None):
@@ -151,6 +154,12 @@ class VllmShard:
         shards = getattr(layer, "shard_ids", None) or []
         if self.sources == 1 and len(shards) > 1:  # fused on disk, e.g. `qkv_proj`
             return self._fused_on_disk(source, shards, dim, rank, size)
+        if self.covers and self.covers[self.index] > 1:  # a source filling several
+            first = sum(self.covers[: self.index])
+            covered = shards[first : first + self.covers[self.index]]
+            return self._fused_on_disk(source, covered, dim, rank, size)
+        if self.covers:  # each source's first shard
+            shards = [shards[sum(self.covers[:i])] for i in range(len(self.covers))]
         replicas = 1
         if getattr(self.param, "shard_even", False):  # the source evenly, e.g. sinks
             local = shape[dim] // size
@@ -281,7 +290,8 @@ def load_with_ops(
             index, expert = sources.index(source_pattern), "*" in source_pattern
         else:
             sources, index, expert = [source_pattern], 0, False
-        return VllmShard(model, target, param, len(sources), index, expert)
+        shards = getattr(converter, "shards", None)
+        return VllmShard(model, target, param, len(sources), index, expert, shards)
 
     if not hasattr(model, "base_model_prefix"):
         # The module holding the model's body (e.g. `transformer`): Transformers adds or

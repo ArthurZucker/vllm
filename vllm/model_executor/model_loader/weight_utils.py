@@ -1611,8 +1611,6 @@ def make_attention_sink(
     return sink
 
 
-
-
 def composed_weight_loader(
     loader: LoaderFunction, fn: Callable[[torch.Tensor], torch.Tensor]
 ) -> LoaderFunction:

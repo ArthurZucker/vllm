@@ -49,9 +49,20 @@ def drop(pattern: str) -> WeightRenaming:
     return WeightRenaming(pattern, "_dropped_")
 
 
-def fused(target: str, *sources: str) -> WeightConverter:
-    """`sources` concatenated into the fused `target`, in its shard order"""
-    return WeightConverter(list(sources), target, operations=[OutputConcatenate()])
+class Fused(WeightConverter):
+    """`WeightConverter` concatenating its sources into a fused param; `shards[i]` is
+    how many of the param's shards source `i` fills (Qwen3.5's `in_proj_qkv`: 3)"""
+
+    __slots__ = ("shards",)
+
+
+def fused(target: str, *sources: str | tuple[str, int]) -> WeightConverter:
+    """`sources` concatenated into the fused `target`, in its shard order; a source
+    filling several shards is `(pattern, shards)`"""
+    patterns = [s if isinstance(s, str) else s[0] for s in sources]
+    converter = Fused(patterns, target, operations=[OutputConcatenate()])
+    converter.shards = [1 if isinstance(s, str) else s[1] for s in sources]
+    return converter
 
 
 # Transformers' experts (`experts.gate_up_proj`, `[E, 2I, H]`: gate then up) are vLLM's
@@ -1223,9 +1234,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^lm_head\\.", "language_model.lm_head."),
         rename("^model\\.language_model\\.", "language_model.model."),
     ],
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
     "InternS2MobiusModel": [
+        fused(".in_proj_qkvz", (".in_proj_qkv", 3), ".in_proj_z"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(
             ".shared_expert.gate_up_proj",
             ".shared_expert.gate_proj",
@@ -2197,9 +2208,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model\\.language_model\\.", "language_model.model."),
         drop("^mtp\\."),
     ],
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
     "Qwen3_5Model": [
+        fused(".in_proj_qkvz", (".in_proj_qkv", 3), ".in_proj_z"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(
             ".shared_expert.gate_up_proj",
             ".shared_expert.gate_proj",
@@ -2209,9 +2220,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
     "Qwen3_5MultiTokenPredictor": [
+        fused(".in_proj_qkvz", (".in_proj_qkv", 3), ".in_proj_z"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(
             ".shared_expert.gate_up_proj",
             ".shared_expert.gate_proj",
@@ -2229,9 +2240,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: tensor_ops
     "Qwen4ExpMegaMoEExperts": [],
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
     "Qwen4ExpModel": [
+        fused(".in_proj_qkvz", (".in_proj_qkv", 3), ".in_proj_z"),
+        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(
             "hyper_connection.input_mix_weight_down_block_inject.weight",
             "hyper_connection.input_mix_weight_down.weight",
