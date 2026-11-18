@@ -53,6 +53,8 @@ from vllm.model_executor.model_loader.weight_ops import (
     PadToParam,
     SwapHalves,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 
 # ops reordering a whole tensor: the loader shards their output, not their input
 NEEDS_FULL = (Transpose, SwapHalves, Deinterleave)
@@ -252,6 +254,13 @@ class ShardOutputs(ConversionOps):
         return output
 
 
+def _load_into(param: torch.Tensor, value: torch.Tensor) -> None:
+    """`value` (this rank's, converted) into `param`, through the param's loader: the
+    copy, or what wraps it (online quantization, layerwise reload: buffered until the
+    layer is complete)"""
+    (getattr(param, "weight_loader", None) or default_weight_loader)(param, value)
+
+
 def _padded_converters(model: nn.Module) -> list[WeightConverter]:
     """A `PadToParam` converter for each param larger than its checkpoint tensor:
     vocabularies padded to a multiple of the ranks, `pad_value` params (sinks)"""
@@ -327,13 +336,17 @@ def load_with_ops(
             if "head" not in name and next(child.parameters(), None) is not None
         ]
         model.base_model_prefix = bodies[0] if len(bodies) == 1 else "model"
-    device = next(model.parameters()).device
+    # online quantization builds its layers on `meta`, filled when complete
+    device = next(
+        (p.device for p in model.parameters() if p.device.type != "meta"),
+        torch.device(current_platform.device_type),  # this rank's current device
+    )
     config = LoadStateDictConfig(
         weight_mapping=conversions,
         device_map={"": device},
         hf_quantizer=hf_quantizer,
         get_sharding_op=get_sharding_op,
-        load_in_place=True,
+        load_in_place=_load_into,
     )
     info, _ = convert_and_load_state_dict_in_model(model, dict(weights), config)
     unexpected = sorted(k for k in info.unexpected_keys if "_dropped_" not in k)
