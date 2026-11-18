@@ -18,7 +18,7 @@ class MuseSparkForConditionalGeneration(
 ):
     """Muse Spark Omni: ROCm text stack plus NaViT vision and waveform audio."""
 
-    hf_to_vllm_mapper = MuseSparkForCausalLM.hf_to_vllm_mapper | OMNI_WEIGHTS_MAPPER
+    hf_to_vllm_mapper = OMNI_WEIGHTS_MAPPER
 
 
 __all__ = ["MuseSparkForConditionalGeneration"]

@@ -13,9 +13,7 @@ class Step5ForConditionalGeneration(Step3p7ForConditionalGeneration, SupportsLoR
     """Step5 VLM using the Step3p7 multimodal frontend and Step5 text model."""
 
     packed_modules_mapping = STEP5_PACKED_MODULES_MAPPING
-    hf_to_vllm_mapper = (
-        Step3p7ForConditionalGeneration.hf_to_vllm_mapper | STEP5_SHARE_EXPERT_MAPPER
-    )
+    hf_to_vllm_mapper = STEP5_SHARE_EXPERT_MAPPER
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

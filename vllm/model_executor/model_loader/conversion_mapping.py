@@ -185,6 +185,11 @@ def _own_mapper(module: nn.Module) -> list[WeightTransform]:
     return from_mapper(module.hf_to_vllm_mapper)
 
 
+def _extends(base: str) -> Callable:
+    """A class whose mapper extends another's: that class's entry, then its own"""
+    return lambda module: [*_CONVERSION_MAPPING[base], *_own_mapper(module)]
+
+
 def _gemma4(module: nn.Module) -> list[WeightTransform]:
     """`attention_k_eq_v` full-attention layers ship `k_proj` only: K is loaded into
     both the K and V shards. KV-shared layers only have `q_proj`, kept as is"""
@@ -256,9 +261,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "EmbeddingGemma2Model": _own_mapper,
     "K3DSparkForCausalLM": _own_mapper,
     "MiniMaxM3SparseForCausalLM": _own_mapper,
-    "MuseSparkForConditionalGeneration": _own_mapper,
-    "Qwen4ExpMultiTokenPredictor": _own_mapper,
-    "Step5ForConditionalGeneration": _own_mapper,
+    "MuseSparkForConditionalGeneration": _extends("MuseSparkForCausalLM"),
+    "Qwen4ExpMultiTokenPredictor": _extends("Qwen3_5Model"),
+    "Step5ForConditionalGeneration": _extends("Step3p7ForConditionalGeneration"),
     "MiMoMTP": _mimo_mtp,
     "ErnieMTP": _ernie_mtp,
     "AIMv2Model": [

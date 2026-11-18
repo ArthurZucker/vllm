@@ -30,7 +30,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.interfaces import SupportsHCSP, SupportsPP
-from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     WeightsMapper,
     get_draft_quant_config,
@@ -176,7 +175,7 @@ def _make_draft_vllm_config(
     }
 )
 class Qwen4ExpMultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
+    hf_to_vllm_mapper = _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

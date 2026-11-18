@@ -252,6 +252,15 @@ def load_with_ops(
             sources, index, expert = [source_pattern], 0, False
         return VllmShard(model, target, param, len(sources), index, expert)
 
+    if not hasattr(model, "base_model_prefix"):
+        # The module holding the model's body (e.g. `transformer`): Transformers adds or
+        # strips it from checkpoint keys saved with or without it (Bloom, GPT-2, ...)
+        bodies = [
+            name
+            for name, child in model.named_children()
+            if "head" not in name and next(child.parameters(), None) is not None
+        ]
+        model.base_model_prefix = bodies[0] if len(bodies) == 1 else None
     device = next(model.parameters()).device
     config = LoadStateDictConfig(
         weight_mapping=conversions,

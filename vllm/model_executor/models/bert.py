@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Set
-from dataclasses import replace
 
 import torch
 from torch import nn
@@ -421,7 +420,6 @@ class BertPoolingModel(BertModel):
     is_pooling_model = True
 
     # Unlike `BertModel`, this model has a pooler to load weights into.
-    hf_to_vllm_mapper = replace(BertModel.hf_to_vllm_mapper, orig_to_new_prefix={})
 
     def __init__(
         self,
