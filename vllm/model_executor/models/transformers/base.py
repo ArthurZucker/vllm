@@ -61,6 +61,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.interfaces_base import VllmModel
 from vllm.model_executor.models.transformers.conversion import (
     convert_weights,
+    quantization_plan,
     streamable_converters,
 )
 from vllm.model_executor.models.transformers.fuser import BaseFuser, Fusers
@@ -94,6 +95,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.offloader import BaseOffloader, NoopOffloader, get_offloader
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.config import get_safetensors_params_metadata
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -914,8 +916,27 @@ class Base(
             ignore_unexpected_prefixes=self.ignore_unexpected_prefixes,
             ignore_unexpected_suffixes=self.ignore_unexpected_suffixes,
         )
-        converters = streamable_converters(self._weight_conversions())
-        weights = convert_weights(weights, converters, self.config)
+        # vLLM kept a quant config: its kernels take the tensors as they are. Else the
+        # format is one only Transformers reads, dequantized by its ops
+        hf_quantizer = quantization_plan(
+            getattr(self.config, "quantization_config", None),
+            serialized=self.quant_config is not None,
+        )
+        conversions = self._weight_conversions()
+        if hf_quantizer is not None:
+            conversions = hf_quantizer.update_weight_conversions(
+                conversions, self.model
+            )
+        checkpoint_keys = get_safetensors_params_metadata(
+            self.model_config.model, revision=self.model_config.revision
+        )
+        weights = convert_weights(
+            weights,
+            streamable_converters(conversions),
+            self.config,
+            hf_quantizer,
+            checkpoint_keys,
+        )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @staticmethod
