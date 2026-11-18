@@ -12,6 +12,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
 from vllm.transformers_utils.config import (
     try_get_dense_modules,
@@ -201,7 +202,7 @@ def _create_pooling_model_cls(orig_cls: type[_T]) -> type[_T]:
             # (e.g. Gemma4 model.language_model.* -> language_model.model.*)
             # so the "" / "model." scan can early-exit. Forwarded names stay
             # unmapped to avoid double-applying the mapper in the parent loader.
-            hf_to_vllm_mapper = getattr(self, "hf_to_vllm_mapper", None)
+            hf_to_vllm_mapper = rename_mapper(self)
 
             # We support loading from both `*ForCausalLM` and `*Model`
             candidate_prefixes = ["", "model."]
@@ -572,7 +573,7 @@ def load_weights_using_from_2_way_softmax(
     loaded_weights.add(score_weight_name)
 
     lm_head_name: str | None = "lm_head.weight"
-    if hf_to_vllm_mapper := getattr(model, "hf_to_vllm_mapper", None):
+    if hf_to_vllm_mapper := rename_mapper(model):
         lm_head_name = hf_to_vllm_mapper._map_name(lm_head_name)
     if lm_head_name is not None:
         loaded_weights.discard(lm_head_name)
@@ -638,7 +639,7 @@ def load_weights_no_post_processing(model, weights: Iterable[tuple[str, torch.Te
     loaded_weights.add(score_weight_name)
 
     lm_head_name: str | None = "lm_head.weight"
-    if hf_to_vllm_mapper := getattr(model, "hf_to_vllm_mapper", None):
+    if hf_to_vllm_mapper := rename_mapper(model):
         lm_head_name = hf_to_vllm_mapper._map_name(lm_head_name)
     if lm_head_name is not None:
         loaded_weights.discard(lm_head_name)

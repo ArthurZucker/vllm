@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from torch import nn
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import (
+    Concatenate,
     MergeModulelist,
     WeightConverter,
     WeightRenaming,
@@ -31,6 +32,7 @@ from transformers.core_model_loading import (
 from vllm.model_executor.model_loader.weight_ops import (
     OutputConcatenate,
     RepeatLastSource,
+    ZeroMissingSource,
 )
 
 if TYPE_CHECKING:
@@ -178,6 +180,11 @@ def _cosmos3_edge() -> list[WeightTransform]:
     ]
 
 
+def _own_mapper(module: nn.Module) -> list[WeightTransform]:
+    """The `WeightsMapper` a model builds for itself (from its config)"""
+    return from_mapper(module.hf_to_vllm_mapper)
+
+
 def _gemma4(module: nn.Module) -> list[WeightTransform]:
     """`attention_k_eq_v` full-attention layers ship `k_proj` only: K is loaded into
     both the K and V shards. KV-shared layers only have `q_proj`, kept as is"""
@@ -238,6 +245,20 @@ def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "Gemma4Model": _gemma4,
+    # their mapper is built per instance by a helper (TODO: return transforms)
+    "BeamModel": _own_mapper,
+    "DFlashQwen3Model": _own_mapper,
+    "DeepseekV41ForCausalLM": _own_mapper,
+    "DeepseekV41LLMForCausalLM": _own_mapper,
+    "DeepseekV4ForCausalLM": _own_mapper,
+    "DeepseekV4ForConditionalGeneration": _own_mapper,
+    "Dots3NoteForCausalLM": _own_mapper,
+    "EmbeddingGemma2Model": _own_mapper,
+    "K3DSparkForCausalLM": _own_mapper,
+    "MiniMaxM3SparseForCausalLM": _own_mapper,
+    "MuseSparkForConditionalGeneration": _own_mapper,
+    "Qwen4ExpMultiTokenPredictor": _own_mapper,
+    "Step5ForConditionalGeneration": _own_mapper,
     "MiMoMTP": _mimo_mtp,
     "ErnieMTP": _ernie_mtp,
     "AIMv2Model": [
@@ -355,16 +376,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         ),
         fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
     ],
-    "BeamModel": [
-        rename("\\.self_attn\\.gate_proj", ".self_attn.output_gate_proj"),
-        fused(
-            ".self_attn.qkv_proj",
-            ".self_attn.q_proj",
-            ".self_attn.k_proj",
-            ".self_attn.v_proj",
-        ),
-        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
-    ],
     "BeeForConditionalGeneration": [
         rename("^model\\.language_model\\.", "language_model.model."),
         rename("^model\\.vision_tower\\.", "vision_tower."),
@@ -400,8 +411,11 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("^pooler\\."),
         fused(".self.qkv_proj", ".self.query", ".self.key", ".self.value"),
     ],
-    # TODO: mapper: BertModel's without its prefixes
-    "BertPoolingModel": [],
+    "BertPoolingModel": [  # BertModel's, keeping the pooler
+        rename("LayerNorm\\.gamma", "LayerNorm.weight"),
+        rename("LayerNorm\\.beta", "LayerNorm.bias"),
+        fused(".self.qkv_proj", ".self.query", ".self.key", ".self.value"),
+    ],
     "BertWithRope": [
         rename("^model\\.", ""),
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
@@ -568,16 +582,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
     # TODO: old loader: tensor_ops
-    "DFlashQwen3Model": [
-        rename("(?<![A-Za-z0-9_])midlayer(?=\\.|\\*|$)", "layers.0"),
-        rename(
-            "(?<![A-Za-z0-9_])encoder\\.output_norm_enc(?=\\.|\\*|$)", "hidden_norm"
-        ),
-        rename("(?<![A-Za-z0-9_])encoder\\.fc(?=\\.|\\*|$)", "fc"),
-        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
-        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
-    ],
-    # TODO: old loader: tensor_ops
     "DSparkDeepseekV4ForCausalLM": [
         fused("attn.fused_wqa_wkv", "attn.wq_a", "attn.wkv"),
         fused(".gate_up_proj", ".w1", ".w3"),
@@ -646,14 +650,10 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
     ],
-    # TODO: mapper _make_deepseek_v4_weights_mapper('fp4') not literal
-    "DeepseekV41LLMForCausalLM": [],
     # TODO: old loader: tensor_ops
     "DeepseekV4AiterMegaMoEExperts": [],
     # TODO: old loader: tensor_ops
     "DeepseekV4CPUAttention": [],
-    # TODO: mapper _make_deepseek_v4_weights_mapper('fp4') not literal
-    "DeepseekV4ForCausalLM": [],
     # TODO: old loader: tensor_ops
     "DeepseekV4MegaMoEExperts": [],
     # TODO: old loader: tensor_ops
@@ -676,13 +676,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
         fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
-    "Dots3NoteForCausalLM": [
-        rename("^model\\.", "language_model.model."),
-        rename("^lm_head\\.", "language_model.lm_head."),
-        rename("^mtp\\.", "language_model.mtp."),
-        rename("^vision_encoder\\.", "visual."),
-        rename("^audio_encoder\\.", "audio_tower."),
-    ],
     "DotsOCRForCausalLM": [
         rename("\\.attn\\.qkv_proj\\.", ".attn.qkv."),
         rename("\\.attn\\.out_proj\\.", ".attn.proj."),
@@ -698,8 +691,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "EagleMistralLarge3ForCausalLM": [
         *MISTRAL_FORMAT,
     ],
-    # TODO: mapper _embedding_gemma2_weights_mapper() not literal
-    "EmbeddingGemma2Model": [],
     "Ernie4_5_MoeModel": [
         drop("mtp"),
         fused(
@@ -1269,14 +1260,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
         fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
-    "K3DSparkForCausalLM": [
-        drop("confidence_head"),
-        drop("embed_tokens"),
-        drop("lm_head"),
-        rename("^", "model."),
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
-        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
-    ],
     "KimiAudioForConditionalGeneration": [
         rename("\\.fc1\\.", ".mlp.fc1."),
         rename("\\.fc2\\.", ".mlp.fc2."),
@@ -1656,19 +1639,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         ),
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
     ],
-    "MiniMaxM3SparseForCausalLM": [
-        drop("mtp\\."),
-        rename("weight_scale_inv", "weight_scale"),
-        fused(
-            ".qkv_proj",
-            ".q_proj",
-            ".k_proj",
-            ".v_proj",
-            ".index_k_proj",
-            ".index_q_proj",
-        ),
-        fused(".gate_up_proj", ".gate_proj", ".up_proj"),
-    ],
     "MiniMaxM3SparseForConditionalGeneration": [
         rename("\\.mlp\\.fc1\\.", ".fc1."),
         rename("\\.mlp\\.fc2\\.", ".fc2."),
@@ -1842,8 +1812,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: tensor_ops
     "MuseSparkForCausalLM": [],
-    # TODO: mapper OMNI_WEIGHTS_MAPPER not literal
-    "MuseSparkForConditionalGeneration": [],
     # TODO: old loader: tensor_ops
     "MuseSparkQKVOGateParallelLinear": [],
     "Nemotron3_5TranscribeForConditionalGeneration": [
@@ -2244,19 +2212,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
-    # TODO: mapper _EXTRA_WEIGHTS_MAPPER not literal
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
-    # TODO: .in_proj_qkv fills shards [0, 1, 2] of .in_proj_qkvz
-    "Qwen4ExpMultiTokenPredictor": [
-        fused(
-            ".shared_expert.gate_up_proj",
-            ".shared_expert.gate_proj",
-            ".shared_expert.up_proj",
-        ),
-        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
-        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
-        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
-    ],
     "RForConditionalGeneration": [
         rename("^model\\.language_model\\.", "language_model.model."),
         rename("^model\\.vision_tower\\.", "vision_tower."),
@@ -2397,21 +2352,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("^vit_large_projector\\.weight$"),
         rename("(?<!\\.moe)\\.share_expert\\.", ".moe.share_expert."),
     ],
-    # TODO: mapper STEP5_SHARE_EXPERT_MAPPER not literal
-    "Step5ForConditionalGeneration": [
-        rename("\\.attn\\.in_proj_weight", ".attn.qkv_proj.weight"),
-        rename("\\.attn\\.in_proj_bias", ".attn.qkv_proj.bias"),
-        rename("\\.mlp\\.c_fc", ".mlp.fc1"),
-        rename("\\.mlp\\.c_proj", ".mlp.fc2"),
-        rename("^model\\.vision_model\\.", "vision_model."),
-        rename("^model\\.vit_large_projector\\.", "vit_large_projector."),
-        rename("^model\\.vit_large_projector", "vit_large_projector"),
-        rename("^model\\.language_model\\.", "language_model.model."),
-        rename("^model\\.language_model", "language_model.model"),
-        rename("^model\\.", "language_model.model."),
-        rename("^lm_head\\.", "language_model.lm_head."),
-        rename("^lm_head", "language_model.lm_head"),
-    ],
     # TODO: old loader: tensor_ops
     "Step5FusedQKVIndexerLinear": [],
     # TODO: old loader: tensor_ops
@@ -2440,9 +2380,20 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: mapper weights_transforms not literal
     "WhisperForConditionalGeneration": [
-        rename("\\.fc1\\.", ".mlp.fc1."),
-        rename("\\.fc2\\.", ".mlp.fc2."),
-        drop("^proj_out\\."),
+        rename(r"\.fc1\.", ".mlp.fc1."),
+        rename(r"\.fc2\.", ".mlp.fc2."),
+        drop(r"^proj_out\."),
+        # k_proj ships no bias: zeros in its slot of the fused bias
+        WeightConverter(
+            [f".self_attn.{p}_proj.bias" for p in "qkv"],
+            ".self_attn.qkv_proj.bias",
+            operations=[ZeroMissingSource(), OutputConcatenate()],
+        ),
+        WeightConverter(
+            [".encoder_attn.k_proj.bias", ".encoder_attn.v_proj.bias"],
+            ".encoder_attn.kv_proj.bias",
+            operations=[ZeroMissingSource(), OutputConcatenate()],
+        ),
         fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
         fused(
             ".self_attn.qkv_proj",
@@ -2511,6 +2462,71 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
 }
 
 
+def _shard_order(shard) -> tuple:
+    """Shards in a fused param's order: indices, then q, k, v, then the others"""
+    if isinstance(shard, int):
+        return (0, shard)
+    return (1, {"q": 0, "k": 1, "v": 2}.get(shard, 3), str(shard))
+
+
+def from_mapper(mapper: "WeightsMapper") -> list[WeightTransform]:
+    """A vLLM `WeightsMapper` built by a model's helper (e.g. DeepSeek V4's, per expert
+    dtype), as Transformers transforms: its rules in their order (renamings, regex,
+    substrings, prefixes, suffixes), its stacked shards as fused converters.
+    TODO: rewrite those helpers to return transforms directly."""
+    rules: list[WeightTransform] = list(mapper.orig_to_new_renaming)
+    for pattern, new in mapper.orig_to_new_regex.items():
+        rules.append(
+            drop(pattern.pattern) if new is None else rename(pattern.pattern, new)
+        )
+    for kind, wrap in (
+        ("orig_to_new_substr", lambda k: re.escape(k)),
+        ("orig_to_new_prefix", lambda k: "^" + re.escape(k)),
+        ("orig_to_new_suffix", lambda k: re.escape(k) + "$"),
+    ):
+        for key, new in getattr(mapper, kind).items():
+            rules.append(drop(wrap(key)) if new is None else rename(wrap(key), new))
+    shards: dict[str, list[tuple]] = {}
+    for source, (target, shard) in mapper.orig_to_new_stacked.items():
+        for one in shard if isinstance(shard, list) else [shard]:
+            shards.setdefault(target, []).append((one, source))
+    for target, members in shards.items():
+        members.sort(key=lambda member: _shard_order(member[0]))
+        rules.append(fused(target, *(source for _, source in members)))
+    return rules
+
+
+def _layer_experts(model: nn.Module) -> list[WeightTransform]:
+    """Per-expert checkpoints of the model's `FusedMoE` layers, by the names each layer
+    gives its checkpoint's experts (`ckpt_gate_proj_name`, ...): Transformers' expert
+    merge, for the models Transformers does not map"""
+    names = {
+        (m.ckpt_gate_proj_name, m.ckpt_up_proj_name, m.ckpt_down_proj_name)
+        for m in model.modules()
+        if hasattr(m, "ckpt_gate_proj_name")
+    }
+    out: list[WeightTransform] = []
+    for gate, up, down in sorted(names, key=str):
+        sources = [f"experts.*.{gate}.weight"] + (
+            [f"experts.*.{up}.weight"] if up else []
+        )
+        out.append(
+            WeightConverter(
+                sources,
+                TRANSFORMERS_EXPERTS["experts.gate_up_proj"],
+                operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+            )
+        )
+        out.append(
+            WeightConverter(
+                f"experts.*.{down}.weight",
+                TRANSFORMERS_EXPERTS["experts.down_proj"],
+                operations=[MergeModulelist(dim=0)],
+            )
+        )
+    return out
+
+
 def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
     """The entries of the model's classes, each scoped to where its instances live
     (e.g. a vision tower's to `visual`), outermost first: its renamings see the
@@ -2527,6 +2543,7 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
         if getattr(getattr(module, "config", None), "model_type", None)
     }
     out = to_vllm([e for t in sorted(model_types) for e in transformers_experts(t)])
+    out += _layer_experts(model)
     for cls, names in sorted(instances.items(), key=lambda kv: min(map(len, kv[1]))):
         parts = os.path.commonprefix([name.split(".") for name in names])
         scope = ".".join(p for p in parts if not p.isdigit())

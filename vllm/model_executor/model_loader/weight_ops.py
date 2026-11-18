@@ -51,3 +51,16 @@ class RepeatLastSource(ConversionOps):
             [*last, *last] if isinstance(last, list) else [last, last]
         )
         return input_dict
+
+
+class ZeroMissingSource(ConversionOps):
+    """A source the checkpoint does not ship, as zeros shaped like a present one:
+    Whisper's `k_proj` has no bias, the fused `qkv_proj.bias` has a K slot"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        present = next(iter(input_dict.values()))
+        present = present[0] if isinstance(present, list) else present
+        for pattern in source_patterns:
+            input_dict.setdefault(pattern, [torch.zeros_like(present)])
+        return input_dict
