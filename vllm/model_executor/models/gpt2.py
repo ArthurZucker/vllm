@@ -20,7 +20,6 @@
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -241,19 +240,6 @@ class GPT2Model(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
-    def _transpose_conv1d(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        # HF's GPT-2 uses Conv1D instead of Linear, so its 2D weights are
-        # stored transposed relative to what vLLM expects.
-        # Note(zhuohan): the logic below might break quantized models.
-        for name, loaded_weight in weights:
-            if name.endswith(".weight") and any(
-                proj in name for proj in ("c_attn", "c_proj", "c_fc")
-            ):
-                loaded_weight = loaded_weight.t()
-            yield name, loaded_weight
-
 
 class GPT2LMHeadModel(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -352,16 +338,3 @@ class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
             intermediate_tensors=intermediate_tensors,
         )
         return hidden_states
-
-
-def _add_transformer_prefix(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    for name, tensor in weights:
-        if (
-            not name.startswith("transformer.")
-            and not name.startswith("lm_head.")
-            and not name.startswith("score.")
-        ):
-            name = "transformer." + name
-        yield name, tensor

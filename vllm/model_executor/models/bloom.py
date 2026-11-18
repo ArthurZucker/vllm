@@ -20,7 +20,6 @@
 """Inference-only BLOOM model compatible with HuggingFace weights."""
 
 import math
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -294,21 +293,6 @@ class BloomModel(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
-    def _repack_qkv(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        # BLOOM's fused QKV is laid out as (num_heads * 3 * head_size) on its
-        # output dim (0), while vLLM expects (3 * num_heads * head_size).
-        num_heads = self.config.num_attention_heads
-        for name, loaded_weight in weights:
-            if "query_key_value" in name:
-                shape = loaded_weight.shape
-                loaded_weight = loaded_weight.view((num_heads, 3, -1) + shape[1:])
-                loaded_weight = loaded_weight.transpose(0, 1)
-                loaded_weight = loaded_weight.reshape(shape)
-            yield name, loaded_weight
-
-
 
 class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -354,13 +338,3 @@ class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-
-
-def _add_transformer_prefix(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    for name, tensor in weights:
-        if not name.startswith("transformer."):
-            name = "transformer." + name
-        yield name, tensor

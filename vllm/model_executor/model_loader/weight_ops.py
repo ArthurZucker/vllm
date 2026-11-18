@@ -119,3 +119,35 @@ class SwapHalves(ConversionOps):
         tensor = tensor[0] if isinstance(tensor, list) else tensor
         first, second = tensor.chunk(2, dim=self.dim)
         return {target_patterns[0]: torch.cat([second, first], dim=self.dim)}
+
+
+class TransposeFull(ConversionOps):
+    """The checkpoint tensor transposed before it is sharded: GPT-2's `Conv1D` weights,
+    stored `[in, out]`"""
+
+    needs_full = True
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        tensor = next(iter(input_dict.values()))
+        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        return {target_patterns[0]: tensor.t().contiguous()}
+
+
+class Deinterleave(ConversionOps):
+    """A fused projection stored per head (`[heads, parts, head_dim]`, Bloom's
+    `query_key_value`) as its parts one after the other (`[parts, heads, head_dim]`)"""
+
+    needs_full = True
+
+    def __init__(self, parts: int, heads_attr: str = "num_attention_heads"):
+        self.parts, self.heads_attr = parts, heads_attr
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        tensor = next(iter(input_dict.values()))
+        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        heads = getattr(kwargs["config"].get_text_config(), self.heads_attr)
+        shape = tensor.shape
+        tensor = tensor.view((heads, self.parts, -1) + shape[1:]).transpose(0, 1)
+        return {target_patterns[0]: tensor.reshape(shape)}

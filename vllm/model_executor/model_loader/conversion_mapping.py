@@ -30,9 +30,11 @@ from transformers.core_model_loading import (
 )
 
 from vllm.model_executor.model_loader.weight_ops import (
+    Deinterleave,
     OutputConcatenate,
     RepeatLastSource,
     SwapHalves,
+    TransposeFull,
     ZeroMissingSource,
 )
 
@@ -158,6 +160,29 @@ MISTRAL_FORMAT = [
 # names under `model.`
 COLBERT_LINEAR = rename(r"^(.*\.)?(colbert_)?linear\.weight$", "colbert_linear.weight")
 
+# GPT-2 / Bloom style checkpoints, saved without the `transformer.` prefix
+TRANSFORMER_PREFIX = rename(r"^(?!transformer\.|lm_head\.|score\.)", "transformer.")
+GPT2 = [
+    TRANSFORMER_PREFIX,
+    *(
+        WeightConverter(
+            f".{proj}.weight", f".{proj}.weight", operations=[TransposeFull()]
+        )
+        for proj in ("c_attn", "c_proj", "c_fc")
+    ),
+]
+BLOOM = [
+    TRANSFORMER_PREFIX,
+    *(
+        WeightConverter(
+            f".query_key_value.{tensor}",
+            f".query_key_value.{tensor}",
+            operations=[Deinterleave(parts=3)],
+        )
+        for tensor in ("weight", "bias")
+    ),
+]
+
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
@@ -266,6 +291,9 @@ def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "Gemma4Model": _gemma4,
+    "GPT2LMHeadModel": GPT2,
+    "GPT2ForSequenceClassification": GPT2,
+    "BloomForCausalLM": BLOOM,
     "ColBERTModel": [COLBERT_LINEAR, rename(r"^bert\.", "model.")],
     "ColBERTJinaRobertaModel": [
         COLBERT_LINEAR,
@@ -860,10 +888,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             "linear_proj.gate_proj",
             "linear_proj.dense_h_to_4h",
         ),
-    ],
-    "GPT2Model": [
-        drop("\\.attn\\.bias"),
-        drop("\\.attn\\.masked_bias"),
     ],
     "GPTJForCausalLM": [
         rename("(?<!\\.attn)\\.attn\\.([qkv]_(?:scale|zero_point))$", ".attn.attn.\\1"),
