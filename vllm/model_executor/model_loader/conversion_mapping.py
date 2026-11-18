@@ -2558,7 +2558,9 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
             if scope:
                 transform.scope_prefix, transform.base_model_prefix = scope, ""
             out.append(transform)
-    return out
+    # Last, the projections almost every model fuses: a model that does not keeps its
+    # names, the converter's target not being one of its params
+    return [*out, QKV, GATE_UP]
 
 
 def rename_mapper(model) -> "WeightsMapper | None":
