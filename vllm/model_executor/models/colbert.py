@@ -82,11 +82,7 @@ class ColBERTMixin(nn.Module, SupportsLateInteraction):
         self.hidden_size = hidden_size
         self.colbert_dim = colbert_dim or _checkpoint_colbert_dim()
         self.head_dtype = head_dtype
-
-        if self.colbert_dim is not None:
-            self.colbert_linear = self._build_colbert_linear()
-        else:
-            self.colbert_linear = None
+        self.colbert_linear = None  # built with the pooler, the module initialized
 
     def _build_colbert_linear(self) -> nn.Linear:
         """Build the ColBERT linear projection layer."""
@@ -108,6 +104,8 @@ class ColBERTMixin(nn.Module, SupportsLateInteraction):
         Otherwise `pooler_for_token_embed` falls back to auto-loading
         sentence-transformers Dense layers (`1_Dense/` etc.).
         """
+        if self.colbert_dim is not None:
+            self.colbert_linear = self._build_colbert_linear()
         pooler = pooler_for_token_embed(
             pooler_config,
             projector=self.colbert_linear,
