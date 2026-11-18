@@ -309,47 +309,18 @@ def test_parse_language_detection_output():
         cls.parse_language_detection_output([], make_tokenizer("anything"))
 
 
-def test_create_fake_bias_for_k_proj_injects_out_features():
-    """Packed k_proj weights get a zeros bias of length `out_features`."""
-    from vllm.model_executor.models.whisper import _create_fake_bias_for_k_proj
+def test_k_proj_bias_zeros_in_fused_bias():
+    """Whisper's k_proj ships no bias: zeros fill its slot, a real one is kept."""
+    from vllm.model_executor.model_loader.weight_ops import ZeroMissingSource
 
-    packed = torch.ones(2, 16)
-    result = dict(
-        _create_fake_bias_for_k_proj(
-            [("model.encoder.layers.0.self_attn.k_proj.weight_packed", packed)],
-            ".k_proj.weight_packed",
-            out_features=8,
-        )
+    q, v = torch.ones(8), torch.full((8,), 2.0)
+    patterns = [".q_proj.bias", ".k_proj.bias", ".v_proj.bias"]
+    out = ZeroMissingSource().convert(
+        {patterns[0]: [q], patterns[2]: [v]}, patterns, []
     )
-    bias_name = "model.encoder.layers.0.self_attn.k_proj.bias"
-    assert bias_name in result
-    assert "model.encoder.layers.0.self_attn.k_proj.bias_packed" not in result
-    assert tuple(result[bias_name].shape) == (8,)
-    assert torch.equal(result[bias_name], torch.zeros(8))
-
-
-def test_create_fake_bias_for_k_proj_forwards_real_bias():
-    """A checkpoint bias is forwarded and no extra fake bias is emitted."""
-    from vllm.model_executor.models.whisper import _create_fake_bias_for_k_proj
-
-    weight = torch.ones(8, 16)
-    real_bias = torch.ones(8)
-    items = list(
-        _create_fake_bias_for_k_proj(
-            [
-                ("layers.0.self_attn.k_proj.weight", weight),
-                ("layers.0.self_attn.k_proj.bias", real_bias),
-            ],
-            ".k_proj.weight",
-            out_features=8,
-        )
-    )
-    names = [n for n, _ in items]
-    assert names == [
-        "layers.0.self_attn.k_proj.weight",
-        "layers.0.self_attn.k_proj.bias",
-    ]
-    assert items[1][1] is real_bias
+    assert torch.equal(out[patterns[1]][0], torch.zeros(8))
+    real = {p: [torch.ones(8)] for p in patterns}
+    assert ZeroMissingSource().convert(dict(real), patterns, []) == real
 
 
 @pytest.mark.core_model
