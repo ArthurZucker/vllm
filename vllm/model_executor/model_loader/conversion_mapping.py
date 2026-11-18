@@ -184,6 +184,12 @@ BLOOM = [
     ),
 ]
 
+# Whisper's k_proj ships no bias: zeros in its slot of the fused bias
+WHISPER_QKV_BIAS = WeightConverter(
+    [f".self_attn.{p}_proj.bias" for p in "qkv"],
+    ".self_attn.qkv_proj.bias",
+    operations=[ZeroMissingSource(), OutputConcatenate()],
+)
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
@@ -606,8 +612,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("^mtp\\."),
     ],
     "ColUltraVBertForRetrieval": [
-        rename("^vision_model\\.vision_model\\.", "vision_model.vision_model."),
-        rename("^vision_model\\.", "vision_model.vision_model."),
+        rename("^vision_model\\.(?!vision_model\\.)", "vision_model.vision_model."),
     ],
     "Cosmos3EdgeForConditionalGeneration": _cosmos3_edge(),
     "Cosmos3ForConditionalGeneration": [
@@ -1034,9 +1039,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
         fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
     ],
-    "GlmAsrEncoder": [
-        fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
-    ],
+    "GlmAsrEncoder": [WHISPER_QKV_BIAS],
     "GlmAsrForConditionalGeneration": [
         drop("^audio_tower\\.embed_positions"),
     ],
@@ -2449,30 +2452,23 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("^audio_tower\\.model\\."),
         drop("^audio_tower\\.proj_out\\."),
     ],
-    # TODO: mapper weights_transforms not literal
-    "WhisperForConditionalGeneration": [
+    "WhisperEncoder": [
         rename(r"\.fc1\.", ".mlp.fc1."),
         rename(r"\.fc2\.", ".mlp.fc2."),
-        drop(r"^proj_out\."),
-        # k_proj ships no bias: zeros in its slot of the fused bias
-        WeightConverter(
-            [f".self_attn.{p}_proj.bias" for p in "qkv"],
-            ".self_attn.qkv_proj.bias",
-            operations=[ZeroMissingSource(), OutputConcatenate()],
-        ),
+        WHISPER_QKV_BIAS,
+    ],
+    "WhisperDecoder": [
+        rename(r"\.fc1\.", ".mlp.fc1."),
+        rename(r"\.fc2\.", ".mlp.fc2."),
+        WHISPER_QKV_BIAS,
         WeightConverter(
             [".encoder_attn.k_proj.bias", ".encoder_attn.v_proj.bias"],
             ".encoder_attn.kv_proj.bias",
             operations=[ZeroMissingSource(), OutputConcatenate()],
         ),
         fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
-        fused(
-            ".self_attn.qkv_proj",
-            ".self_attn.q_proj",
-            ".self_attn.k_proj",
-            ".self_attn.v_proj",
-        ),
     ],
+    "WhisperForConditionalGeneration": [drop(r"^proj_out\.")],
     # TODO: old loader: tensor_ops
     "XPressRefinerHead": [],
     "Zamba2ForCausalLM": [
@@ -2621,7 +2617,7 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
         if getattr(getattr(module, "config", None), "model_type", None)
     }
     out = to_vllm([e for t in sorted(model_types) for e in transformers_experts(t)])
-    seen: set[tuple] = set()
+    seen: dict[tuple, list[str]] = {}
     out += _layer_experts(model)
     for cls, names in sorted(instances.items(), key=lambda kv: min(map(len, kv[1]))):
         parts = os.path.commonprefix([name.split(".") for name in names])
@@ -2630,9 +2626,10 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
         for transform in entry(first[cls]) if callable(entry) else entry:
             # an inner class repeating its outer class's transform applies it once
             key = (type(transform), *transform._original_source_patterns)
-            if key in seen:
+            outer = seen.setdefault(key, [])
+            if any(not o or f"{scope}.".startswith(f"{o}.") for o in outer):
                 continue
-            seen.add(key)
+            outer.append(scope)
             transform = deepcopy(transform)
             if scope:
                 transform.scope_prefix, transform.base_model_prefix = scope, ""
