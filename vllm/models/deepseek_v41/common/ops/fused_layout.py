@@ -12,7 +12,7 @@ per-step shuffle.
 
 import torch
 
-from vllm.model_executor.model_loader.weight_utils import composed_weight_loader
+from vllm.model_executor.model_loader.weight_ops import Gather
 
 HEAD_DIM = 512
 Q_CHUNK = 16
@@ -65,10 +65,4 @@ def _bytes_view(t: torch.Tensor) -> torch.Tensor:
 def permute_on_load(param: torch.Tensor, perm: torch.Tensor, dim: int) -> None:
     """Make `param`'s weight loader gather the loaded shard by `perm`."""
 
-    def gather(t: torch.Tensor) -> torch.Tensor:
-        return _bytes_view(t).index_select(dim, perm.to(t.device)).view(t.dtype)
-
-    param.weight_loader = composed_weight_loader(  # type: ignore[attr-defined]
-        param.weight_loader,  # type: ignore[attr-defined]
-        gather,
-    )
+    param.load_ops = [*getattr(param, "load_ops", ()), Gather(perm, dim)]  # type: ignore[attr-defined]

@@ -29,11 +29,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    LoaderFunction,
-    composed_weight_loader,
-    default_weight_loader,
-)
+from vllm.model_executor.model_loader.weight_ops import Affine
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     SupportsEagle3,
@@ -72,13 +68,6 @@ if TYPE_CHECKING:
         intermediate_size: int
         # Tokenizer
         vocab_size: int
-
-
-def rms_norm_weight_loader(offset: float) -> LoaderFunction:
-    return composed_weight_loader(
-        default_weight_loader,
-        lambda x: x + offset,
-    )
 
 
 class DenseMLP(nn.Module):
@@ -187,13 +176,9 @@ class Plamo3AttentionMixer(nn.Module):
             rope_parameters=rope_parameters,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.q_norm.weight, {"weight_loader": rms_norm_weight_loader(offset=1.0)}
-        )
+        set_weight_attrs(self.q_norm.weight, {"load_ops": [Affine(offset=1.0)]})
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.k_norm.weight, {"weight_loader": rms_norm_weight_loader(offset=1.0)}
-        )
+        set_weight_attrs(self.k_norm.weight, {"load_ops": [Affine(offset=1.0)]})
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -250,22 +235,22 @@ class Plamo3DecoderLayer(nn.Module):
         self.pre_mixer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         set_weight_attrs(
             self.pre_mixer_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0)},
+            {"load_ops": [Affine(offset=1.0)]},
         )
         self.post_mixer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         set_weight_attrs(
             self.post_mixer_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0 / 5)},
+            {"load_ops": [Affine(offset=1.0 / 5)]},
         )
         self.pre_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         set_weight_attrs(
             self.pre_mlp_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0)},
+            {"load_ops": [Affine(offset=1.0)]},
         )
         self.post_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         set_weight_attrs(
             self.post_mlp_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0 / (5**1.5))},
+            {"load_ops": [Affine(offset=1.0 / (5**1.5))]},
         )
 
     def forward(
@@ -350,7 +335,7 @@ class Plamo3Model(nn.Module, EagleModelMixin):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         set_weight_attrs(
             self.norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0)},
+            {"load_ops": [Affine(offset=1.0)]},
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -451,4 +436,3 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

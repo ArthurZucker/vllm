@@ -16,7 +16,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.beam import BeamConfig
@@ -106,7 +105,7 @@ class BeamAttention(nn.Module):
                 prefix=f"{prefix}.output_gate_proj",
             )
         self.gate_bias = nn.Parameter(torch.zeros(self.num_heads))
-        set_weight_attrs(self.gate_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.gate_bias, {"shard_dim": 0})
 
         if self.disable_rope:
             self.rotary_emb = None

@@ -224,7 +224,6 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
             "weight_shape",
             BasevLLMParameter(
                 data=torch.tensor([out_features, in_features], dtype=torch.int64),
-                weight_loader=_noop_loader,
             ),
         )
 

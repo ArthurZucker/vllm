@@ -77,9 +77,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    sharded_weight_loader,
-)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.third_party.flash_linear_attention.ops.kda import (
@@ -211,17 +208,6 @@ def _get_layer_swiglu_limit(limit_list: list | None, layer_idx: int) -> float | 
     if limit in (None, 0):
         return None
     return float(limit)
-
-
-def _load_a_log(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
-    tp_rank = get_tensor_model_parallel_rank()
-    tp_size = get_tensor_model_parallel_world_size()
-    if loaded_weight.ndim == 1:
-        shard_size = loaded_weight.shape[0] // tp_size
-        shard = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
-        param.data.copy_(shard.view_as(param.data))
-    else:
-        sharded_weight_loader(2)(param, loaded_weight)
 
 
 def _is_block_fp8_config(
@@ -621,7 +607,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
         self.dt_bias = nn.Parameter(
             torch.empty(projection_size // self.tp_size, dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         self.q_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -651,7 +637,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": _load_a_log})
+        set_weight_attrs(self.A_log, {"shard_dim": 2})
 
         self.g_proj = ColumnParallelLinear(
             self.hidden_size,

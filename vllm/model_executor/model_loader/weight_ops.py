@@ -64,3 +64,40 @@ class ZeroMissingSource(ConversionOps):
         for pattern in source_patterns:
             input_dict.setdefault(pattern, [torch.zeros_like(present)])
         return input_dict
+
+
+class NegExp(ConversionOps):
+    """`-exp(x)`, in float32: Mamba's `A` from the checkpoint's `A_log`"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        return {key: -torch.exp(tensor.float()) for key, tensor in input_dict.items()}
+
+
+class Affine(ConversionOps):
+    """`x * scale + offset`, for norms stored shifted or scaled (PLaMo 3's `1 + w`,
+    LongCat's MLA LoRA scaling)"""
+
+    def __init__(self, scale: float = 1.0, offset: float = 0.0):
+        self.scale, self.offset = scale, offset
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        return {k: t * self.scale + self.offset for k, t in input_dict.items()}
+
+
+class Gather(ConversionOps):
+    """This rank's shard reordered by `index` along `dim` (DeepSeek V4.1's fused
+    layouts); 1-byte dtypes (fp8, ue8m0) are gathered as bytes"""
+
+    def __init__(self, index: torch.Tensor, dim: int):
+        self.index, self.dim = index, dim
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        out = {}
+        for key, t in input_dict.items():
+            raw = t.view(torch.uint8) if t.element_size() == 1 else t
+            index = self.index.to(t.device)
+            out[key] = raw.index_select(self.dim, index).view(t.dtype)
+        return out

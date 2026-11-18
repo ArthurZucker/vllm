@@ -6,9 +6,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.model_executor.model_loader.weight_utils import (
-    sharded_weight_loader,
-)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.mistral.amd.ops import fusion_enabled
 from vllm.models.mistral.amd.ops.ssmax import (
@@ -25,7 +22,7 @@ class SSMaxScaling(nn.Module):
         self.b = nn.Parameter(torch.empty(num_heads), requires_grad=False)
         if tp_sharded:
             for param in (self.s, self.b):
-                set_weight_attrs(param, {"weight_loader": sharded_weight_loader(0)})
+                set_weight_attrs(param, {"shard_dim": 0})
         self.fused = fusion_enabled("ssmax")
 
     def forward(

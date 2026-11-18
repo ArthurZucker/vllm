@@ -44,7 +44,6 @@ from vllm.model_executor.layers.quantization.modelopt import (
 )
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
-    sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
@@ -126,8 +125,6 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes = output_sizes.copy()
         output_sizes[replicated_shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
-
-
 
 
 def is_fused_kda_decode_supported(
@@ -618,7 +615,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.dt_bias = nn.Parameter(
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -761,7 +758,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
 
         backend = (
             additional_config.get("kda_prefill_backend", "auto")

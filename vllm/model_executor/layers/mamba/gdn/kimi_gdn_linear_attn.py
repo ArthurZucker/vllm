@@ -16,7 +16,6 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
-    sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -113,8 +112,6 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         super().__init__(input_size, output_sizes, **kwargs)
 
 
-
-
 @PluggableLayer.register("kimi_gated_delta_net_attention")
 class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_dtype(
@@ -198,7 +195,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -213,19 +210,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         delattr(self.conv1d.weight, "weight_loader")
         set_weight_attrs(
             self.conv1d.weight,
-            {
-                "weight_loader": _make_fused_conv1d_weight_loader(
-                    [self.projection_size] * 3,
-                    self.tp_size,
-                    self.tp_rank,
-                )
-            },
+            {"shard_dim": 0},
         )
 
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
 
         self.gate_lower_bound: float | None = kda_config.get("gate_lower_bound", None)
         if self.gate_lower_bound is not None:

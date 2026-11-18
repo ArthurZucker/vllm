@@ -19,9 +19,6 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointMetadata,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
-    _make_fused_conv1d_weight_loader,
-)
 from vllm.model_executor.layers.mamba.kda_checkpoint import (
     FlashKDAPrefillCheckpointExporter,
     TritonKDACheckpointSpec,
@@ -42,7 +39,6 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
 from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
@@ -88,8 +84,6 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
         for sid in self.replicated_shard_ids:
             output_sizes[sid] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
-
-
 
 
 @torch.compile(
@@ -149,11 +143,7 @@ def _fused_qkv_conv1d(
     delattr(conv1d.weight, "weight_loader")
     set_weight_attrs(
         conv1d.weight,
-        {
-            "weight_loader": _make_fused_conv1d_weight_loader(
-                [projection_size] * 3, tp_size, tp_rank
-            )
-        },
+        {"shard_dim": 0},
     )
     return conv1d
 
@@ -255,7 +245,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         self.conv1d = _fused_qkv_conv1d(
             self.conv_size,
@@ -268,7 +258,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
+        set_weight_attrs(self.A_log, {"shard_dim": 2})
 
         self.g_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -295,13 +285,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        # Checkpoints store A_log as 1-D; the model parameter is 4-D.
-        def _a_log_weight_loader(param, loaded_weight):
-            if loaded_weight.dim() == 1:
-                loaded_weight = loaded_weight.view([1, 1, -1, 1])
-            return sharded_weight_loader(2)(param, loaded_weight)
-
-        self.A_log.weight_loader = _a_log_weight_loader
+        # Checkpoints store A_log as 1-D; the model parameter is 4-D (`ops_loader`)
+        self.A_log.shard_dim = 2
 
         # GLM-5.3-Flash uses a bounded sigmoid gate instead of the default
         # unbounded softplus gate.

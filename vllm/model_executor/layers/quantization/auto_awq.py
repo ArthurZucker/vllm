@@ -137,7 +137,6 @@ def _convert_awq_to_standard_format(
         output_dim=1,
         packed_dim=0,
         packed_factor=pack_factor,
-        weight_loader=_noop_loader,
     )
     replace_parameter(layer, w_q_name, new_param)
 
@@ -168,7 +167,6 @@ def _convert_awq_to_standard_format(
         input_dim=1,
         packed_dim=0,
         packed_factor=pack_factor,
-        weight_loader=_noop_loader,
     )
     replace_parameter(layer, w_zp_name, new_zp_param)
 

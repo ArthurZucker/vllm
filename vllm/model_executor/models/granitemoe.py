@@ -54,7 +54,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
@@ -204,7 +203,7 @@ class GraniteMoeAttention(nn.Module):
 
         if has_sink:
             self.sinks = nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
-            set_weight_attrs(self.sinks, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(self.sinks, {"shard_dim": 0})
         else:
             self.sinks = None
 

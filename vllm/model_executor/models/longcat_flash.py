@@ -60,11 +60,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    LoaderFunction,
-    composed_weight_loader,
-    default_weight_loader,
-)
+from vllm.model_executor.model_loader.weight_ops import Affine
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
@@ -80,10 +76,6 @@ from .utils import (
 logger = init_logger(__name__)
 
 
-def _scaled_weight_loader(scale: float) -> LoaderFunction:
-    return composed_weight_loader(default_weight_loader, lambda x: x * scale)
-
-
 def scale_mla_lora_norms_on_load(self_attn: nn.Module, config) -> None:
     """Fold LongCat's MLA LoRA scaling into the q/kv_a_layernorm weight loaders."""
     for norm, rank, enabled in (
@@ -92,9 +84,7 @@ def scale_mla_lora_norms_on_load(self_attn: nn.Module, config) -> None:
     ):
         if enabled:
             scale = (config.hidden_size / rank) ** 0.5
-            set_weight_attrs(
-                norm.weight, {"weight_loader": _scaled_weight_loader(scale)}
-            )
+            set_weight_attrs(norm.weight, {"load_ops": [Affine(scale=scale)]})
 
 
 class FlashMLP(nn.Module):
@@ -455,7 +445,6 @@ class FlashModel(nn.Module):
         )
 
 
-
 class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     """Flash model for causal language modeling."""
 
@@ -523,4 +512,3 @@ class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
-

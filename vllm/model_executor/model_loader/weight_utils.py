@@ -37,7 +37,6 @@ from vllm.config.load import (
     LoadConfig,
 )
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
     get_world_group,
     in_single_pp_stage,
 )
@@ -1597,21 +1596,6 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         raise
 
 
-def row_parallel_weight_loader(
-    param: torch.Tensor, loaded_weight: torch.Tensor
-) -> None:
-    """Load weights that are row-parallelized."""
-    tp_rank = get_tensor_model_parallel_rank()
-    shard_dim = 0 if param.dim() != 1 else None
-
-    if shard_dim is not None:
-        shard_size = param.data.shape[shard_dim]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
-
-    return default_weight_loader(param, loaded_weight)
-
-
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
 
@@ -1627,19 +1611,6 @@ def make_attention_sink(
     return sink
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-
-        shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-
-        return default_weight_loader(param, loaded_weight)
-
-    return loader
 
 
 def composed_weight_loader(

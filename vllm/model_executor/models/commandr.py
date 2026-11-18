@@ -47,7 +47,6 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import row_parallel_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -77,7 +76,7 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(param_shape))
         self.variance_epsilon = eps
-        set_weight_attrs(self.weight, {"weight_loader": row_parallel_weight_loader})
+        set_weight_attrs(self.weight, {"shard_dim": 0})
 
     def forward(self, hidden_states, residuals=None):
         hidden_states = layer_norm_func(
@@ -103,7 +102,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(param_shape))
         self.variance_epsilon = eps
-        set_weight_attrs(self.weight, {"weight_loader": row_parallel_weight_loader})
+        set_weight_attrs(self.weight, {"shard_dim": 0})
 
     def forward(self, hidden_states, residuals=None):
         hidden_states = rms_norm_func(hidden_states, self.weight, self.variance_epsilon)

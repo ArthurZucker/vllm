@@ -33,9 +33,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    sharded_weight_loader,
-)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
@@ -136,13 +133,7 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
         delattr(self.conv1d.weight, "weight_loader")
         set_weight_attrs(
             self.conv1d.weight,
-            {
-                "weight_loader": _make_fused_conv1d_weight_loader(
-                    [self.key_dim, self.key_dim, self.value_dim],
-                    self.tp_size,
-                    self.tp_rank,
-                )
-            },
+            {"shard_dim": 0},
         )
 
         self.dt_bias = nn.Parameter(
@@ -154,8 +145,8 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         # use eps=1e-5 to match FLA's FusedRMSNormGated
         self.o_norm = RMSNormGated(

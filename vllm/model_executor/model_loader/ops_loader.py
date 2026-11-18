@@ -109,6 +109,13 @@ class VllmShard:
         layer, param, shape = self.layer, self.param, _shape(source)
         dim, rank, size = _placement(layer, param)
         target = list(param.shape)
+        if len(shape) != param.dim() and dim is not None and dim < param.dim():
+            # stored at another rank (an old 4D `A_log`, a 2D conv1d): viewed at the
+            # param's, the full length on the sharded dim
+            full = list(param.shape)
+            full[dim] = 1
+            full[dim] = torch.Size(shape).numel() // torch.Size(full).numel()
+            source, shape = _read(source).reshape(full), full
         if getattr(param, "expert_dim", None) is not None:
             if self.expert:  # one checkpoint expert, a slice of the experts
                 if layer._map_global_expert_id_to_local_expert_id(tensor_idx) == -1:
@@ -138,6 +145,8 @@ class VllmShard:
         return tensor
 
     def _slice(self, source, shape, dim, rank, size, target):
+        if segments := getattr(self.param, "shard_segments", None):
+            return self._segments(source, segments, dim, rank, size)
         layer = self.layer
         shards = getattr(layer, "shard_ids", None) or []
         if self.sources == 1 and len(shards) > 1:  # fused on disk, e.g. `qkv_proj`
@@ -156,6 +165,24 @@ class VllmShard:
             local = shape[dim] * replicas // size
         start = min(rank // replicas * local, shape[dim])
         return _read(source, dim, start, min(local, shape[dim] - start))
+
+    def _segments(self, source, segments, dim, rank, size):
+        """A param concatenating segments sharded on their own (Mamba2's [gate, x,
+        B, C, dt]): `(full size, padded extra, replicated)` each. A replicated segment
+        (one group, more ranks) is rank 0's slice on every rank; padding stays zeros."""
+        pieces, offset = [], 0
+        for full, extra, replicated in segments:
+            local = full // size
+            skip = 0 if replicated else rank * local
+            take = max(min(local, full - extra - skip), 0)
+            piece = _read(source, dim, offset + skip, take)
+            if take < local:
+                pad = list(piece.shape)
+                pad[dim] = local - take
+                piece = torch.cat([piece, piece.new_zeros(pad)], dim=dim)
+            pieces.append(piece)
+            offset += full - extra
+        return torch.cat(pieces, dim=dim)
 
     def _fused_on_disk(self, source, shards, dim, rank, size):
         """Split (by the layer's shard sizes) -> Shard each -> Concatenate: this rank's
