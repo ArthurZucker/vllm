@@ -5,7 +5,6 @@
 
 """Compile-time storage layout and CTA schedule for the ML4 MonoKernel."""
 
-import math
 import os
 
 from .geometry import (
@@ -330,15 +329,6 @@ def down_x_words(
     return (
         samples * MOE_SLOTS * inter // (4 if native_fp4_mfma or not expert_mxfp4 else 2)
     )
-
-
-def dcp_softmax_weights(maxima, sums):
-    global_max = max(maxima)
-    scaled = [
-        total * math.exp(maximum - global_max) for maximum, total in zip(maxima, sums)
-    ]
-    denominator = sum(scaled)
-    return [value / denominator if denominator else 0.0 for value in scaled]
 
 
 def dcp_summary_index(source, sample, tile, item, samples, n_uv):

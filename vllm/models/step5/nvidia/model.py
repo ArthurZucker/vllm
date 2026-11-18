@@ -612,27 +612,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             return offset
         raise ValueError(f"Unsupported sparse indexer shard: {shard_id}.")
 
-
-    def assert_fully_loaded(self, prefix: str) -> None:
-        """Fail unless this load covered every shard, then forget the record.
-
-        Tracking per load (instead of latching a flag on first success) is what
-        makes weight reloading safe: a reload materializes fresh uninitialized
-        storage for the whole parameter, so a shard the new weight stream omits
-        would otherwise silently become garbage.
-        """
-        loaded = self.loaded_shard_ids.pop("weight", set())
-        self.loaded_shard_ids.clear()
-        missing = [shard for shard in self.shard_ids if shard not in loaded]
-        if missing:
-            raise ValueError(
-                f"Incomplete fused qkv+indexer weight for {prefix}: "
-                f"missing shards {missing}."
-            )
-
-    def reset_load_state(self) -> None:
-        self.loaded_shard_ids.clear()
-
     def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
@@ -654,23 +633,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             dim=-1,
         )
         return index_q, index_k, index_z, gate
-
-
-def _reset_fused_qkv_indexer_load_state(module: nn.Module) -> None:
-    for submodule in module.modules():
-        if isinstance(submodule, Step5FusedQKVIndexerLinear):
-            submodule.reset_load_state()
-
-
-def _validate_fused_qkv_indexer_weights(module: nn.Module) -> set[str]:
-    loaded_params: set[str] = set()
-    for name, submodule in module.named_modules():
-        if not isinstance(submodule, Step5FusedQKVIndexerLinear):
-            continue
-        param_name = f"{name}.weight" if name else "weight"
-        submodule.assert_fully_loaded(param_name)
-        loaded_params.add(param_name)
-    return loaded_params
 
 
 class Step5SparseIndexerIndexTPLinear(ColumnParallelLinear):
@@ -708,8 +670,6 @@ class Step5SparseIndexerIndexTPLinear(ColumnParallelLinear):
         self.index_group_start = index_group_start
         self.output_size_per_group = output_size // index_tp_size
         self.weight.data.zero_()
-
-
 
     def forward(
         self,
@@ -2154,7 +2114,6 @@ class Step5Model(nn.Module):
         return hidden_states
 
 
-
 class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoRA):
     # Required so quantization exclude lists match fused module prefixes.
     packed_modules_mapping = STEP5_PACKED_MODULES_MAPPING
@@ -2268,4 +2227,3 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoRA):
             moe.n_physical_experts = num_physical_experts
             moe.n_redundant_experts = self.num_redundant_experts
             moe.experts.update_expert_map()
-

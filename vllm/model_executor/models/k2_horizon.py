@@ -169,32 +169,6 @@ def apply_partial_rope(
     return q, k
 
 
-def _rope_weight_perm(head_dim: int, rope_head_dim: int) -> torch.Tensor:
-    """Per-head gather index that folds K2Horizon's partial-RoPE channel reordering.
-
-    The K2Horizon checkpoint stores each head's channels in a GPT-J-interleaved
-    convention with rope/nope channels interleaved. Applying this fixed
-    (position-independent) permutation to the q/k weight rows lets the runtime
-    use vLLM's *native* NeoX partial-RoPE path (`head_size = head_dim`,
-    `rotary_dim = rope_head_dim`) with no per-forward permutes/all-gather.
-    """
-    D, R = head_dim, rope_head_dim
-    assert R % 2 == 0 and R <= D, (
-        f"partial NeoX RoPE requires an even rope_head_dim <= head_dim, "
-        f"got R={R}, D={D}"
-    )
-    h = D // 2
-    idx = torch.cat(
-        [
-            torch.arange(0, R // 2),  # rope first-half channels
-            torch.arange(h, h + R // 2),  # rope second-half channels
-            torch.arange(R // 2, h),  # nope remainder (first half)
-            torch.arange(h + R // 2, D),  # nope remainder (second half)
-        ]
-    )
-    return idx
-
-
 def calc_router_weights(
     router_logits: torch.Tensor,
     e_score_correction_bias: torch.Tensor | None,
@@ -1138,7 +1112,6 @@ class K2HorizonModel(nn.Module, EagleModelMixin):
         )
 
 
-
 class K2HorizonForCausalLM(
     nn.Module, SupportsPP, SupportsLoRA, SupportsEagle, SupportsEagle3, MixtureOfExperts
 ):
@@ -1246,7 +1219,6 @@ class K2HorizonForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

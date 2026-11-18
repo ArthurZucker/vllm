@@ -21,7 +21,6 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import supports_any_eagle
 from vllm.multimodal import NestedTensors
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -458,16 +457,6 @@ class AutoWeightsLoader:
                 raise ValueError(msg)
 
 
-    def _filter_skipped(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in weights:
-            if self._can_skip(name):
-                continue
-
-            yield name, weight
-
-
 def get_fused_shared_expert_layers(
     module: nn.Module,
     moe_cls: type[nn.Module],
@@ -543,74 +532,6 @@ def get_fused_shared_expert_layers(
     return frozenset(fused_layers)
 
 
-def maybe_fuse_shared_experts(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    n_routed_experts: int,
-    n_shared_experts: int,
-    fused_shared_expert_layers: frozenset[int],
-    ckpt_prefix: str = "mlp.shared_experts",
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Route AITER fused-shared-expert checkpoint weights into fused slots.
-
-    When AITER fused-shared-experts is active, shared experts are packed into
-    the routed expert tensor. The checkpoint stores them under `ckpt_prefix`
-    as a single (possibly widened) tensor; this splits it into
-    `n_shared_experts` chunks named `mlp.experts.{n_routed_experts + j}` so
-    the `RoutedExperts` loader treats them as extra experts. Yields the input
-    unchanged when the fusion is inactive, so callers can wrap unconditionally.
-
-    Args:
-        weights: Iterable of `(name, tensor)` checkpoint pairs.
-        n_routed_experts: Number of routed experts; offsets the fused slots.
-        n_shared_experts: Number of shared experts packed into the tensor.
-        ckpt_prefix: Checkpoint module name of the shared experts.
-        fused_shared_expert_layers: Layer indices whose shared expert was fused
-            at construction time, as returned by
-            `get_fused_shared_expert_layers`. Only weights belonging to these
-            layers are routed to fused slots.
-
-    Yields:
-        `(name, tensor)` pairs with shared experts routed to fused slots.
-
-    """
-    if not fused_shared_expert_layers:
-        yield from weights
-        return
-
-    # Match on the dotted boundary so e.g. "mlp.shared_expert." does not also
-    # catch a sibling "mlp.shared_expert_gate".
-    prefix = f"{ckpt_prefix}."
-    for name, loaded_weight in weights:
-        if prefix not in name:
-            yield name, loaded_weight
-            continue
-        if extract_layer_index(name) not in fused_shared_expert_layers:
-            yield name, loaded_weight
-            continue
-        # gate/up split on the output dim; down_proj on the input dim.
-        split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0
-        total = loaded_weight.shape[split_dim]
-        if total % n_shared_experts != 0:
-            raise ValueError(
-                f"FSE shared-expert weight {name!r} has size {total} along axis "
-                f"{split_dim}, not divisible by n_shared_experts={n_shared_experts}."
-            )
-        chunk = total // n_shared_experts
-        for j in range(n_shared_experts):
-            sl = slice(j * chunk, (j + 1) * chunk)
-            if loaded_weight.ndim == 1:
-                chunk_weight = loaded_weight[sl]
-            elif split_dim == 0:
-                chunk_weight = loaded_weight[sl, :]
-            else:
-                chunk_weight = loaded_weight[:, sl]
-            yield (
-                name.replace(prefix, f"mlp.experts.{n_routed_experts + j}."),
-                chunk_weight,
-            )
-
-
 def get_spec_layer_idx_from_weight_name(
     config: "PreTrainedConfig", weight_name: str
 ) -> int | None:
@@ -638,26 +559,6 @@ def get_spec_layer_idx_from_weight_name(
         ):
             return base + i
     return None
-
-
-def skip_spec_layers(
-    weights: Iterable[tuple[str, torch.Tensor]], config: "PreTrainedConfig"
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Drop MTP spec-layer weights (loaded by the MTP head, not the base model).
-
-    Args:
-        weights: Iterable of `(name, tensor)` checkpoint pairs.
-        config: The model config, passed to `get_spec_layer_idx_from_weight_name`.
-
-    Yields:
-        `(name, tensor)` pairs whose weight is not an MTP-layer weight.
-
-    """
-    return (
-        (name, w)
-        for name, w in weights
-        if get_spec_layer_idx_from_weight_name(config, name) is None
-    )
 
 
 def init_vllm_registered_model(
@@ -1326,29 +1227,6 @@ direct_register_custom_op(
     fake_impl=sequence_parallel_chunk_impl_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
-
-
-def process_eagle_weight(
-    model: nn.Module,
-    name: str,
-) -> None:
-    """Update EAGLE model flags based on loaded weight name.
-    This should be called during weight loading to detect if a model
-    has its own lm_head or embed_tokens weight.
-
-    Args:
-        model: The model instance (must support EAGLE)
-        name: The name of the weight to process
-
-    """
-    if not supports_any_eagle(model):
-        return
-
-    # To prevent overriding with target model's layers
-    if "lm_head" in name:
-        model.has_own_lm_head = True
-    if "embed_tokens" in name:
-        model.has_own_embed_tokens = True
 
 
 def get_layer_index(feature_layer_index: int, num_hidden_layers: int) -> int:

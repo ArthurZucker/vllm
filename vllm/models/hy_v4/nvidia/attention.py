@@ -71,24 +71,6 @@ def sparse_layer_ids(config: PreTrainedConfig) -> set[int]:
     return {i for i, t in enumerate(layer_types) if t in _SPARSE_LAYER_TYPES}
 
 
-def is_skip_topk_indexer_weight(weight_name: str, skip_topk_layers: set[int]) -> bool:
-    """Return whether an indexer weight belongs to a top-k sharing layer.
-
-    Args:
-        weight_name: Checkpoint weight name.
-        skip_topk_layers: Result of `compute_skip_topk_layers`.
-
-    Returns:
-        True when the weight is an indexer weight of a layer that has no
-        indexer module and therefore must be dropped.
-
-    """
-    if ".indexer." not in weight_name or not skip_topk_layers:
-        return False
-    match = _WEIGHT_LAYER_INDEX_RE.search(weight_name)
-    return match is not None and int(match.group(1)) in skip_topk_layers
-
-
 class Indexer(nn.Module):
     """Lightning indexer selecting the top-k tokens for sparse MLA."""
 

@@ -848,32 +848,6 @@ def _ra_entry(tid, mb0, mb1, dst, src_a, src_r, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ra_load_a1(tid, mb1, dst, src_a, *, loc=None, ip=None):
-    """Thread 0, after the CTA barrier that ends the generic-proxy use of the region: the second W'' half on mb1"""
-    cp = "".join(
-        f"\t@p cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$2+{16384 * i}], "
-        f"[$3+{16384 * i}], 16384, [$1];\n"
-        for i in range(RA_A_BYTES // 2 // 16384)
-    )
-    _asm(
-        None,
-        [
-            cutlass.Int32(tid),
-            cutlass.Int32(mb1),
-            cutlass.Int32(dst),
-            cutlass.Int64(src_a),
-        ],
-        "{\n\t.reg .pred p;\n\tsetp.eq.u32 p, $0, 0;\n\t@p fence.proxy.async.shared::cta;\n\t"
-        f"@p mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], {RA_A_BYTES // 2};\n"
-        + cp
-        + "\t}",
-        "r,r,r,l,~{memory}",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _ra_st_tag2(addr, tag, za, zr, on, *, loc=None, ip=None):
     """Rx words (part 0 = a, part 1 = r) of one (token, src, expert): tag << 32 | fp32, relaxed sys (peer memory)"""
     _asm(

@@ -11,7 +11,6 @@ take the default format. The sigmoid-gated shared expert stays unfused and runs
 on an aux stream next to the router.
 """
 
-
 import torch
 from torch import nn
 
@@ -228,34 +227,6 @@ class Qwen4ExpMegaMoEExperts(DeepGemmMegaMoEExperts):
         # Tensors of expert shards still missing their weight or scale; a
         # chunked weight update may split the two across load_weights calls.
         self.pending_shards: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
-
-
-    def _load_shard(
-        self, expert_id: int, shard_id: str, kind: str, tensor: torch.Tensor
-    ) -> set[str]:
-        """Write or requantize one checkpoint tensor; return the parameters
-        written, so the loader still flags a parameter nothing reached."""
-        if self.checkpoint_format == self.weight_format.name:
-            suffix = "weight" if kind == "weight" else "weight_scale"
-            return {self._write(expert_id, shard_id, suffix, tensor)}
-        pending = self.pending_shards.setdefault((expert_id, shard_id), {})
-        pending[kind] = tensor
-        if len(pending) < len(self._shard_tensors):
-            return set()
-        del self.pending_shards[(expert_id, shard_id)]
-        scale = None
-        if self.checkpoint_format != "bf16":
-            scale = pending[self._shard_tensors[1]].to(self._device)
-        weight, scale = _requantize(
-            pending["weight"].to(self._device),
-            scale,
-            self.checkpoint_format,
-            self.weight_format,
-        )
-        return {
-            self._write(expert_id, shard_id, "weight", weight),
-            self._write(expert_id, shard_id, "weight_scale", scale),
-        }
 
     def _write(
         self, expert_id: int, shard_id: str, suffix: str, tensor: torch.Tensor

@@ -39,28 +39,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _index_expert_mapping(
-    mapping: list[tuple[str, str, int, str]],
-) -> dict[str, list[tuple[str, str, int, str]]]:
-    """Index by logical checkpoint ID, preserving entry order and EPLB replicas.
-
-    An empty index keeps the full scan for unsupported mapping names.
-    """
-    mapping_by_expert: dict[str, list[tuple[str, str, int, str]]] = {}
-    for entry in mapping:
-        prefix, _, suffix = entry[1].partition(".")
-        expert_key, sep, _ = suffix.partition(".")
-        if (
-            prefix != "experts"
-            or not expert_key
-            or (expert_key.isdecimal() and not sep)
-        ):
-            return {}
-        if expert_key.isdecimal():
-            mapping_by_expert.setdefault(expert_key, []).append(entry)
-    return mapping_by_expert
-
-
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
     CHANNEL = "channel"
@@ -366,30 +344,6 @@ class RoutedExperts(PluggableLayer):
     #
     # Weight Loading Methods
     #
-
-
-
-
-
-
-
-    @staticmethod
-    def _orient_fused_weight(
-        fused_weight: torch.Tensor,
-        is_fused_checkpoint_transposed: bool,
-    ) -> torch.Tensor:
-        """Normalise a fused expert tensor to the vLLM weight layout."""
-        if is_fused_checkpoint_transposed:
-            return fused_weight.transpose(-1, -2)
-        return fused_weight
-
-
-
-
-
-
-
-
 
     def get_expert_mapping(
         self,

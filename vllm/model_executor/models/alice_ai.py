@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only AliceAI model."""
 
-from collections.abc import Iterable
 from copy import copy
 from itertools import islice
 from typing import cast
@@ -73,32 +72,6 @@ _SPLIT_KDA_CONV_SHARDS = {
     ".linear_attn.k_conv1d": (".linear_attn.conv1d", 1),
     ".linear_attn.v_conv1d": (".linear_attn.conv1d", 2),
 }
-
-
-def _load_split_kda_conv_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    params: dict[str, nn.Parameter],
-    loaded: set[str],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Load split AliceAI conv weights through the upstream fused-conv ABI."""
-    for name, weight in weights:
-        for source_name, (target_name, shard_id) in _SPLIT_KDA_CONV_SHARDS.items():
-            if source_name not in name:
-                continue
-            mapped_name = name.replace(source_name, target_name, 1)
-            param = params.get(mapped_name)
-            if param is None:
-                raise ValueError(f"No target parameter for {name!r}: {mapped_name!r}")
-            weight_loader = getattr(param, "weight_loader", None)
-            if weight_loader is None:
-                raise ValueError(
-                    f"Target parameter {mapped_name!r} has no weight loader"
-                )
-            weight_loader(param, weight, shard_id)
-            loaded.add(mapped_name)
-            break
-        else:
-            yield name, weight
 
 
 def get_attn_res_block_size(hf_config: object) -> int:
@@ -564,7 +537,6 @@ class AliceAIModel(nn.Module):
         return self.norm(hidden_states)
 
 
-
 class AliceAIForCausalLM(
     nn.Module, HasInnerState, IsHybrid, SupportsLoRA, MixtureOfExperts
 ):
@@ -694,4 +666,3 @@ class AliceAIForCausalLM(
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
-

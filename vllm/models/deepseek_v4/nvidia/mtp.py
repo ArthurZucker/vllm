@@ -11,7 +11,6 @@ pieces that have no analogue in V3/V32:
   * V4-specific checkpoint weight-name remapping in `load_weights`.
 """
 
-
 import regex as re
 import torch
 import torch.nn as nn
@@ -31,8 +30,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
-from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import (
+    get_spec_layer_idx_from_weight_name,
+    maybe_prefix,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -345,7 +346,6 @@ class DeepSeekV4MTP(nn.Module):
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         name = self._to_spec_layer_name(name)
         return get_spec_layer_idx_from_weight_name(self.config, name) is None
-
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """Rewrite the weight name to match the format of the original model.

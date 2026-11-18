@@ -11,16 +11,11 @@ checkpoint key ─▶ plan: the layer's quantizer
 ```
 """
 
-from collections import Counter
-from collections.abc import Iterable, Iterator
-from copy import deepcopy
 from functools import partial
 
-import torch
 from transformers.core_model_loading import (
     WeightConverter,
     WeightTransform,
-    rename_source_key,
 )
 from transformers.quantizers import (
     HfQuantizer,
@@ -123,53 +118,6 @@ def streamable_converters(conversions: list[WeightTransform]) -> list[WeightConv
         if isinstance(conversion, WeightConverter)
         and not any("*" in pattern for pattern in conversion.source_patterns)
     ]
-
-
-def convert_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    converters: list[WeightConverter],
-    config=None,
-    hf_quantizer: HfQuantizer | None = None,
-    checkpoint_keys: Iterable[str] = (),
-    renamings: list[WeightTransform] = (),
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """`weights`, through Transformers' renamings, converters and quantization plan.
-
-    A converter's tensors are held until it has them all, then converted: as many
-    as `checkpoint_keys` name for its target, else one per source pattern. Keys no
-    converter matches pass through. Scales follow their weight: a `.weight` pattern
-    also matches `.weight_scale`, into a target of its own.
-    """
-
-    def rename(name):
-        name = hf_quantizer.rename_layer(name) if hf_quantizer else name
-        return rename_source_key(name, renamings, converters)
-
-    expected = Counter(
-        target for target, pattern in map(rename, checkpoint_keys) if pattern
-    )
-    pending: dict[str, WeightConverter] = {}
-    seen: Counter[str] = Counter()
-    for name, tensor in weights:
-        target, pattern = rename(name)
-        if pattern is None:
-            yield target, tensor  # renamed, if a renaming matched
-            continue
-        if target not in pending:
-            converter = next(c for c in converters if pattern in c.source_patterns)
-            converter = deepcopy(converter)
-            if hf_quantizer is not None:  # the layer's load op, if any
-                converter = hf_quantizer.update_weight_transform(
-                    converter, None, target
-                )
-            pending[target] = converter
-        pending[target].add_tensor(target, name, pattern, tensor)
-        seen[target] += 1
-        if seen[target] == expected.get(target, len(pending[target].source_patterns)):
-            yield from _convert(pending.pop(target), target, config)
-    # A group missing a source, e.g. a scale only some of its weights have
-    for target, converter in pending.items():
-        yield from _convert(converter, target, config)
 
 
 def _convert(converter: WeightConverter, target: str, config):

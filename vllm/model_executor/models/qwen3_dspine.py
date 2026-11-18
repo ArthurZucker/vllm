@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -286,7 +285,6 @@ class DSpineQwen3Model(DFlashQwen3Model):
         hidden_states = self.norm(hidden_states)
         return hidden_states, final_pre_injection
 
-
     def _validate_bridge_metadata(self, weights: dict[str, torch.Tensor]) -> None:
         if missing := set(_BRIDGE_METADATA[2:]) - weights.keys():
             raise ValueError(f"Missing DSpine bridge metadata: {sorted(missing)}")
@@ -302,30 +300,6 @@ class DSpineQwen3Model(DFlashQwen3Model):
             or terminal.count_nonzero().item()
         ):
             raise ValueError("DSpine requires a zero terminal projection")
-
-    def _map_bridge_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        aliases = {
-            "codebook": "transfer_codebook",
-            "read_weight": f"injection.readouts.{self.injection.num_layers - 1}.weight",
-            "gate.weight": "injection.receiver_gate.weight",
-            "gate.bias": "injection.gate_bias",
-            "predecessor_gate.weight": "injection.predecessor_gate.weight",
-            "prev.weight": "injection.message.weight",
-        }
-        for name, weight in weights:
-            if name in _BRIDGE_METADATA:
-                continue
-            key = name.removeprefix("selected_prefix_bridge.")
-            if key in ("early_read_weights", "feature_write_weights"):
-                read = key == "early_read_weights"
-                count = self.injection.num_layers - int(read)
-                if weight.ndim != 3 or weight.shape[0] != count:
-                    raise ValueError(f"Invalid DSpine layer stack: {name}")
-                for index, tensor in enumerate(weight):
-                    module = "readouts" if read else "writes"
-                    yield f"injection.{module}.{index}.weight", tensor
-            else:
-                yield aliases.get(key, name), weight
 
 
 class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):

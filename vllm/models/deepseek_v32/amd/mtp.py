@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-
 import torch
 import torch.nn as nn
 
@@ -17,11 +16,11 @@ from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
-    get_spec_layer_idx_from_weight_name,
 )
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     get_fused_shared_expert_layers,
+    get_spec_layer_idx_from_weight_name,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
@@ -243,4 +242,3 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
             get_spec_layer_idx_from_weight_name(self.config, name) is None
             and "embed_tokens" not in name
         )
-

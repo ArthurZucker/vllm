@@ -325,13 +325,3 @@ class DoryForCausalLM(nn.Module):
                 self.lm_head.logit_scale.float() / self.config.initializer_range
             )
         return logits
-
-
-    @staticmethod
-    def _check_weight_shape(name, weight, expected):
-        # TP loaders may narrow oversized tensors; reject incompatible exports.
-        if tuple(weight.shape) != expected:
-            raise ValueError(
-                f"Dory weight {name}: expected shape {expected}, "
-                f"got {tuple(weight.shape)}"
-            )

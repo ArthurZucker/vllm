@@ -14,7 +14,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.utils import copy_weight_
 
 __all__ = [
     "BasevLLMParameter",
@@ -89,17 +88,6 @@ class BasevLLMParameter(Parameter):
         cond2 = loaded_weight.ndim == 0 and loaded_weight.numel() == 1
         return cond1 and cond2
 
-    def _assert_and_load(self, loaded_weight: torch.Tensor):
-        assert self.data.shape == loaded_weight.shape or self._is_1d_and_scalar(
-            loaded_weight
-        )
-        copy_weight_(self.data, loaded_weight)
-
-
-
-
-
-
 
 class _ColumnvLLMParameter(BasevLLMParameter):
     """Private class defining weight loading functionality
@@ -120,9 +108,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         return self._output_dim
 
 
-
-
-
 class RowvLLMParameter(BasevLLMParameter):
     """Parameter class defining weight_loading functionality
     (load_row_parallel_weight) for parameters being loaded
@@ -137,7 +122,6 @@ class RowvLLMParameter(BasevLLMParameter):
     @property
     def input_dim(self):
         return self._input_dim
-
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
@@ -184,10 +168,6 @@ class PerTensorScaleParameter(BasevLLMParameter):
     # load weight into parameter as is
 
 
-
-
-
-
 class PackedColumnParameter(_ColumnvLLMParameter):
     """Parameter for model parameters which are packed on disk
     and support column parallelism only. See PackedvLLMParameter
@@ -217,7 +197,6 @@ class PackedColumnParameter(_ColumnvLLMParameter):
     @property
     def marlin_tile_size(self):
         return self._marlin_tile_size
-
 
 
 class PackedvLLMParameter(ModelWeightParameter):
@@ -253,7 +232,6 @@ class PackedvLLMParameter(ModelWeightParameter):
     @property
     def marlin_tile_size(self):
         return self._marlin_tile_size
-
 
 
 class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):
@@ -329,10 +307,6 @@ class SharedWeightParameter(BasevLLMParameter):
         # hold local reference, since ModelWeightParameter does not
         # see https://github.com/pytorch/pytorch/issues/75932
         self.local_tensors.add(data)
-
-
-
-
 
     def process_weights_after_loading(self):
         for key in self.partitions:
@@ -415,9 +389,3 @@ def permute_param_layout_(
         param._packed_dim = kwargs["packed_dim"]
 
     return param
-
-
-def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size):
-    return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
-
-

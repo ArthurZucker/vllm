@@ -132,27 +132,6 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
         """Allocate no rows; they stay in the checkpoint files."""
         return torch.empty(0, embedding_dim, dtype=dtype)
 
-    def accept_checkpoint_shard(
-        self,
-        shard_index: int,
-        loaded_weight: torch.Tensor,
-        shard_size: int,
-        name: str,
-    ) -> None:
-        """Keep a checkpoint shard as a zero-copy byte view of its storage."""
-        if self._bound:
-            raise RuntimeError("PLE disk offload does not support weight reload")
-        dtype = getattr(self, name).dtype
-        if loaded_weight.dtype != dtype:
-            raise ValueError(
-                f"PLE shard {name} dtype {loaded_weight.dtype} must match the "
-                f"embedding dtype {dtype}; disk offload serves rows as stored"
-            )
-        if shard_index in self._shards[name]:
-            raise ValueError(f"Duplicate PLE embedding shard {shard_index} {name}")
-        self._shards[name][shard_index] = loaded_weight.view(torch.uint8)
-        self._shard_size = shard_size
-
     def bind_file_shards(self) -> None:
         """Record each shard's file and offset and release the loader's views."""
         if self._bound or self._dummy:
@@ -640,7 +619,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             output=self._prefetch_ids[: input_ids.numel()],
         )
         embedding.start_prefetch(ngram_ids)
-
 
 
 def stage_checkpoint_rows(

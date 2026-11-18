@@ -9,8 +9,6 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-from collections.abc import Iterable
-
 import regex as re
 import torch
 import torch.nn as nn
@@ -61,23 +59,6 @@ logger = init_logger(__name__)
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 _CONTEXT_WKV_RE = re.compile(r"^mtp\.(\d+)\.attn\.wkv\.(.+)$")
-
-
-def _duplicate_context_wkv_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], num_layers: int
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Load every draft layer's WKV into the cross-layer projection."""
-    for name, weight in weights:
-        yield name, weight
-        match = _CONTEXT_WKV_RE.fullmatch(name)
-        if match is None:
-            continue
-        layer_idx = int(match.group(1))
-        if layer_idx >= num_layers:
-            continue
-        stacked_weight = weight.detach()
-        stacked_weight.shard_id = layer_idx
-        yield f"context_wkv_proj.{match.group(2)}", stacked_weight
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -438,7 +419,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
     # --- Weight loading ----------------------------------------------------
-
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint `mtp.{i}.*` name to this model's parameter path.

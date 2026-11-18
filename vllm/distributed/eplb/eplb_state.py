@@ -1246,30 +1246,6 @@ class EplbState:
             load_pass_list.append(eplb_model_state.expert_load_pass.clone())
         return self._allreduce_list(load_pass_list)
 
-    @classmethod
-    def from_mapping(
-        cls,
-        model: MixtureOfExperts,
-        model_config: ModelConfig,
-        device: torch.device,
-        parallel_config: ParallelConfig,
-        expanded_physical_to_logical: torch.Tensor,
-    ) -> "EplbState":
-        eplb_state = cls(
-            parallel_config=parallel_config,
-            device=device,
-        )
-        eplb_state.add_model(
-            model=model,
-            model_config=model_config,
-        )
-        eplb_state.update_mapping(
-            model_config,
-            expanded_physical_to_logical,
-        )
-
-        return eplb_state
-
     def update_mapping(
         self,
         model_config: ModelConfig,

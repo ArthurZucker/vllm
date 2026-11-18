@@ -366,25 +366,6 @@ def _pad_vocab_rows(tensor: torch.Tensor, vocab_size: int) -> torch.Tensor:
     )
 
 
-def _decoder_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], vocab_size: int
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Shape the mapped decoder tensors for `NemotronHForCausalLM`.
-
-    NeMo packs the routed experts of each MoE layer into two tensors; the FP8 and
-    NVFP4 checkpoints have one tensor per expert, with its quantization scales.
-    The embedding and LM head are zero-padded to the decoder's padded vocabulary.
-    """
-    for name, tensor in weights:
-        if name in (
-            "model.embed_tokens.weight",
-            "model.embeddings.weight",
-            "lm_head.weight",
-        ):
-            tensor = _pad_vocab_rows(tensor, vocab_size)
-        yield from _unpack_experts(name, tensor)
-
-
 def _mtp_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -575,7 +556,6 @@ class Nemotron3_5TranscribeForConditionalGeneration(
             tower_model=["audio_tower.preprocessor", "audio_tower.encoder"],
         )
 
-
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
         text_config = vllm_config.model_config.hf_config.text_config
@@ -629,4 +609,3 @@ class Nemotron3_5TranscribeMTP(NemotronHMTP, SupportsMultiModalEmbeddings):
         # Shard selection passes the raw llm.mtp.* names; load_weights passes
         # the mtp.* names that _mtp_weights produces.
         return super().is_unused_checkpoint_weight(name.removeprefix("llm."))
-

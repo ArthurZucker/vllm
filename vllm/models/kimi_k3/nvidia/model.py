@@ -336,26 +336,6 @@ class KimiRoutedOutputTransform(nn.Module):
         return hidden_states
 
 
-def make_kimi_k3_mega_moe_expert_params_mapping(
-    num_experts: int,
-) -> list[tuple[str, str, int, str]]:
-    mapping = []
-    for expert_id in range(num_experts):
-        for shard_id in ("w1", "w2", "w3"):
-            param_prefix = "w13" if shard_id in ("w1", "w3") else "w2"
-            for suffix in ("weight_packed", "weight_scale"):
-                param_suffix = "weight" if suffix == "weight_packed" else suffix
-                mapping.append(
-                    (
-                        f"experts.{param_prefix}_{param_suffix}",
-                        f"experts.{expert_id}.{shard_id}.{suffix}",
-                        expert_id,
-                        shard_id,
-                    )
-                )
-    return mapping
-
-
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -1312,7 +1292,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         return hidden_states
 
 
-
 class KimiLinearForCausalLM(
     nn.Module,
     HasInnerState,
@@ -1451,7 +1430,6 @@ class KimiLinearForCausalLM(
         if self.needs_norm_in_logits:
             hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
-
 
     def process_weights_after_loading(self) -> None:
         """The specialized decode is built after the first load and keeps copies
@@ -1919,4 +1897,3 @@ class KimiK3ForConditionalGeneration(
         return packed_dsa_block_size(
             vllm_config, attn_page_size_1_token, mamba_page_size, alignment
         )
-

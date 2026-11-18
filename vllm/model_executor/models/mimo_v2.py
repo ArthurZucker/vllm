@@ -44,7 +44,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
     make_attention_sink,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
@@ -62,7 +61,6 @@ from .interfaces import (
 from .utils import (
     PPMissingLayer,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -872,77 +870,6 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         )
 
 
-    def _try_load_fp8_qkv_proj(
-        self,
-        name: str,
-        tensor: torch.Tensor,
-        fp8_qkv_proj_dict: dict[str, dict[str, torch.Tensor]],
-        params_dict: dict[str, torch.nn.Parameter],
-        loaded_params: set[str],
-        tp_rank: int,
-        tp_size: int,
-    ) -> bool:
-        """The fused fp8 QKV projection weights and scale are stored separately.
-        Special care must be taken while sharding these tensors across TP ranks.
-        See _shard_fp8_qkv_proj for more details.
-
-        Returns:
-            True if `tensor` was an fp8 qkv_proj weight/scale and was consumed
-            (caller should skip it); False otherwise, so the caller falls
-            through to its normal loading path.
-
-        """
-        is_weight = (
-            name.endswith("qkv_proj.weight") and tensor.dtype == torch.float8_e4m3fn
-        )
-        is_scale = name.endswith("qkv_proj.weight_scale_inv")
-        if not is_weight and not is_scale:
-            # Weight is not in FP8 format. Ignore.
-            return False
-
-        if is_pp_missing_parameter(name, self):
-            # This qkv_proj is for a layer not on this PP rank.
-            return True
-
-        prefix, qkv_kind = name.rsplit(".", 1)
-        if f"{prefix}.weight" not in params_dict:
-            # Layer absent from this instance, e.g. truncated num_hidden_layers.
-            return True
-        entry = fp8_qkv_proj_dict.setdefault(prefix, {})
-        entry[qkv_kind] = tensor
-        if "weight" not in entry or "weight_scale_inv" not in entry:
-            # Still waiting for the other param.
-            return True
-        del fp8_qkv_proj_dict[prefix]
-
-        # Get self_attn module, which is a parent of qkv_proj.
-        attn = self.get_submodule(prefix.rsplit(".", 1)[0])
-
-        # Shard the qkv_proj per-rank.
-        w_rank, s_rank = _shard_fp8_qkv_proj(
-            entry["weight"],
-            entry["weight_scale_inv"],
-            num_heads=attn.total_num_heads,
-            num_kv_heads=attn.total_num_kv_heads,
-            head_dim=attn.head_dim,
-            v_head_dim=attn.v_head_dim,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            # The fused qkv_proj is pre-sharded for this many ranks.
-            ckpt_tp=self.config.num_key_value_heads,
-            kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
-        )
-        sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
-        for kind, tensor in sharded.items():
-            param_name = f"{prefix}.{kind}"
-            param = params_dict[param_name]
-            if tensor.shape[0] > param.shape[0]:
-                tensor = tensor[: param.shape[0]]
-            default_weight_loader(param, tensor)
-            loaded_params.add(param_name)
-        return True
-
-
 class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEagle3):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1001,7 +928,6 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
-
 
 
 class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):

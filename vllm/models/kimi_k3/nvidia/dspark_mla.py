@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """K3 dense MLA draft model for DSpark speculative decoding."""
 
-from collections.abc import Iterable
 from dataclasses import replace
 
 import torch
@@ -37,28 +36,6 @@ from vllm.v1.worker.workspace import current_workspace_manager
 _GROUPED_KV_CACHE_DTYPES = frozenset(
     {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
 )
-
-
-def _duplicate_context_kv_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], num_layers: int
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Load each layer's KV projection into the cross-layer linear."""
-    for name, weight in weights:
-        yield name, weight
-        layer_prefix, marker, param_name = name.partition(
-            ".self_attn.kv_a_proj_with_mqa."
-        )
-        if not marker:
-            continue
-        layer_idx_str = layer_prefix.rsplit(".", 1)[-1]
-        if not layer_idx_str.isdecimal():
-            continue
-        layer_idx = int(layer_idx_str)
-        if layer_idx >= num_layers:
-            continue
-        fused_weight = weight.detach()
-        fused_weight.shard_id = layer_idx
-        yield f"context_kv_proj.{param_name}", fused_weight
 
 
 class K3DSparkAttention(MultiHeadLatentAttention):
@@ -539,7 +516,6 @@ class K3DSparkForCausalLM(nn.Module):
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
-
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()

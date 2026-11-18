@@ -5,7 +5,7 @@
 """PyTorch Ultravox model."""
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
 import numpy as np
@@ -56,7 +56,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     flatten_bn,
     init_vllm_registered_model,
@@ -65,7 +64,6 @@ from .utils import (
 from .whisper import (
     WhisperEncoder,
     WhisperEncoderLayer,
-    _create_fake_bias_for_k_proj,
 )
 
 _AUDIO_PLACEHOLDER_OVERRIDE = "<|audio|>"
@@ -390,14 +388,6 @@ _WHISPER_ENCODER_MAPPER = WeightsMapper(
 )
 
 
-def _load_whisper_layer_weights(
-    module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
-) -> set[str]:
-    weights = _create_fake_bias_for_k_proj(weights, ".self_attn.k_proj.weight")
-    loader = AutoWeightsLoader(module)
-    return loader.load_weights(weights, mapper=_WHISPER_ENCODER_MAPPER)
-
-
 class UltravoxFeedForwardProjector(nn.Module):
     def __init__(
         self,
@@ -542,7 +532,6 @@ class UltravoxTransformerProjector(nn.Module):
         return hidden_states
 
 
-
 class UltravoxWhisperEncoder(WhisperEncoder):
     """Ultravox's `ModifiedWhisperEncoder` on top of vLLM's `WhisperEncoder`.
 
@@ -606,7 +595,6 @@ class UltravoxWhisperEncoder(WhisperEncoder):
 
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
-
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -938,7 +926,6 @@ class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
-
 
 
 def pad_and_concat_to_dim3(

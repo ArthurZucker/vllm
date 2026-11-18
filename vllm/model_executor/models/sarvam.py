@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator
 from itertools import islice
 
 import torch
@@ -92,16 +91,6 @@ def _zero_mean_tensor(t: torch.Tensor) -> torch.Tensor:
     if t.numel() == 0:
         return t
     return t - t.mean()
-
-
-def _normalized_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterator[tuple[str, torch.Tensor]]:
-    for name, w in weights:
-        if _is_gate_expert_bias_name(name):
-            yield name, _zero_mean_tensor(w)
-        else:
-            yield name, w
 
 
 class SarvamMLAAttention(nn.Module):
@@ -586,7 +575,6 @@ class SarvamMLAModel(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-
 class SarvamMixtureOfExperts(MixtureOfExperts):
     moe_layers: list[MoERunner]
     moe_mlp_layers: list[SarvamMLAMoE]
@@ -728,8 +716,7 @@ class SarvamMLAForCausalLM(
         return logits
 
 
-
 class SarvamMoEForCausalLM(BailingMoeForCausalLM):
     """Same as BailingMoeForCausalLM, but normalizes gate expert_bias pre-load."""
-    pass
 
+    pass

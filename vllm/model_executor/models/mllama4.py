@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from collections.abc import Hashable, Iterable, Mapping
+from collections.abc import Hashable, Mapping
 from typing import Annotated, Any, Literal
 
 import torch
@@ -50,9 +50,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.utils import initialize_model
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -1078,35 +1075,6 @@ class Llama4ForConditionalGeneration(
 
         return name
 
-    def _load_other_weights(
-        self,
-        other_weights: Iterable[tuple[str, torch.Tensor]],
-        params_dict: dict,
-        stacked_params_mapping: list,
-    ) -> set[str]:
-        """Load non-language-model weights with stacking support."""
-        updated_params = set()
-
-        for name, loaded_weight in other_weights:
-            # Try stacked parameter mapping first
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                updated_params.add(name)
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Use regular weight loading
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                updated_params.add(name)
-
-        return updated_params
-
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1118,7 +1086,6 @@ class Llama4ForConditionalGeneration(
             num_experts=self.config.text_config.num_local_experts,
             num_redundant_experts=self.num_redundant_experts,
         )
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

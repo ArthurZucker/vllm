@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import itertools
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -149,21 +147,6 @@ class RobertaEmbeddingModel(BertEmbeddingModel):
             return JinaRobertaModel(vllm_config=vllm_config, prefix=prefix)
 
 
-
-def filter_secondary_weights(
-    all_weights: Iterable[tuple[str, torch.Tensor]],
-    secondary_weights: list[str],
-) -> tuple[Iterable[tuple[str, torch.Tensor]], Iterable[tuple[str, torch.Tensor]]]:
-    all_weights1, all_weights2 = itertools.tee(all_weights)
-
-    def filtered(n):
-        return any(n.startswith(f) for f in secondary_weights)
-
-    return ((n, w) for n, w in all_weights1 if filtered(n)), (
-        (n, w) for n, w in all_weights2 if not filtered(n)
-    )
-
-
 class BgeM3EmbeddingModel(RobertaEmbeddingModel):
     """A model that extends RobertaEmbeddingModel with sparse embeddings.
 
@@ -230,7 +213,6 @@ class BgeM3EmbeddingModel(RobertaEmbeddingModel):
         )
 
 
-
 @default_pooling_type(seq_pooling_type="CLS")
 class RobertaForSequenceClassification(nn.Module, SupportsCrossEncoding, SupportsLoRA):
     """A model that uses Roberta to provide embedding functionalities.
@@ -282,7 +264,6 @@ class RobertaForSequenceClassification(nn.Module, SupportsCrossEncoding, Support
             pooler_config,
             classifier=self.classifier,
         )
-
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.roberta.embed_input_ids(input_ids)
@@ -343,7 +324,6 @@ class RobertaForTokenClassification(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.roberta.embed_input_ids(input_ids)
-
 
     def forward(
         self,

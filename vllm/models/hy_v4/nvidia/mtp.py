@@ -3,8 +3,6 @@
 """Multi-token prediction (MTP) head for HY V4 (NVIDIA)."""
 
 import copy
-import typing
-from collections.abc import Callable
 
 import torch
 from torch import nn
@@ -41,24 +39,6 @@ _MTP_SCALE_ONLY_PARAM_SUBSTRINGS = (
 #   * ``ignored_layers`` -- Fp8Config, GPTQ / AWQ configs.
 #   * ``exclude_modules`` -- ModelOpt* configs (Fp8, NvFp4, MxFp8, Mixed).
 _MTP_QUANT_EXCLUSION_ATTRS = ("ignored_layers", "exclude_modules")
-
-
-def _get_spec_layer_idx_from_weight_name(
-    config: PreTrainedConfig, weight_name: str
-) -> int | None:
-    """Return the MTP layer index a checkpoint weight belongs to, or None.
-
-    Compatible with`num_nextn_predict_layers` of 1 and 2 for a single MTP
-    head, matching how the HY V4 checkpoints are exported.
-    """
-    if getattr(config, "num_nextn_predict_layers", 0) < 1:
-        return None
-    layer_idx = config.num_hidden_layers
-    num_mtp_layers = max(config.num_nextn_predict_layers - 1, 1)
-    for i in range(num_mtp_layers):
-        if weight_name.startswith(f"model.layers.{layer_idx + i}."):
-            return layer_idx + i
-    return None
 
 
 def _should_skip_missing_mtp_scale_param(
@@ -596,114 +576,3 @@ class HYV4MTP(nn.Module):
                 f"model.layers.{spec_layer}.mtp_block.",
             )
         return name
-
-    def _load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ) -> bool:
-        if name not in params_dict:
-            return False
-        param = params_dict[name]
-        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        loaded_local_expert = False
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            success = weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                expert_id,
-                return_success=True,
-            )
-            if success:
-                loaded_local_expert = True
-        return loaded_local_expert
-
-    def _load_expert_weight(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict,
-        loaded_params: set[str],
-        split_expert_params_mapping: list[tuple[str, str, int, str]],
-        fused_expert_param_names: dict[tuple[str, str], str],
-        num_experts: int,
-    ) -> bool:
-        """Load one routed-expert weight in either checkpoint layout.
-
-        Args:
-            name: Weight name already rewritten to draft-module naming.
-            loaded_weight: The checkpoint tensor.
-            params_dict: The draft model's named parameters.
-            loaded_params: Set updated with the parameters that received a value.
-            split_expert_params_mapping: Mapping for the per-expert layout.
-            fused_expert_param_names: `(mlp_prefix, tag) -> param name` for the
-                all-experts-packed layout.
-            num_experts: Total number of routed experts.
-
-        Returns:
-            True when the weight was consumed (even if this rank holds none of
-            the addressed experts).
-
-        """
-        base = name.split(".experts.")[0]
-        for ckpt_proj, tag in (
-            (".experts.gate_up_proj", "w13_weight"),
-            (".experts.down_proj", "w2_weight"),
-        ):
-            if ckpt_proj not in name:
-                continue
-            param_base = fused_expert_param_names.get((base, tag))
-            if param_base is None:
-                return False
-            # Keep the checkpoint suffix (e.g. `_scale_inv`) so block-scale
-            # tensors land in the scale parameter, not in the weight.
-            target = _resolve_fused_expert_param(
-                param_base, name.split(ckpt_proj, 1)[1], params_dict
-            )
-            if target is None:
-                return False
-            if tag == "w13_weight":
-                chunks = loaded_weight.chunk(2, dim=-2)
-                loaded_w1 = self._load_fused_expert_weights(
-                    target, params_dict, chunks[0], "w1", num_experts
-                )
-                loaded_w3 = self._load_fused_expert_weights(
-                    target, params_dict, chunks[1], "w3", num_experts
-                )
-                loaded = loaded_w1 and loaded_w3
-            else:
-                loaded = self._load_fused_expert_weights(
-                    target, params_dict, loaded_weight, "w2", num_experts
-                )
-            if loaded:
-                loaded_params.add(target)
-            # The weight belongs to the experts either way; never fall through.
-            return True
-
-        consumed = False
-        for param_name, weight_name, expert_id, shard_id in split_expert_params_mapping:
-            if weight_name not in name:
-                continue
-            consumed = True
-            name_mapped = name.replace(weight_name, param_name)
-            if name_mapped not in params_dict:
-                continue
-            param = params_dict[name_mapped]
-            weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-            if weight_loader(
-                param,
-                loaded_weight,
-                name_mapped,
-                shard_id=shard_id,
-                expert_id=expert_id,
-                return_success=True,
-            ):
-                loaded_params.add(name_mapped)
-        return consumed
-

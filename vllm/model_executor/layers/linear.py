@@ -68,57 +68,6 @@ def register_weight_loader_v2_supported_method(cls):
     return cls
 
 
-def adjust_marlin_shard(
-    param: Parameter,
-    shard_size: int,
-    shard_offset: int,
-) -> tuple[int, int]:
-    marlin_tile_size: int | None = getattr(param, "marlin_tile_size", None)
-    if marlin_tile_size is None:
-        return shard_size, shard_offset
-
-    return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
-
-
-def adjust_block_scale_shard(
-    weight_block_size: tuple[int, ...] | None,
-    shard_size: int,
-    shard_offset: int,
-) -> tuple[int, int]:
-    assert weight_block_size is not None
-    block_n = weight_block_size[0]
-    shard_offset = (shard_offset + block_n - 1) // block_n
-    shard_size = (shard_size + block_n - 1) // block_n
-    return shard_size, shard_offset
-
-
-def adjust_scalar_to_fused_array(
-    param_data: torch.Tensor,
-    loaded_weight: torch.Tensor,
-    shard_id: int | str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """For fused modules (QKV and MLP) we have an array of length
-    N that holds 1 scale for each "logical" matrix. So the param
-    is an array of length N. The loaded_weight corresponds to
-    one of the shards on disk. Here, we slice the param based on
-    the shard_id for loading.
-    """
-    qkv_idxs = {"q": 0, "k": 1, "v": 2}
-
-    if isinstance(shard_id, str):
-        shard_id = qkv_idxs[shard_id]
-    elif not isinstance(shard_id, int):
-        raise ValueError(f"Unknown Shard Id {shard_id}")
-
-    # AutoFP8 scales do not have a shape
-    # compressed-tensors scales do have a shape
-    if len(loaded_weight.shape) != 0:
-        assert loaded_weight.shape[0] == 1
-        loaded_weight = loaded_weight[0]
-
-    return param_data[shard_id], loaded_weight
-
-
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
@@ -406,7 +355,6 @@ class ReplicatedLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-
     def forward(
         self,
         x: torch.Tensor,
@@ -577,8 +525,6 @@ class ColumnParallelLinear(LinearBase):
                 self.output_partition_sizes,
             )
 
-
-
     def forward(
         self,
         input_,
@@ -670,8 +616,6 @@ class StackedColumnParallelLinear(ColumnParallelLinear):
         raise NotImplementedError
 
 
-
-
 class MergedColumnParallelLinear(StackedColumnParallelLinear):
     """Packed linear layers with column parallelism.
 
@@ -753,17 +697,8 @@ class MergedColumnParallelLinear(StackedColumnParallelLinear):
         if self.padding_size and (param is self.weight or param is self.bias):
             param.data[-self.padding_size :].zero_()
 
-    @property
-    def _checkpoint_output_sizes(self) -> list[int]:
-        return self.output_sizes[:-1] if self.padding_size else self.output_sizes
-
     def _get_shard_size_mapping(self, loaded_shard_id: int) -> int:
         return self.output_sizes[loaded_shard_id] // self.tp_size
-
-
-
-
-
 
 
 class QKVParallelLinear(StackedColumnParallelLinear):
@@ -867,10 +802,6 @@ class QKVParallelLinear(StackedColumnParallelLinear):
             "v": self.num_kv_heads * self.v_head_size,
         }
         return shard_size_mapping.get(loaded_shard_id)
-
-
-
-
 
 
 class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
@@ -991,8 +922,6 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         }.get(loaded_shard_id)
 
 
-
-
 class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
     """Kimi-K3 QKV-A projection fused with its output-gate projection.
 
@@ -1034,34 +963,6 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
-
-    def _load_with_replicated_latents(
-        self,
-        loader: Callable[..., None],
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None,
-    ) -> None:
-        is_replicated = isinstance(loaded_shard_id, int) and loaded_shard_id < 2
-        if not is_replicated:
-            loader(param, loaded_weight, loaded_shard_id)
-            return
-
-        # The base loader narrows every checkpoint shard using its TP rank.
-        # Replicated latent shards instead load the rank-zero slice on every rank.
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        self.tp_rank = 0
-        if param_tp_rank is not None:
-            param.tp_rank = 0
-        try:
-            loader(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
-
-
 
 
 # --8<-- [start:row_parallel_linear]
@@ -1179,8 +1080,6 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
         self.update_param_tp_status()
-
-
 
     def forward(
         self,

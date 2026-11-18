@@ -91,7 +91,7 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.math_utils import cdiv, round_up
+from vllm.utils.math_utils import round_up
 
 from ..nvidia.specialized_decode.runtime import specialized_decode_config
 from .attention import Glm5NextMLAAttention
@@ -1041,7 +1041,6 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 layer.split_hc_fns()
 
 
-
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
 ):
@@ -1158,7 +1157,6 @@ class Glm5NextForCausalLM(
                 return logits
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
     def process_weights_after_loading(self) -> None:
         for module in self.modules():
@@ -1421,39 +1419,3 @@ _FP8_ATTN_PROJS = {
     ".q_b_proj.": "q_b_proj",
     ".o_proj.": "o_proj",
 }
-
-
-def _mla_proj_checkpoint_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    params_dict: dict[str, nn.Parameter],
-    config: Glm5NextTextConfig,
-    kv_a_pad_size: int,
-) -> tuple[str, torch.Tensor]:
-    """A checkpoint tensor of an MLA projection, in the form its parameter
-    loads: Quark's `weight_scale` under the `weight_scale_inv` name, and a
-    NoPE `kv_a_proj_with_mqa` with zero rows (and scale blocks) for the RoPE
-    part the checkpoint omits. Each tensor is adapted on its own, so a weight
-    and its scale can arrive in any order and in different calls."""
-    suffix = next((s for s in _FP8_ATTN_PROJS if s in name), None)
-    if suffix is None:
-        return name, tensor
-    prefix = name.rsplit(suffix, 1)[0]
-    scale_name = f"{prefix}.{_FP8_ATTN_PROJS[suffix]}.weight_scale_inv"
-    if scale_name not in params_dict:  # no q_lora_rank: kv_a is not fused
-        scale_name = f"{prefix}{suffix}weight_scale_inv"
-    is_fp8_proj = scale_name in params_dict  # see `bf16_linear`
-    if is_fp8_proj and name.endswith(".weight_scale"):
-        name = f"{name}_inv"
-    if kv_a_pad_size > 0 and suffix == ".kv_a_proj_with_mqa.":
-        if name.endswith(".weight"):
-            pad = tensor.new_zeros(kv_a_pad_size, *tensor.shape[1:])
-            tensor = torch.cat([tensor, pad])
-        elif name.endswith((".weight_scale_inv", ".weight_scale")) and tensor.ndim == 2:
-            # block scales; Quark names them `weight_scale` (not renamed above
-            # when its own layer, with a `weight_scale` parameter, loads them)
-            block_n = cdiv(config.kv_lora_rank, tensor.shape[0])
-            rows = cdiv(config.kv_lora_rank + kv_a_pad_size, block_n)
-            pad = tensor.new_ones(rows - tensor.shape[0], *tensor.shape[1:])
-            tensor = torch.cat([tensor, pad])
-    return name, tensor

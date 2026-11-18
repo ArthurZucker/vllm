@@ -772,19 +772,6 @@ _QUARK_EXPERT_PROJECTIONS = {
 }
 
 
-def _quark_expert_weight_slot(name: str) -> tuple[str, str, int] | None:
-    parts = name.split(".")
-    if len(parts) != 3 or not parts[0].isdigit():
-        return None
-    projection = _QUARK_EXPERT_PROJECTIONS.get(parts[1])
-    if projection is None or parts[2] not in ("weight", "weight_scale"):
-        return None
-    param_name, shard_id = projection
-    if parts[2] == "weight_scale":
-        param_name += "_scale"
-    return param_name, shard_id, int(parts[0])
-
-
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
     """MuseSpark routed experts using ROCm BF16, FP8, or MXFP4 methods."""
 
@@ -823,7 +810,6 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
             quant_method.weight_quant_key,
             quant_method.activation_quant_key,
         )
-
 
 
 class MuseMoERunner(MoERunner):

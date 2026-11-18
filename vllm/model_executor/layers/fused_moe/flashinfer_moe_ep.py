@@ -610,12 +610,6 @@ class FlashInferMoeEp:
             _expert_major_bytes(fc2_sf, as_bytes),
         )
 
-    def expert_weight_views(self) -> tuple[torch.Tensor, ...]:
-        """Every per-expert tensor the kernel reads: weights plus epilogue."""
-        epilogue = cast(FlashInferMoeEpEpilogue, self._epilogue)
-        vectors = (epilogue.fc1_alpha, epilogue.fc2_alpha, epilogue.fc1_norm_const)
-        return (*self.kernel_weights(), *(v for v in vectors if v is not None))
-
     def destroy(self) -> None:
         mega_layer = self._mega_layer
         if mega_layer is None:

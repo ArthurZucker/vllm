@@ -491,7 +491,6 @@ class BertWithRope(nn.Module, SupportsQuant):
         return self.encoder(positions, hidden_states)
 
 
-
 class NomicBertModel(BertWithRope):
     # for https://huggingface.co/nomic-ai/nomic-bert-2048
 
@@ -550,7 +549,6 @@ class GteNewModel(BertWithRope):
             yield name, weight
 
 
-
 class SnowflakeGteNewModel(GteNewModel):
     # for Snowflake/snowflake-arctic-embed-m-v2.0
 
@@ -577,54 +575,6 @@ class JinaRobertaModel(BertWithRope):
             "norm2": "mlp_ln",
         }
     )
-
-    @torch.inference_mode()
-    def jina_merge_lora_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        # use for jina-embeddings-v3
-        # Merge Lora weights into a single weight tensor.
-        # This is a temporary solution until we have a better way to handle
-
-        scaling = self.config.lora_alpha / self.config.lora_rank
-        device = self.vllm_config.device_config.device
-
-        weights_dict = {name: weight for name, weight in weights}
-
-        o = ".original"
-        a = ".0.lora_A"
-        b = ".0.lora_B"
-
-        # text-matching
-        i = -1
-
-        for name in list(weights_dict.keys()):
-            if o in name:
-                dtype = weights_dict[name].dtype
-                shape = weights_dict[name].shape
-                weight_name = name[: -len(o)]
-
-                if "embeddings" in weight_name:
-                    B = weights_dict[weight_name + a][i].to(device).float()
-                    A = weights_dict[weight_name + b][i].to(device).float()
-                else:
-                    B = weights_dict[weight_name + b][i].to(device).float()
-                    A = weights_dict[weight_name + a][i].to(device).float()
-
-                weight = (
-                    weights_dict[weight_name + o].to(device)
-                    + torch.matmul(B, A).view(shape) * scaling
-                )
-                weight = weight.cpu().to(dtype)
-
-                weights_dict[weight_name.replace(".parametrizations", "")] = weight
-
-                del (
-                    weights_dict[weight_name + o],
-                    weights_dict[weight_name + a],
-                    weights_dict[weight_name + b],
-                )
-
-        return [(name, weight) for name, weight in weights_dict.items()]
-
 
 
 @default_pooling_type(seq_pooling_type="CLS")
@@ -657,7 +607,6 @@ class GteNewForSequenceClassification(nn.Module, SupportsCrossEncoding):
             pooling=self.new.pooler,
             classifier=self.classifier,
         )
-
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.new.embed_input_ids(input_ids)

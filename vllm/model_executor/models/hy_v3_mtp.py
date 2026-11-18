@@ -24,7 +24,6 @@
 # limitations under the License.
 """Inference-only HY V3 MTP model compatible with HuggingFace weights."""
 
-
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
@@ -220,31 +219,6 @@ class HYV3MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
-
-    def _split_qkv_weight(self, qkv: torch.Tensor):
-        num_attention_heads = self.config.num_attention_heads
-        num_kv_heads = getattr(
-            self.config, "num_key_value_heads", self.config.num_attention_heads
-        )
-        num_key_value_groups = num_attention_heads // num_kv_heads
-        hidden_size = self.config.hidden_size
-
-        if hasattr(self.config, "head_dim"):
-            attention_head_dim = self.config.head_dim
-        elif hasattr(self.config, "attention_head_dim"):
-            attention_head_dim = self.config.attention_head_dim
-        else:
-            attention_head_dim = self.config.hidden_size // num_attention_heads
-
-        qkv = qkv.reshape(
-            num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size
-        )
-        q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
-        q = q.reshape(-1, hidden_size)
-        k = k.reshape(-1, hidden_size)
-        v = v.reshape(-1, hidden_size)
-        return torch.concat((q, k, v))
-
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """Rewrite spec layer weight names to match vLLM module structure."""

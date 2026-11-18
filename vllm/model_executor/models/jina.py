@@ -4,7 +4,6 @@
 import json
 import logging
 from collections import defaultdict
-from collections.abc import Iterable
 
 import torch
 from safetensors.torch import load as safetensors_load
@@ -31,7 +30,6 @@ from .interfaces_base import VllmModelForPooling
 from .llama import LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM, Qwen3Model
 from .utils import (
-    AutoWeightsLoader,
     StageMissingLayer,
     WeightsMapper,
     maybe_prefix,
@@ -88,7 +86,6 @@ class JinaForRanking(nn.Module, SupportsLateInteraction):
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
         return hidden_states
-
 
 
 class JinaForRankingPool(StepPool):
@@ -227,53 +224,6 @@ def _setup_jina_v5_task_and_pooler(model: nn.Module, vllm_config: VllmConfig) ->
     model.pooler = DispatchPooler.for_embedding(pooler_config)
 
 
-def _load_jina_v5_weights(
-    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
-) -> set[str]:
-    """Shared loader: merge the selected task LoRA adapter into the base weights."""
-    lora_pairs: dict[str, dict[str, torch.Tensor]] = {}
-    scaling = 1.0
-
-    result = _load_adapter(model._model_name, model._task, model._revision)
-    if result is None:
-        logger.warning(
-            "No adapter found for task %r in %r. Loading raw base weights.",
-            model._task,
-            model._model_name,
-        )
-    else:
-        adapter_config, adapter_weights = result
-        scaling = adapter_config["lora_alpha"] / adapter_config["r"]
-        lora_pairs = _build_lora_pairs(adapter_weights)
-        logger.info(
-            "Loaded %d adapter tensors for task %r (scaling=%.4f, %d LoRA pairs)",
-            len(adapter_weights),
-            model._task,
-            scaling,
-            len(lora_pairs),
-        )
-
-    def _merge_weights(
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, tensor in weights:
-            clean_name = name
-            if clean_name.startswith("model."):
-                clean_name = clean_name[len("model.") :]
-
-            if clean_name in lora_pairs:
-                pair = lora_pairs[clean_name]
-                if "A" in pair and "B" in pair:
-                    lora_A = pair["A"].to(device=tensor.device, dtype=tensor.dtype)
-                    lora_B = pair["B"].to(device=tensor.device, dtype=tensor.dtype)
-                    tensor = tensor + (lora_B @ lora_A) * scaling
-            yield name, tensor
-
-    loader = AutoWeightsLoader(model, ignore_unexpected_prefixes=["lm_head."])
-    weights = _merge_weights(weights)
-    return loader.load_weights(weights, mapper=model.hf_to_vllm_mapper)
-
-
 class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):
     """jina-embeddings-v5 with a Qwen3 decoder backbone (e.g. -small).
 
@@ -294,7 +244,6 @@ class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _setup_jina_v5_task_and_pooler(self, vllm_config)
-
 
 
 class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
@@ -319,7 +268,6 @@ class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _setup_jina_v5_task_and_pooler(self, vllm_config)
-
 
 
 class JinaEmbeddingsV5Model(JinaEmbeddingsV5DecoderModel):

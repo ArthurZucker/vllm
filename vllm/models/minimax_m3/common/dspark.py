@@ -8,8 +8,6 @@ Markov and confidence heads) built from MiniMax-M3 layers: Gemma RMSNorm
 checkpoint ships no token embedding or LM head; both are shared with the target.
 """
 
-from collections.abc import Iterable
-
 import torch
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
@@ -431,17 +429,3 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             )
 
             attach_drafter(self, vllm_config)
-
-    @staticmethod
-    def _rename_checkpoint_weights(
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, tensor in weights:
-            name = name.removeprefix(_CHECKPOINT_PREFIX)
-            name = name.replace(".decoder_layer.", ".")
-            if name.startswith("final_norm."):
-                name = "norm." + name.removeprefix("final_norm.")
-            # MiniMax stores the MXFP8 E8M0 block scales as weight_scale_inv.
-            name = name.replace(".weight_scale_inv", ".weight_scale")
-            yield name, tensor
-
