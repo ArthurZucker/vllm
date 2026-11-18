@@ -44,7 +44,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.conversion_mapping import get_conversion_mapping
+from vllm.model_executor.model_loader.conversion_mapping import (
+    from_mapper,
+    get_conversion_mapping,
+)
 from vllm.model_executor.model_loader.weight_ops import (
     Deinterleave,
     PadToParam,
@@ -279,8 +282,22 @@ def load_with_ops(
     """Load `weights` (tensors, or lazy safetensors slices: then each rank reads its
     bytes only) into `model` with `conversions` (default: the model's entries in
     `conversion_mapping`). Returns the params loaded."""
+    stream = []  # functions of the whole stream (pair scales, repack), run first
     if conversions is None:
         conversions = get_conversion_mapping(model)
+        if (own := getattr(model, "hf_to_vllm_mapper", None)) is not None:
+            stream += own.weights_transforms  # e.g. MiniMax M3's ROCm redirect
+    # the quant config's: KV-cache scales onto `attn`, ModelOpt's CSF pairing, ...
+    modules = (model, *model.children())
+    quant = next(
+        (m.quant_config for m in modules if getattr(m, "quant_config", None)), None
+    )
+    if quant is not None:
+        mapper = quant.get_cache_scale_mapper() | quant.get_checkpoint_weight_mapper()
+        conversions = [*conversions, *from_mapper(mapper)]
+        stream += mapper.weights_transforms
+    for transform in stream:
+        weights = transform(weights)
     conversions = [*deepcopy(conversions), *_padded_converters(model)]
     # the live params: `state_dict()` (what Transformers passes) drops their attributes
     params = dict(model.named_parameters()) | dict(model.named_buffers())

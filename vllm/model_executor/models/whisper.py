@@ -3,7 +3,7 @@
 
 import enum
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from typing import Annotated
 
@@ -79,7 +79,6 @@ from .interfaces import (
     SupportsTranscription,
 )
 from .utils import (
-    WeightsMapper,
     cast_overflow_tensors,
     make_layers,
     maybe_prefix,
@@ -811,26 +810,6 @@ class WhisperForConditionalGeneration(
         "kv_proj": ["k_proj", "v_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."},
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-            ".encoder_attn.k_proj": (".encoder_attn.kv_proj", 0),
-            ".encoder_attn.v_proj": (".encoder_attn.kv_proj", 1),
-        },
-        orig_to_new_prefix={"proj_out.": None},
-        # Add fake zeros bias to k_proj for qkv packed
-        weights_transforms=[
-            lambda weights: _create_fake_bias_for_k_proj(weights, ".k_proj.weight"),
-            lambda weights: _create_fake_bias_for_k_proj(
-                weights, ".k_proj.weight_packed"
-            ),
-        ],
-    )
-
     # Whisper only supports audio-conditioned generation.
     supports_transcription_only = True
     supports_segment_timestamp = True
@@ -1041,46 +1020,3 @@ class WhisperForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.proj_out, hidden_states)
         return logits
-
-
-
-def _create_fake_bias_for_k_proj(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    fake_bias_key_name: str,
-    out_features: int | None = None,
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Create full zeros bias for k_proj weight in self-attn and x-attn layers.
-    So that the bias for k_proj in qkv_proj or kv_proj can be initialized with
-    zeros.
-
-    If the checkpoint already provides a real `.bias` entry for the given
-    weight, it is forwarded as-is and no fake bias is injected for that layer.
-    """
-    # Map the weight-name suffix to the corresponding bias-name suffix, e.g.
-    # ".k_proj.weight_packed" / ".k_proj.weight" -> ".k_proj.bias",
-    # ".wk.weight" -> ".wk.bias". ``.weight_packed`` is stripped first so the
-    # longer suffix wins.
-    bias_key_name = (
-        fake_bias_key_name.removesuffix(".weight_packed").removesuffix(".weight")
-        + ".bias"
-    )
-
-    real_bias_names: set[str] = set()
-    pending: dict[str, torch.Tensor] = {}
-    for name, weight in weights:
-        yield name, weight
-
-        if name.endswith(bias_key_name):
-            real_bias_names.add(name)
-            pending.pop(name, None)
-            continue
-
-        if name.endswith(fake_bias_key_name):
-            bias_name = name[: -len(fake_bias_key_name)] + bias_key_name
-            if bias_name not in real_bias_names:
-                pending[bias_name] = torch.zeros(
-                    out_features if out_features is not None else weight.size(0)
-                )
-
-    for bias_name, bias in pending.items():
-        yield bias_name, bias

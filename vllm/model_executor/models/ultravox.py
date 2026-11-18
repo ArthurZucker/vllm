@@ -374,11 +374,6 @@ def _build_chunk_attn_metadata(
     }
 
 
-# Maps HF whisper encoder layer names to vLLM's fused qkv_proj and nested
-# mlp; `_create_fake_bias_for_k_proj` supplies the fused bias' k-slice
-# (HF whisper k_proj has no bias).
-
-
 class UltravoxFeedForwardProjector(nn.Module):
     def __init__(
         self,
