@@ -119,7 +119,7 @@ class VllmShard:
                 source = _read(source, 0, ep * target[0], target[0])
                 shape = _shape(source)
         if getattr(param, "partial", False) and rank != 0:  # added once, after reduce
-            return torch.zeros(shape, device=device, dtype=dtype)
+            return torch.zeros(shape, device=device, dtype=dtype or param.dtype)
         if dim is None or len(shape) <= dim or size == 1:
             # replicated: a param as large as one source (GPTQ's `g_idx` in a fused
             # layer) takes the first only
@@ -129,10 +129,13 @@ class VllmShard:
             tensor = self._slice(source, shape, dim, rank, size, target)
         if tensor is None:
             return None
+        # on the device first: no CPU kernel in the loader's threads (OpenMP's pool is
+        # invalid there, in a forked worker)
+        tensor = tensor.to(device=device).to(dtype=dtype)
         for op in getattr(param, "load_ops", ()):  # e.g. A_log's `-exp`
             out = next(iter(op.convert({"t": [tensor]}, ["t"], ["t"]).values()))
             tensor = out[0] if isinstance(out, list) else out
-        return tensor.to(device=device, dtype=dtype)
+        return tensor
 
     def _slice(self, source, shape, dim, rank, size, target):
         layer = self.layer
