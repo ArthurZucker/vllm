@@ -925,7 +925,7 @@ class Base(
         return load_with_ops(self, mapper.apply(weights), conversions, hf_quantizer)
 
     def _fused_conversions(self) -> list[WeightConverter]:
-        """Each projection vLLM fused (q, k, v -> qkv_proj) as a Transformers converter"""
+        """The fused projections (q, k, v -> qkv_proj), as Transformers converters"""
         conversions = {}
         for prefix, fusers in self.fusers.items():
             module = prefix.rpartition(".")[2]
