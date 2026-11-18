@@ -2532,6 +2532,13 @@ def _layer_experts(model: nn.Module) -> list[WeightTransform]:
     return out
 
 
+def _entry_name(cls: type) -> str | None:
+    """The class's entry, or the one it inherits (as it inherited its mapper)"""
+    return next(
+        (c.__name__ for c in cls.__mro__ if c.__name__ in _CONVERSION_MAPPING), None
+    )
+
+
 def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
     """The entries of the model's classes, each scoped to where its instances live
     (e.g. a vision tower's to `visual`), outermost first: its renamings see the
@@ -2539,7 +2546,7 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
     instances: dict[str, list[str]] = {}
     first: dict[str, nn.Module] = {}
     for name, module in model.named_modules():
-        if (cls := type(module).__name__) in _CONVERSION_MAPPING:
+        if (cls := _entry_name(type(module))) is not None:
             instances.setdefault(cls, []).append(name)
             first.setdefault(cls, module)
     model_types = {
@@ -2572,7 +2579,7 @@ def rename_mapper(model) -> "WeightsMapper | None":
     if isinstance(model, nn.Module):
         transforms = get_conversion_mapping(model)
     else:
-        entry = _CONVERSION_MAPPING.get(model.__name__, [])
+        entry = _CONVERSION_MAPPING.get(_entry_name(model), [])
         transforms = [] if callable(entry) else entry
     renamings = [
         t
