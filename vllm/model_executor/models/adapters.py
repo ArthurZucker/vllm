@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
+from vllm.model_executor.model_loader.weight_utils import checkpoint_shapes
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
 from vllm.transformers_utils.config import (
     try_get_dense_modules,
@@ -305,7 +306,7 @@ def as_seq_cls_model(cls: type[_T]) -> type[_T]:
             self.score = ReplicatedLinear(
                 model_config.get_hidden_size(),
                 _resolve_num_labels(hf_config, text_config),
-                bias=False,
+                bias=bool(checkpoint_shapes(r"(^|\.)score\.bias$")),
                 params_dtype=model_config.head_dtype,
                 quant_config=quant_config,
                 return_bias=False,

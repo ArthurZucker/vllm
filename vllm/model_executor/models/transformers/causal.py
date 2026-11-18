@@ -25,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import checkpoint_shapes
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 
@@ -49,6 +50,7 @@ class CausalMixin(VllmModelForTextGeneration, Base):
             self.lm_head = ParallelLMHead(
                 self.text_config.vocab_size,
                 self.text_config.hidden_size,
+                bias=bool(checkpoint_shapes(r"(^|\.)lm_head\.bias$")),  # Phi
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
@@ -65,7 +67,6 @@ class CausalMixin(VllmModelForTextGeneration, Base):
             )
         else:
             self.lm_head = PPMissingLayer()
-
 
     def compute_logits_local(self, hidden_states: "torch.Tensor") -> "torch.Tensor":
         """Logits for this TP rank's vocab shard, for batch-sharded sampling."""
