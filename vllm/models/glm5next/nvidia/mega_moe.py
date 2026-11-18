@@ -197,4 +197,3 @@ class Glm5NextMegaMoEExperts(DeepGemmMegaMoEExperts):
             self._load_weight(dst_scale, s, shard_id, True)
 
 
-Glm5NextMegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]

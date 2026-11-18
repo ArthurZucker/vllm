@@ -785,4 +785,3 @@ class RoutedExperts(PluggableLayer):
 
 
 # Mark the RoutedExperts weight_loader as supporting MoE-specific parameters
-RoutedExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
