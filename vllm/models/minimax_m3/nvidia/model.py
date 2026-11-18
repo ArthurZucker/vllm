@@ -42,7 +42,6 @@ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_NVFP4,
@@ -290,22 +289,6 @@ def _row_parallel_reduce_scatter(
 # MiniMax-M3.1 QAT quantizes the FC2 input with a fixed global scale of 16;
 # checkpoints carry a placeholder ``w2.input_global_scale`` of 1.0.
 MEGA_MOE_FC2_INPUT_SCALE = 1.0 / 16.0
-
-
-def _mega_moe_expert_params_mapping(
-    num_experts: int,
-) -> list[tuple[str, str, int, str]]:
-    """Map `experts.{e}.w{1,2,3}.*` to the MegaMoE `w13_*`/`w2_*` params."""
-    return [
-        (
-            "experts.w2_" if shard_id == "w2" else "experts.w13_",
-            f"experts.{expert_id}.{shard_id}.",
-            expert_id,
-            shard_id,
-        )
-        for expert_id in range(num_experts)
-        for shard_id in ("w1", "w2", "w3")
-    ]
 
 
 def _redirect_fused_shared_experts(
@@ -1651,18 +1634,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        if self.use_mega_moe:
-            return _mega_moe_expert_params_mapping(self.config.num_local_experts)
-        # Checkpoint experts use w1=gate, w2=down, w3=up.
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
-        )
-
 
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
@@ -1769,9 +1740,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1976,6 +1944,3 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits_local(hidden_states)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.language_model.get_expert_mapping()

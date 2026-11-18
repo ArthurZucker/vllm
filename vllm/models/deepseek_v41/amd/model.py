@@ -24,9 +24,6 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.triton import MHC_POST_COLLAPSE_RMS_NORM_KERNEL
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
@@ -1121,7 +1118,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         logger.warning_once("Decoder SWA bounded replay is off: %s.", reason)
         return False
 
-
     @staticmethod
     def _pad_shared_expert_weight(
         quant_config: QuantizationConfig | None,
@@ -1148,18 +1144,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         pad_shape = list(loaded_weight.shape)
         pad_shape[dim] = pad
         return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-            routed_experts_prefix="" if self.use_mega_moe else "routed_experts",
-        )
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
@@ -1436,10 +1420,6 @@ class DeepseekV41LLMForCausalLM(
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

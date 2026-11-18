@@ -195,6 +195,41 @@ WHISPER_QKV_BIAS = WeightConverter(
     ".self_attn.qkv_proj.bias",
     operations=[ZeroMissingSource(), OutputConcatenate()],
 )
+# Mistral Large 4's consolidated checkpoint; a layer's modules (`attention.wq`) onto
+# vLLM's (`self_attn.q_proj`), `lerope.alpha` onto the rotary embedding
+_L = r"^(model\.layers\.\d+)\."
+MISTRAL_LARGE4 = [
+    rename("^lerope.alpha$", "model.rotary_emb.lerope_alpha"),
+    drop("^mtp_"),  # the draft model's
+    rename(r"^tok_embeddings(?=\.|$)", "model.embed_tokens"),
+    rename(r"^norm(?=\.|$)", "model.norm"),
+    rename(r"^output(?=\.|$)", "lm_head"),
+    rename("^layers.", "model.layers."),
+    *(
+        rename(_L + old + r"(?=\.|$)", r"\1." + new)
+        for old, new in (
+            ("attention_norm", "input_layernorm"),
+            ("ffn_norm", "post_attention_layernorm"),
+            (r"attention\.indexer\.ssmax_scaling", "self_attn.indexer.ssmax"),
+            (r"attention\.ssmax_scaling", "self_attn.ssmax"),
+            (r"attention\.wq", "self_attn.q_proj"),
+            (r"attention\.wkv_a_with_mqa", "self_attn.kv_a_proj_with_mqa"),
+            (r"attention\.kv_a_norm", "self_attn.kv_a_layernorm"),
+            (r"attention\.wkv_b", "self_attn.kv_b_proj"),
+            (r"attention\.wo", "self_attn.o_proj"),
+            (r"attention\.indexer", "self_attn.indexer"),
+            ("feed_forward", "mlp"),
+            ("shared_experts", "mlp.shared_experts"),
+            ("gate", "mlp.gate"),
+            ("experts", "mlp.experts"),  # per expert: `w1` / `w2` / `w3` (MistralMoE)
+        )
+    ),
+    rename(".qscale_weight$", ".weight_scale_inv"),
+    rename(r"\.(mlp|shared_experts)\.w2\.", r".\1.down_proj."),
+    fused(".mlp.gate_up_proj", ".mlp.w1", ".mlp.w3"),
+    fused(".shared_experts.gate_up_proj", ".shared_experts.w1", ".shared_experts.w3"),
+    fused(".indexer.wk_weights_proj", ".indexer.wk", ".indexer.weights_proj"),
+]
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
@@ -302,6 +337,7 @@ def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
+    "MistralLarge4ForCausalLM": MISTRAL_LARGE4,
     "Gemma4Model": _gemma4,
     "GPT2LMHeadModel": GPT2,
     "GPT2ForSequenceClassification": GPT2,

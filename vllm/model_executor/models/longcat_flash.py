@@ -47,7 +47,6 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -433,17 +432,6 @@ class FlashModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-        )
-
 
 class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     """Flash model for causal language modeling."""
@@ -509,6 +497,3 @@ class LongcatFlashForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

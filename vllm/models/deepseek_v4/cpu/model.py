@@ -17,7 +17,6 @@ from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClam
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -202,6 +201,7 @@ class DeepseekV4MoE(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            ckpt_names=("w1", "w2", "w3"),
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
@@ -625,23 +625,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # (param_name, weight_name, expert_id, shard_id). When fusing shared
-        # experts, include the appended slots so redirected shared-expert
-        # weights route through the expert loader.
-        n_shared = getattr(self.config, "n_shared_experts", 0) or 0
-        num_experts = self.config.n_routed_experts + (
-            n_shared if self.is_fused_shared_expert_enabled else 0
-        )
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=num_experts,
-        )
-
-
 def _make_deepseek_v4_weights_mapper(
     expert_dtype: str, fuse_shared_experts: bool = False
 ) -> WeightsMapper:
@@ -758,10 +741,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-
     def process_weights_after_loading(self) -> None:
         # No CPU AMX weight-packing hook yet.
         pass
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

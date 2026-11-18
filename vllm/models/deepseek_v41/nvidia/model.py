@@ -30,9 +30,6 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_pre_delayed_tilelang,
 )
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
     TrtLlmMxfp4ExpertsModular,
     TrtLlmMxfp4Mxfp8ExpertsModular,
@@ -76,7 +73,6 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MixtureOfExperts,
     MegaGateRoutingMetadata,
     _use_mega_gate,
-    make_deepseek_v4_expert_params_mapping,
     prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v4.nvidia.model import (
@@ -1601,7 +1597,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         logger.warning_once("Decoder SWA bounded replay is off: %s.", reason)
         return False
 
-
     @staticmethod
     def _pad_shared_expert_weight(
         quant_config: QuantizationConfig | None,
@@ -1628,21 +1623,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         pad_shape = list(loaded_weight.shape)
         pad_shape[dim] = pad
         return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_native_mega_moe:
-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=first_layer.ffn.n_redundant_experts,
-        )
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -1903,7 +1883,6 @@ class DeepseekV41LLMForCausalLM(
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
         config = self.model.vllm_config
@@ -1920,6 +1899,3 @@ class DeepseekV41LLMForCausalLM(
             ):
                 if layer.engram is not None:
                     layer.engram.embed_tokens.collapse_huge_pages()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

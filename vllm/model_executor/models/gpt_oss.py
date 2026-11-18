@@ -19,7 +19,6 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -249,6 +248,7 @@ class MLPBlock(torch.nn.Module):
             renormalize=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            ckpt_names=("w1", "w2", "w3"),
             apply_router_weight_on_input=False,
             has_bias=True,
             activation="swigluoai",
@@ -404,19 +404,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
         if len(aux_hidden_states) > 0:
             return x, aux_hidden_states
         return x
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, weight scales, activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        # NOTE: this is only used for quark.
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
-            num_redundant_experts=0,
-        )
 
     @staticmethod
     def _get_streamed_expert_info(

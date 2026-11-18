@@ -40,9 +40,6 @@ from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -324,18 +321,6 @@ class Glm4MoeLiteModel(nn.Module):
             }
         )
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-        )
-
-
 
 class Glm4MoeLiteForCausalLM(
     nn.Module, SupportsPP, SupportsLoRA, Glm4LiteMixtureOfExperts
@@ -435,16 +420,3 @@ class Glm4MoeLiteForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
-        )
-

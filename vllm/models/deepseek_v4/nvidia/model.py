@@ -28,7 +28,6 @@ from vllm.model_executor.kernels.mhc.tilelang import (
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_MXFP4,
@@ -187,25 +186,6 @@ class DeepseekV4MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
-
-def make_deepseek_v4_expert_params_mapping(
-    num_experts: int,
-) -> list[tuple[str, str, int, str]]:
-    return [
-        (
-            "experts.w13_" if shard_id in ("w1", "w3") else "experts.w2_",
-            f"experts.{expert_id}.{weight_name}.",
-            expert_id,
-            shard_id,
-        )
-        for expert_id in range(num_experts)
-        for shard_id, weight_name in [
-            ("w1", "w1"),
-            ("w2", "w2"),
-            ("w3", "w3"),
-        ]
-    ]
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1085,7 +1065,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-
     @staticmethod
     def _pad_shared_expert_weight(
         quant_config: QuantizationConfig | None,
@@ -1110,21 +1089,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         pad_shape = list(loaded_weight.shape)
         pad_shape[dim] = pad
         return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_native_mega_moe:
-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=first_layer.ffn.n_redundant_experts,
-        )
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -1317,9 +1281,5 @@ class DeepseekV4ForCausalLM(
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

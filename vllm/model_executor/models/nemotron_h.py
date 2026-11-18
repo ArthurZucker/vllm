@@ -42,7 +42,6 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     RoutedScaleMode,
     activation_without_mul,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -689,27 +688,6 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                             max_experts, getattr(block, "n_routed_experts", 0)
                         )
         return max_experts
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Consumed by `get_moe_expert_mapping` (bitsandbytes / LoRA); the main
-        # weight load is self-served by each `RoutedExperts` layer. Sized to the
-        # MAX expert count so heterogeneous puzzle models load every expert.
-        if self.has_moe:
-            # (param_name, weight_name, expert_id, shard_id)
-            return fused_moe_make_expert_params_mapping(
-                # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
-                #   what the activation is applied to
-                # - FusedMoe.w3 (aka up_proj) should be ignored since we're
-                #   using non-gated MoE
-                self,
-                ckpt_gate_proj_name="up_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name=None,
-                num_experts=self._get_max_n_routed_experts(),
-                num_redundant_experts=getattr(self, "num_redundant_experts", 0),
-            )
-
-        return []
 
 
 class NemotronHForCausalLM(

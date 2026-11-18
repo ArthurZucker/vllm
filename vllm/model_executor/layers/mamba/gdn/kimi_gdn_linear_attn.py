@@ -10,13 +10,10 @@ from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
-from vllm.distributed import divide, get_tensor_model_parallel_rank
+from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -40,31 +37,6 @@ from ..ops.scatter_states import scatter_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
-
-
-def a_log_weight_loader(
-    shard_axis: int,
-) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Load KDA A_log stored as either old 4D or current 1D weights."""
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-        shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-
-        if loaded_weight.dim() == 4:
-            assert loaded_weight.shape[:2] == (1, 1), (
-                f"Expected old A_log shape (1, 1, H, 1), got {loaded_weight.shape}"
-            )
-            assert loaded_weight.shape[-1] == 1, (
-                f"Expected old A_log last dim to be 1, got {loaded_weight.shape}"
-            )
-            loaded_weight = loaded_weight.view(loaded_weight.shape[2])
-
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-        return default_weight_loader(param, loaded_weight)
-
-    return loader
 
 
 def _make_fused_conv1d_weight_loader(

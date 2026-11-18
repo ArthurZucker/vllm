@@ -315,16 +315,6 @@ _CHECKPOINT_NAME_MAP: list[tuple[str, str]] = [
     (r"\.qscale_weight$", ".weight_scale_inv"),
 ]
 
-# (fused param, checkpoint shard, shard id)
-_STACKED_PARAMS: list[tuple[str, str, int]] = [
-    (".gate_up_proj.", ".w1.", 0),
-    (".gate_up_proj.", ".w3.", 1),
-    (".down_proj.", ".w2.", -1),
-    (".wk_weights_proj.", ".wk.", 0),
-    (".wk_weights_proj.", ".weights_proj.", 1),
-]
-
-
 def _to_vllm_weight_name(name: str) -> str:
     for pattern, repl in _CHECKPOINT_NAME_MAP:
         name = re.sub(pattern, repl, name)
@@ -357,93 +347,6 @@ def _map_quant_config_layers(quant_config: QuantizationConfig, prefix: str) -> N
         **quant_config.packed_modules_mapping,
         **stacked,
     }
-
-
-def _load_weights(
-    model: nn.Module,
-    mistral_model: MistralLarge4Model,
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> set[str]:
-    """Load a Mistral consolidated checkpoint into `model`.
-
-    `model` holds `mistral_model` as `model.model` and the LM head as
-    `model.lm_head`.
-    """
-    config = mistral_model.config
-    params = dict(model.named_parameters())
-    expert_mapping = fused_moe_make_expert_params_mapping(
-        model,
-        ckpt_gate_proj_name="w1",
-        ckpt_down_proj_name="w2",
-        ckpt_up_proj_name="w3",
-        num_experts=getattr(config, "n_routed_experts", None) or 0,
-    )
-    loaded: set[str] = set()
-    lerope_alpha: torch.Tensor | None = None
-
-    for ckpt_name, weight in weights:
-        if ckpt_name == "lerope.alpha":
-            lerope_alpha = weight
-            continue
-        if ckpt_name.startswith("mtp_"):
-            # Speculative-decoding heads are loaded by their draft model.
-            continue
-        # Layers beyond the configured depth (e.g. a truncated debug model).
-        layer = re.match(r"layers\.(\d+)\.", ckpt_name)
-        if layer is not None and int(layer.group(1)) >= config.num_hidden_layers:
-            continue
-        name = _to_vllm_weight_name(ckpt_name)
-        if is_pp_missing_parameter(name, model):
-            continue
-
-        if ".mlp.experts." in name:
-            is_expert_weight = False
-            for param_name, weight_name, expert_id, shard_id in expert_mapping:
-                if weight_name not in name:
-                    continue
-                is_expert_weight = True
-                mapped = name.replace(weight_name, param_name)
-                param = params[mapped]
-                loader = cast(Callable[..., bool], param.weight_loader)
-                if loader(
-                    param,
-                    weight,
-                    mapped,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                    return_success=True,
-                ):
-                    loaded.add(mapped)
-                    break
-            else:
-                # A known expert weight that is not local to this EP rank is skipped.
-                if not is_expert_weight:
-                    raise ValueError(f"Unexpected expert weight: {ckpt_name}")
-            continue
-
-        for param_part, ckpt_part, stacked_shard_id in _STACKED_PARAMS:
-            if ckpt_part not in name:
-                continue
-            name = name.replace(ckpt_part, param_part)
-            param = params[name]
-            if stacked_shard_id < 0:
-                param.weight_loader(param, weight)
-            else:
-                param.weight_loader(param, weight, stacked_shard_id)
-            break
-        else:
-            param = params[name]
-            getattr(param, "weight_loader", default_weight_loader)(param, weight)
-        loaded.add(name)
-
-    # The default loader skips this check for quantized models.
-    if missing := sorted(set(params) - loaded):
-        raise ValueError(f"Parameters not loaded from the checkpoint: {missing}")
-
-    if getattr(config, "lerope", False):
-        assert lerope_alpha is not None, "Checkpoint is missing lerope.alpha"
-        mistral_model.rotary_emb.set_lerope_alpha(lerope_alpha)
-    return loaded
 
 
 class MistralLarge4ForCausalLM(nn.Module, SupportsEagle3):

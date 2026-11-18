@@ -56,7 +56,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
     RoutedScaleMode,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     resolve_layer_fused_shared_expert,
@@ -1534,7 +1533,6 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
-
 class DeepseekV2MixtureOfExperts(MixtureOfExperts):
     moe_mlp_layers: list[DeepseekV2MoE]
     """
@@ -1687,19 +1685,6 @@ class DeepseekV2ForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
-        )
-
 
 
 class DeepseekForCausalLM(DeepseekV2ForCausalLM):

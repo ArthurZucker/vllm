@@ -44,7 +44,6 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.hpc import HpcRopeNorm, QkNormPolicy
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -502,17 +501,6 @@ class HYV3Model(nn.Module, MixtureOfExperts):
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -546,7 +534,6 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
-
 
 
 class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
@@ -604,7 +591,3 @@ class HYV3ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

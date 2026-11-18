@@ -36,7 +36,6 @@ from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -361,20 +360,6 @@ class HYV4Model(nn.Module):
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # (param_name, weight_name, expert_id, shard_id) for weights, fp8
-        # weight scales and fp8 activation scales.
-        if not hasattr(self, "_cached_expert_params_mapping"):
-            self._cached_expert_params_mapping = fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-                num_redundant_experts=self.num_redundant_experts,
-            )
-        return self._cached_expert_params_mapping
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -522,6 +507,3 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             logits = soft_cap * torch.nn.functional.tanh(logits / soft_cap)
 
         return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

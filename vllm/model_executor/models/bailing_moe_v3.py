@@ -36,7 +36,6 @@ from vllm.model_executor.layers.activation import SiluAndMul, SwigluStepAndMul
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -1324,15 +1323,6 @@ class BailingMoeV3Model(nn.Module):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
-
 
 class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     packed_modules_mapping = {
@@ -1409,6 +1399,3 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple:
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

@@ -18,7 +18,6 @@ from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClam
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
@@ -272,25 +271,6 @@ def _stage_deepseek_v4_mega_moe_inputs(
         BLOCK_TOPK=block_topk,
         num_warps=4,
     )
-
-
-def make_deepseek_v4_expert_params_mapping(
-    num_experts: int,
-) -> list[tuple[str, str, int, str]]:
-    return [
-        (
-            "experts.w13_" if shard_id in ("w1", "w3") else "experts.w2_",
-            f"experts.{expert_id}.{weight_name}.",
-            expert_id,
-            shard_id,
-        )
-        for expert_id in range(num_experts)
-        for shard_id, weight_name in [
-            ("w1", "w1"),
-            ("w2", "w2"),
-            ("w3", "w3"),
-        ]
-    ]
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
@@ -721,6 +701,7 @@ class DeepseekV4MoE(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            ckpt_names=("w1", "w2", "w3"),
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
@@ -1127,21 +1108,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_mega_moe:
-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-        )
-
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
@@ -1262,9 +1228,5 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA)
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

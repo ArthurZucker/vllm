@@ -85,31 +85,6 @@ logger = init_logger(__name__)
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
 
-def a_log_weight_loader(
-    shard_axis: int,
-) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Load KDA A_log stored as either old 4D or current 1D weights."""
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-        shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-
-        if loaded_weight.dim() == 4:
-            assert loaded_weight.shape[:2] == (1, 1), (
-                f"Expected old A_log shape (1, 1, H, 1), got {loaded_weight.shape}"
-            )
-            assert loaded_weight.shape[-1] == 1, (
-                f"Expected old A_log last dim to be 1, got {loaded_weight.shape}"
-            )
-            loaded_weight = loaded_weight.view(loaded_weight.shape[2])
-
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-        return default_weight_loader(param, loaded_weight)
-
-    return loader
-
-
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with one output replicated across TP ranks."""
 

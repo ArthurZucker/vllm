@@ -23,7 +23,6 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -857,18 +856,6 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=self.num_redundant_experts,
-        )
-
 
 class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEagle3):
     packed_modules_mapping = {
@@ -925,9 +912,6 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
 
 
 class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):

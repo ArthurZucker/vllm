@@ -8,9 +8,6 @@ from transformers.configuration_utils import PreTrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -279,12 +276,3 @@ class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states, spec_step_idx, self.lm_head)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )

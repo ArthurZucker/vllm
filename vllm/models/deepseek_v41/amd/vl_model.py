@@ -330,10 +330,6 @@ class DeepseekV41ForCausalLM(
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits_local(hidden_states)
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.language_model.get_expert_mapping()
-
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
-

@@ -57,6 +57,7 @@ class MistralMoE(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            ckpt_names=("w1", "w2", "w3"),
             scoring_func="softmax",
             routed_scaling_factor=config.routed_scaling_factor,
             enable_eplb=parallel_config.enable_eplb,

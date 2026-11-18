@@ -396,34 +396,6 @@ class GraniteMoeHybridModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        # layers.0.block_sparse_moe.expert_0.input_linear.input_scale
-        ckpt_gate_proj_name = "gate_proj"
-        ckpt_down_proj_name = "down_proj"
-        ckpt_up_proj_name = "up_proj"
-        num_experts = self.config.num_local_experts
-
-        return [
-            # (param_name, weight_name, expert_id, shard_id)
-            (
-                "block_sparse_moe.experts.w13_"
-                if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
-                else "block_sparse_moe.experts.w2_",
-                f"block_sparse_moe.experts.{expert_id}.{weight_name}.",
-                expert_id,
-                shard_id,
-            )
-            for expert_id in range(num_experts)
-            for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name),
-                ("w2", ckpt_down_proj_name),
-                ("w3", ckpt_up_proj_name),
-            ]
-        ]
-
-
 
 class GraniteMoeHybridForCausalLM(
     nn.Module,
@@ -550,4 +522,3 @@ class GraniteMoeHybridForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

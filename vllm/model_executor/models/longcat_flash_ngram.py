@@ -231,9 +231,6 @@ class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def get_expert_mapping(self):
-        return self.model.get_expert_mapping()
-
 
 class LongcatNgramModelState(DefaultModelState):
     # prepare_inputs builds its own inputs_embeds from n-gram token embeddings.

@@ -19,7 +19,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
     RoutedScaleMode,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -550,18 +549,6 @@ class BailingMoeV25Model(nn.Module):
                 hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        """Get expert parameter mapping for MoE layers."""
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-            num_redundant_experts=0,
-        )
-
-
 
 class BailingMoeV25ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     """Bailing MoE v2.5 For CausalLM."""
@@ -670,7 +657,3 @@ class BailingMoeV25ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple:
         return MambaStateCopyFuncCalculator.linear_attention_state_copy_func()
-
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

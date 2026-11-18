@@ -383,16 +383,14 @@ def get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
 def get_moe_expert_mapping(
     model: torch.nn.Module,
 ) -> list[tuple[str, str, int, str]]:
-    """Get the expert mapping from a model.
+    """The expert mapping of the model's first `RoutedExperts` layer, by the checkpoint
+    names it declares (`ckpt_names`)"""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-    It will be retrieved from the first module that has a `get_expert_mapping` method.
-    If the model manually implements `get_expert_mapping`, it will be used.
-    Otherwise, it will use the first RoutedExperts layer."""
-    for _, module in model.named_modules():
-        get_mapping = getattr(module, "get_expert_mapping", None)
-        if get_mapping is not None:
-            return get_mapping()
-    raise ValueError("No module in the model has a `get_expert_mapping` method.")
+    for module in model.modules():
+        if isinstance(module, RoutedExperts):
+            return module.get_expert_mapping()
+    raise ValueError("The model has no `RoutedExperts` layer.")
 
 
 def maybe_disable_graph_partition(current_backend: str) -> dict[str, bool]:

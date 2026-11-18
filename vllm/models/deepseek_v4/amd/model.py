@@ -24,7 +24,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEQuantConfig,
     GateLinear,
     RoutedExperts,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     derive_aiter_quant_type,
@@ -760,6 +759,7 @@ class DeepseekV4MoE(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            ckpt_names=("w1", "w2", "w3"),
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
@@ -1314,26 +1314,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        # When fusing shared experts, include the appended slots
-        # (ids n_routed_experts .. n_routed_experts + n_shared - 1) so the
-        # redirected shared-expert weights route through the expert loader.
-        n_shared = getattr(self.config, "n_shared_experts", 0) or 0
-        num_experts = self.config.n_routed_experts + (
-            n_shared if self.fused_shared_expert_layers else 0
-        )
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=num_experts,
-            routed_experts_prefix="" if self.use_mega_moe else "routed_experts",
-        )
-
-
 def _redirect_shared_expert_name(
     name: str, fuse_by_layer: frozenset[int], n_routed_experts: int
 ) -> str:
@@ -1473,7 +1453,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-
     def process_weights_after_loading(self) -> None:
         # Must precede the gate_up preshuffle of the fused shared experts.
         finalize_mega_moe_weights(self)
@@ -1493,6 +1472,3 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
                 "Fused the C4 compressor GEMMs in %d DeepSeek V4 layers",
                 fused_compressor_layers,
             )
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
