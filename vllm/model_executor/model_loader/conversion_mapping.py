@@ -49,15 +49,27 @@ def fused(target: str, *sources: str) -> WeightConverter:
 
 
 # Transformers' experts (`experts.gate_up_proj`, `[E, 2I, H]`: gate then up) are vLLM's
-# fused experts, which `FusedMoE` keeps in its `routed_experts`. Scales follow (`_scale_inv`)
+# fused experts, which `FusedMoE` keeps in its `routed_experts`
 TRANSFORMERS_EXPERTS = {
     "experts.gate_up_proj": "experts.routed_experts.w13_weight",
     "experts.down_proj": "experts.routed_experts.w2_weight",
 }
-# Checkpoints saved that way (e.g. Transformers v5): renamed onto vLLM's params
+# Experts fused on disk (Transformers v5, gpt-oss' MXFP4 blocks), with their tensors'
+# suffixes: checkpoint -> vLLM
+EXPERT_SUFFIXES = {
+    "_blocks": "",
+    "_scales": "_scale",
+    "_scale_inv": "_scale_inv",
+    "_bias": "",
+    "": "",
+}
 FUSED_EXPERTS = [
-    rename(rf"{re.escape(hf)}(?=_|$)", vllm)
+    rename(
+        rf"{re.escape(hf)}{re.escape(suffix)}$",
+        (vllm.removesuffix("_weight") + "_bias") if suffix == "_bias" else vllm + new,
+    )
     for hf, vllm in TRANSFORMERS_EXPERTS.items()
+    for suffix, new in EXPERT_SUFFIXES.items()
 ]
 
 
@@ -101,7 +113,7 @@ GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
 
 def _mimo_mtp(module: nn.Module) -> list[WeightTransform]:
-    """MTP layers stored 0-indexed without the `mtp_block` wrapper, after the decoder's"""
+    """MTP layers stored 0-indexed without the `mtp_block` wrapper"""
     start, layers = (
         module.config.num_hidden_layers,
         module.config.num_nextn_predict_layers,
@@ -119,7 +131,7 @@ def _mimo_mtp(module: nn.Module) -> list[WeightTransform]:
 
 
 def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
-    """MTP weights stored as a flat `mtp_*.0.` block, onto the layer after the decoder's"""
+    """MTP weights stored as a flat `mtp_*.0.` block, after the decoder layers"""
     layer = module.config.num_hidden_layers
     parts = ("mtp_emb_norm", "mtp_hidden_norm", "mtp_linear_proj", "mtp_block")
     return [
@@ -297,7 +309,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("^pooler\\."),
         fused(".self.qkv_proj", ".self.query", ".self.key", ".self.value"),
     ],
-    # TODO: mapper replace(BertModel.hf_to_vllm_mapper, orig_to_new_prefix={}) not literal
+    # TODO: mapper: BertModel's without its prefixes
     "BertPoolingModel": [],
     "BertWithRope": [
         rename("^model\\.", ""),
@@ -442,7 +454,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("\\.output_quantizer\\."),
         fused(".qkv_proj.", ".q_proj.", ".k_proj.", ".v_proj."),
     ],
-    # TODO: regex with several groups: '^(layers\\.|embed_tokens\\.|norm\\.)(.+)$'
+    # TODO: 1 renames with several groups (Mistral-format names)
     "Cosmos3ForConditionalGeneration": [
         rename(
             "^(layers\\.|embed_tokens\\.|norm\\.)(.+)$", "language_model.model.\\1\\2"
@@ -614,20 +626,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
         fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z'
+    # TODO: 14 renames with several groups (Mistral-format names)
     "EagleMistralLarge3ForCausalLM": [
         rename(
             "\\Alayers\\.(\\d+)\\.attention_norm\\.weight\\Z",
@@ -1005,22 +1004,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "GptOssForCausalLM": [
         rename("\\.self_attn\\.", ".attn."),
         rename("\\.embed_tokens\\.weight$", ".embedding.weight"),
-        rename("\\.gate_up_proj_blocks$", ".routed_experts.w13_weight"),
-        rename("\\.down_proj_blocks$", ".routed_experts.w2_weight"),
-        rename("\\.gate_up_proj_scales$", ".routed_experts.w13_weight_scale"),
-        rename("\\.down_proj_scales$", ".routed_experts.w2_weight_scale"),
-        rename("\\.gate_up_proj$", ".routed_experts.w13_weight"),
-        rename("\\.down_proj$", ".routed_experts.w2_weight"),
-        rename("\\.gate_up_proj_bias$", ".routed_experts.w13_bias"),
-        rename("\\.down_proj_bias$", ".routed_experts.w2_bias"),
-        rename("\\.gate_up_proj\\.weight$", ".routed_experts.w13_weight"),
-        rename("\\.gate_up_proj\\.weight_scale$", ".routed_experts.w13_weight_scale"),
-        rename("\\.gate_up_proj\\.bias$", ".routed_experts.w13_bias"),
-        rename("\\.gate_up_proj\\.input_scale$", ".routed_experts.w13_input_scale"),
-        rename("\\.down_proj\\.weight$", ".routed_experts.w2_weight"),
-        rename("\\.down_proj\\.weight_scale$", ".routed_experts.w2_weight_scale"),
-        rename("\\.down_proj\\.bias$", ".routed_experts.w2_bias"),
-        rename("\\.down_proj\\.input_scale$", ".routed_experts.w2_input_scale"),
     ],
     # TODO: old loader: stacked_unparsed
     # TODO: old loader: tensor_ops
@@ -1718,20 +1701,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("\\.activation_scale$", ".input_scale"),
         rename("\\.weight_scale_inv$", ".weight_scale"),
     ],
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z'
-    # TODO: regex with several groups: '\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z'
+    # TODO: 14 renames with several groups (Mistral-format names)
     "MistralLarge3ForCausalLM": [
         rename(
             "\\Alayers\\.(\\d+)\\.attention_norm\\.weight\\Z",
