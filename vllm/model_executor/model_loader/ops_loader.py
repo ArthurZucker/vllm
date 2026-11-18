@@ -244,7 +244,8 @@ def load_with_ops(
     params = dict(model.named_parameters()) | dict(model.named_buffers())
 
     def get_sharding_op(target, _detached, converter, source_pattern):
-        param = params[target]
+        param = params.get(target)
+        param = model.get_parameter(target) if param is None else param  # tied
         if isinstance(converter, WeightConverter):
             if len(converter.target_patterns) > 1:  # split: each output sharded after
                 if not any(isinstance(op, ShardOutputs) for op in converter.operations):
