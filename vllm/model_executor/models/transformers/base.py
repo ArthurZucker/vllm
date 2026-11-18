@@ -52,7 +52,10 @@ from vllm.model_executor.layers.attention import (
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import MoERunner
-from vllm.model_executor.model_loader.conversion_mapping import to_vllm
+from vllm.model_executor.model_loader.conversion_mapping import (
+    from_mapper,
+    to_vllm,
+)
 from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.weight_ops import OutputConcatenate
 from vllm.model_executor.models.interfaces import (
@@ -909,6 +912,18 @@ class Base(
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def conversions(self) -> list[WeightTransform]:
+        """The checkpoint's prefixes onto `self`'s, then Transformers' conversions and
+        the fused layers'"""
+        # its renamings are Transformers' own, below
+        mapper = replace(
+            self.hf_to_vllm_mapper, orig_to_new_stacked={}, orig_to_new_renaming=[]
+        )
+        return [
+            *from_mapper(mapper),
+            *to_vllm([*self._weight_conversions(), *self._fused_conversions()]),
+        ]
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # vLLM kept a quant config: its kernels take the tensors as they are. Else the
         # format is one only Transformers reads, dequantized by its ops
@@ -916,14 +931,12 @@ class Base(
             getattr(self.config, "quantization_config", None),
             serialized=self.quant_config is not None,
         )
-        conversions = to_vllm([*self._weight_conversions(), *self._fused_conversions()])
+        conversions = self.conversions()
         if hf_quantizer is not None:
             conversions = hf_quantizer.update_weight_conversions(
                 conversions, self.model
             )
-        # The checkpoint's prefixes onto `self`'s; fused layers are conversions above
-        mapper = replace(self.hf_to_vllm_mapper, orig_to_new_stacked={})
-        return load_with_ops(self, mapper.apply(weights), conversions, hf_quantizer)
+        return load_with_ops(self, weights, conversions, hf_quantizer)
 
     def _fused_conversions(self) -> list[WeightConverter]:
         """The fused projections (q, k, v -> qkv_proj), as Transformers converters"""
