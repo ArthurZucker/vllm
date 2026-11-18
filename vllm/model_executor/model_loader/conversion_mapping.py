@@ -28,7 +28,10 @@ from transformers.core_model_loading import (
     WeightTransform,
 )
 
-from vllm.model_executor.model_loader.weight_ops import OutputConcatenate
+from vllm.model_executor.model_loader.weight_ops import (
+    OutputConcatenate,
+    RepeatLastSource,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -141,6 +144,64 @@ QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
 
+def _cosmos3_edge() -> list[WeightTransform]:
+    """Cosmos3 Edge's Diffusers checkpoint: block `N` holds attention and MLP, which the
+    Nemotron-H language model splits into layers `2N` and `2N + 1`"""
+    layers = {
+        "embed_tokens.": "language_model.model.embed_tokens.",
+        "norm.": "language_model.model.norm_f.",
+        "model.visual.": "visual.encoder.",
+        "model.projector.": "visual.projector.",
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+    }
+    for n in range(28):
+        attention, mlp = (
+            f"language_model.model.layers.{2 * n}",
+            f"language_model.model.layers.{2 * n + 1}",
+        )
+        layers[f"layers.{n}.input_layernorm."] = f"{attention}.norm."
+        for proj in ("q", "k", "v", "o"):
+            layers[f"layers.{n}.self_attn.{proj}_proj."] = (
+                f"{attention}.mixer.{proj}_proj."
+            )
+        layers[f"layers.{n}.post_attention_layernorm."] = f"{mlp}.norm."
+        layers[f"layers.{n}.mlp."] = f"{mlp}.mixer."
+    return [
+        *(
+            rename(rf"\.self_attn\.to_{a}\.", f".self_attn.{b}_proj.")
+            for a, b in (("q", "q"), ("k", "k"), ("v", "v"), ("out", "o"))
+        ),
+        rename(r"language_model\.embeddings", "language_model.embed_tokens"),
+        *(rename("^" + re.escape(old), new) for old, new in layers.items()),
+        fused(".qkv_proj.", ".q_proj.", ".k_proj.", ".v_proj."),
+    ]
+
+
+def _gemma4(module: nn.Module) -> list[WeightTransform]:
+    """`attention_k_eq_v` full-attention layers ship `k_proj` only: K is loaded into
+    both the K and V shards. KV-shared layers only have `q_proj`, kept as is"""
+    config = module.config
+    shared = config.num_hidden_layers - getattr(config, "num_kv_shared_layers", 0)
+    k_eq_v = [
+        i
+        for i, layer_type in enumerate(config.layer_types[:shared])
+        if getattr(config, "attention_k_eq_v", False) and layer_type == "full_attention"
+    ]
+    return [
+        *(
+            WeightConverter(
+                [f"layers.{i}.self_attn.q_proj", f"layers.{i}.self_attn.k_proj"],
+                f"layers.{i}.self_attn.qkv_proj",
+                operations=[RepeatLastSource(), OutputConcatenate()],
+            )
+            for i in k_eq_v
+        ),
+        QKV,
+        GATE_UP,
+    ]
+
+
 def _mimo_mtp(module: nn.Module) -> list[WeightTransform]:
     """MTP layers stored 0-indexed without the `mtp_block` wrapper"""
     start, layers = (
@@ -176,6 +237,7 @@ def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
+    "Gemma4Model": _gemma4,
     "MiMoMTP": _mimo_mtp,
     "ErnieMTP": _ernie_mtp,
     "AIMv2Model": [
@@ -463,26 +525,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^vision_model\\.vision_model\\.", "vision_model.vision_model."),
         rename("^vision_model\\.", "vision_model.vision_model."),
     ],
-    # TODO: mapper orig_to_new_prefix not literal
-    "Cosmos3EdgeForConditionalGeneration": [
-        drop("_moe_gen"),
-        drop("k_norm_und_for_gen"),
-        drop("\\.add_q_proj\\."),
-        drop("\\.add_k_proj\\."),
-        drop("\\.add_v_proj\\."),
-        drop("\\.to_add_out\\."),
-        drop("\\.norm_added_q\\."),
-        drop("\\.norm_added_k\\."),
-        rename("\\.self_attn\\.to_q\\.", ".self_attn.q_proj."),
-        rename("\\.self_attn\\.to_k\\.", ".self_attn.k_proj."),
-        rename("\\.self_attn\\.to_v\\.", ".self_attn.v_proj."),
-        rename("\\.self_attn\\.to_out\\.", ".self_attn.o_proj."),
-        rename("language_model\\.embeddings", "language_model.embed_tokens"),
-        drop("\\.input_quantizer\\."),
-        drop("\\.weight_quantizer\\."),
-        drop("\\.output_quantizer\\."),
-        fused(".qkv_proj.", ".q_proj.", ".k_proj.", ".v_proj."),
-    ],
+    "Cosmos3EdgeForConditionalGeneration": _cosmos3_edge(),
     "Cosmos3ForConditionalGeneration": [
         rename("^(layers|embed_tokens|norm)\\.", "language_model.model.\\1."),
         rename(

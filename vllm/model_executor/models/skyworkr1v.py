@@ -40,7 +40,6 @@ from .internvl import (
     BaseInternVLProcessingInfo,
 )
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -126,25 +125,6 @@ class SkyworkR1VProcessingInfo(BaseInternVLProcessingInfo):
     dummy_inputs=BaseInternVLDummyInputsBuilder,
 )
 class SkyworkR1VChatModel(nn.Module, SupportsMultiModal, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix=dict.fromkeys(
-            [
-                "action_embed",
-                "temporal_embed",
-                "track_embed",
-                "track_embed_decoder",
-                "box_token",
-                "cg_criterion",
-                "cg_model",
-                "loc_encoder",
-                "loc_decoder",
-                "sam",
-                "temporal_token",
-                "track_token",
-            ]
-        )
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -406,4 +386,3 @@ class SkyworkR1VChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

@@ -38,3 +38,16 @@ class PadToParam(ConversionOps):
             padded[tuple(slice(0, n) for n in tensor.shape)] = tensor
             tensor = padded
         return {target_patterns[0]: tensor}
+
+
+class RepeatLastSource(ConversionOps):
+    """The last source taken twice: a checkpoint shipping `k_proj` only, loaded into
+    both the K and V shards of a fused `qkv_proj` (Gemma 4's `attention_k_eq_v`)"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        last = input_dict[source_patterns[-1]]
+        input_dict[source_patterns[-1]] = (
+            [*last, *last] if isinstance(last, list) else [last, last]
+        )
+        return input_dict
