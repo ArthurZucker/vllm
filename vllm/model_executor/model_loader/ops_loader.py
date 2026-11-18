@@ -6,6 +6,7 @@
 checkpoint key ─ rename_source_key(conversion_mapping) ─▶ target param
               ─ VllmShard(target).shard_tensor(source) ─▶ this rank's bytes, read
               ─ WeightConverter ops (Concatenate, MergeModulelist, ...)
+                (a split: ShardOutputs shards each output after it)
               ─ copied into vLLM's param (`load_in_place`)
 ```
 
@@ -23,6 +24,7 @@ from copy import deepcopy
 import torch
 from torch import nn
 from transformers.core_model_loading import (
+    ConversionOps,
     WeightConverter,
     WeightTransform,
     convert_and_load_state_dict_in_model,
@@ -107,6 +109,9 @@ class VllmShard:
         else:
             rank = getattr(layer, "tp_rank", None)
             rank = get_tensor_model_parallel_rank() if rank is None else rank
+        shards = getattr(layer, "shard_ids", None) or []
+        if self.sources == 1 and len(shards) > 1:  # fused on disk, e.g. `qkv_proj`
+            return self._fused_on_disk(source, layer, shards, dim, rank, size)
         replicas = 1
         if getattr(param, "shard_even", False):  # the source split evenly, e.g. sinks
             local = shape[dim] // size
@@ -120,6 +125,31 @@ class VllmShard:
         start = min(rank // replicas * local, shape[dim])
         tensor = _read(source, dim, start, min(local, shape[dim] - start))
         return self._pad(tensor, dim) if self.sources == 1 else tensor
+
+    def _fused_on_disk(self, source, layer, shards, dim, rank, size):
+        """Split (by the layer's shard sizes) -> Shard each -> Concatenate: this rank's
+        slice of every segment of a tensor fused on disk, read alone"""
+        length = _shape(source)[dim]
+        replicas = [
+            layer.num_kv_head_replicas
+            if isinstance(layer, QKVParallelLinear) and s in ("k", "v")
+            else 1
+            for s in shards
+        ]
+        rows = [
+            layer._get_shard_size_mapping(s) * size // r
+            for s, r in zip(shards, replicas)
+        ]
+        pieces, offset = [], 0
+        for full, r in zip(rows, replicas):
+            segment = full * length // sum(rows)  # scales, packed: same proportions
+            local = segment * r // size
+            start = offset + min(rank // r * local, segment)
+            pieces.append(
+                _read(source, dim, start, min(local, offset + segment - start))
+            )
+            offset += segment
+        return torch.cat(pieces, dim=dim)
 
     def _pad(self, tensor: torch.Tensor, dim: int | None) -> torch.Tensor:
         """A padded param (vocab, sink heads) keeps its `pad_value` past the source"""
@@ -165,6 +195,30 @@ class VllmShard:
         return tensor
 
 
+class ShardOutputs(ConversionOps):
+    """After a split (e.g. a `qkv` on disk into vLLM's q, k and v), each output
+    sharded as its own param is"""
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        layer_name = kwargs["full_layer_name"]  # the first target's full name
+        output = {}
+        for pattern, tensor in input_dict.items():
+            tensor = tensor[0] if isinstance(tensor, list) else tensor
+            name = layer_name.replace(target_patterns[0], pattern)
+            try:
+                param = self.model.get_parameter(name)
+            except AttributeError:
+                output[pattern] = tensor  # reported as unexpected
+                continue
+            sharder = VllmShard(self.model, name, param, 1, 0, False)
+            output[pattern] = sharder.shard_tensor(tensor, dtype=tensor.dtype)
+        return output
+
+
 def load_weights(
     model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
@@ -188,8 +242,10 @@ def load_with_ops(
 
     def get_sharding_op(target, param, converter, source_pattern):
         if isinstance(converter, WeightConverter):
-            if len(converter.target_patterns) > 1:
-                return None  # split on disk (e.g. qkv): TODO shard after the split
+            if len(converter.target_patterns) > 1:  # split: each output sharded after
+                if not any(isinstance(op, ShardOutputs) for op in converter.operations):
+                    converter.operations = [*converter.operations, ShardOutputs(model)]
+                return None
             sources = converter.source_patterns
             index, expert = sources.index(source_pattern), "*" in source_pattern
         else:
