@@ -6,6 +6,12 @@ import torch
 from transformers.core_model_loading import Concatenate, ConversionOps
 
 
+def _first(input_dict: dict) -> torch.Tensor:
+    """The one tensor of a single-source op (Transformers passes lists)"""
+    tensor = next(iter(input_dict.values()))
+    return tensor[0] if isinstance(tensor, list) else tensor
+
+
 class OutputConcatenate(Concatenate):
     """`Concatenate` along the target param's `output_dim` (an AWQ `qweight` packs its
     output along dim 1); 0-dim tensors (per-tensor scales) are stacked"""
@@ -31,8 +37,7 @@ class PadToParam(ConversionOps):
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
         param = kwargs["model"].get_parameter(kwargs["full_layer_name"])
-        tensor = next(iter(input_dict.values()))
-        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        tensor = _first(input_dict)
         if tensor.shape != param.shape and tensor.dim() == param.dim():
             padded = tensor.new_full(param.shape, getattr(param, "pad_value", 0))
             padded[tuple(slice(0, n) for n in tensor.shape)] = tensor
@@ -59,8 +64,7 @@ class ZeroMissingSource(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        present = next(iter(input_dict.values()))
-        present = present[0] if isinstance(present, list) else present
+        present = _first(input_dict)
         for pattern in source_patterns:
             input_dict.setdefault(pattern, [torch.zeros_like(present)])
         return input_dict
@@ -115,8 +119,7 @@ class SwapHalves(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        tensor = next(iter(input_dict.values()))
-        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        tensor = _first(input_dict)
         first, second = tensor.chunk(2, dim=self.dim)
         return {target_patterns[0]: torch.cat([second, first], dim=self.dim)}
 
@@ -129,8 +132,7 @@ class TransposeFull(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        tensor = next(iter(input_dict.values()))
-        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        tensor = _first(input_dict)
         return {target_patterns[0]: tensor.t().contiguous()}
 
 
@@ -145,8 +147,7 @@ class Deinterleave(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        tensor = next(iter(input_dict.values()))
-        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        tensor = _first(input_dict)
         heads = getattr(kwargs["config"].get_text_config(), self.heads_attr)
         shape = tensor.shape
         tensor = tensor.view((heads, self.parts, -1) + shape[1:]).transpose(0, 1)

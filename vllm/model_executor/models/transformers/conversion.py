@@ -7,16 +7,12 @@ checkpoint key ─▶ plan: the layer's quantizer
                    ├─ vLLM has the kernels: tensors kept serialized (`load_serialized`)
                    └─ only Transformers reads it: dequantized by its ops
                ─▶ model converters (qkv split, gate_up concat, ...), scales alongside
-               ─▶ vLLM `weight_loader`s
+               ─▶ `ops_loader.load_with_ops`: sharded on read, copied into vLLM's params
 ```
 """
 
 from functools import partial
 
-from transformers.core_model_loading import (
-    WeightConverter,
-    WeightTransform,
-)
 from transformers.quantizers import (
     HfQuantizer,
     register_quantization_config,
@@ -103,23 +99,3 @@ def quantization_plan(quant_cfg: dict | None, serialized: bool) -> HfQuantizer |
         quantizer.load_serialized = serialized
         quantizer.quantization_config.dequantize = not serialized
     return hf_quantizer
-
-
-def streamable_converters(conversions: list[WeightTransform]) -> list[WeightConverter]:
-    """The converters to run on the stream: those taking one key per source pattern.
-
-    Wildcard sources (`experts.*.gate_proj`) are expert merges, left out: `FusedMoE`'s
-    `weight_loader` shards each checkpoint expert straight into place, without
-    stacking all of them first.
-    """
-    return [
-        conversion
-        for conversion in conversions
-        if isinstance(conversion, WeightConverter)
-        and not any("*" in pattern for pattern in conversion.source_patterns)
-    ]
-
-
-def _convert(converter: WeightConverter, target: str, config):
-    for name, tensor in converter.convert(target, config=config).items():
-        yield name, tensor[0] if isinstance(tensor, list) else tensor
