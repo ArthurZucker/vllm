@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """PyTorch MAMBA2 model."""
 
-
 import torch
 from torch import nn
 from transformers import MambaConfig
@@ -32,7 +31,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.sequence import IntermediateTensors
 
 from .utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -165,8 +163,6 @@ class Mamba2Model(nn.Module):
 class Mamba2ForCausalLM(
     nn.Module, HasInnerState, IsAttentionFree, SupportsMambaPrefixCaching
 ):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_substr={".A_log": ".A"})
-
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
@@ -267,4 +263,3 @@ class Mamba2ForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

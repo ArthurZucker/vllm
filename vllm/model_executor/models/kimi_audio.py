@@ -24,7 +24,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsTranscription,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -82,14 +81,6 @@ class KimiAudioWhisperEncoder(WhisperEncoder):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-        },
-    )
-
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", init_in_fp32: bool = False
     ):
@@ -109,7 +100,6 @@ class KimiAudioWhisperEncoder(WhisperEncoder):
             prefix=prefix,
             init_in_fp32=init_in_fp32,
         )
-
 
 
 # -----------------------------------------------------------------------------
@@ -358,33 +348,6 @@ class KimiAudioForConditionalGeneration(
     }
     supports_transcription: ClassVar[Literal[True]] = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # audio tower
-            "model.encoder.": "audio_tower.",
-            # Audio projector (VQ-Adaptor)
-            "model.vq_adaptor.layers.0.": "multi_modal_projector.vq_adaptor_layers_0.",
-            "model.vq_adaptor.layers.3.": "multi_modal_projector.vq_adaptor_layers_3.",
-            "model.vq_adaptor.layers.4.": "multi_modal_projector.vq_adaptor_layers_4.",
-            # Language model
-            "model.layers.": "language_model.model.layers.",
-            # Embeddings and output
-            "model.embed_tokens.": "language_model.model.embed_tokens.",
-            "model.norm.": "language_model.model.norm.",
-            "lm_head.": "language_model.lm_head.",
-            # MIMO/TTS weights and any `model.` residue no rule above
-            # claimed: this model only does ASR (speech-to-text).
-            "model.": None,
-            "mimo_layers.": None,
-            "mimo_output.": None,
-            "mimo_norm.": None,
-        },
-        orig_to_new_substr={
-            ".fc1.": ".mlp.fc1.",
-            ".fc2.": ".mlp.fc2.",
-        },
-    )
-
     # Audio placeholder token sequence
     AUDIO_PLACEHOLDER = "<|im_media_begin|><|im_kimia_text_blank|><|im_media_end|>"
 
@@ -569,7 +532,6 @@ class KimiAudioForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     @classmethod
     def get_speech_to_text_config(

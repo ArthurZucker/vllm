@@ -56,7 +56,7 @@ from .interfaces import (
 )
 from .interfaces_base import default_pooling_type
 from .siglip import SiglipVisionModel
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class UltraBertAttention(nn.Module):
@@ -229,7 +229,6 @@ class UltraBertModel(nn.Module):
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states)
         return self.norm(hidden_states)
-
 
 
 class ColUltraVBertConnector(nn.Module):
@@ -421,12 +420,6 @@ class ColUltraVBertForRetrieval(nn.Module, SupportsMultiModal, SupportsLateInter
 
     # transformers >= 5.10 saves SigLIP without its inner `vision_model.`
     # prefix; the longer prefix must stay first.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "vision_model.vision_model.": "vision_model.vision_model.",
-            "vision_model.": "vision_model.vision_model.",
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -492,4 +485,3 @@ class ColUltraVBertForRetrieval(nn.Module, SupportsMultiModal, SupportsLateInter
         return self.text_model(
             input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
         )
-

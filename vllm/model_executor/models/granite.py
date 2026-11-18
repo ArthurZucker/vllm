@@ -68,7 +68,6 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -312,17 +311,6 @@ class GraniteDecoderLayer(nn.Module):
 
 @support_torch_compile
 class GraniteModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -402,11 +390,9 @@ class GraniteModel(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-
 class GraniteForCausalLM(
     nn.Module, SupportsLoRA, SupportsPP, SupportsQuant, SupportsEagle3
 ):
-    hf_to_vllm_mapper = GraniteModel.hf_to_vllm_mapper
     # LoRA specific attributes
     packed_modules_mapping: dict[str, list[str]] = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -478,4 +464,3 @@ class GraniteForCausalLM(
                 ),
             }
         )
-

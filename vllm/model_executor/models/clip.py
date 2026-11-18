@@ -558,14 +558,6 @@ class CLIPEncoder(nn.Module):
 
 
 class CLIPTextTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -614,7 +606,6 @@ class CLIPTextTransformer(nn.Module):
         last_hidden_state = self.final_layer_norm(last_hidden_state)
 
         return last_hidden_state
-
 
 
 class CLIPVisionTransformer(nn.Module):
@@ -710,7 +701,6 @@ class CLIPVisionTransformer(nn.Module):
         return encoder_outputs
 
 
-
 class CLIPVisionModel(nn.Module):
     def __init__(
         self,
@@ -761,8 +751,6 @@ class CLIPVisionModel(nn.Module):
 )
 class CLIPEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
     is_pooling_model = True
-
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_substr={".position_ids": None})
 
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
@@ -975,4 +963,3 @@ class CLIPEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
         return merge_dual_encoder_text_and_vision(
             text_features, vision_embeds, self._mm_token_mask
         )
-

@@ -1456,28 +1456,11 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         return hidden_states
 
 
-
 class Gemma4ForCausalLM(
     nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts, SupportsEagle3
 ):
     is_3d_moe_weight: ClassVar[bool] = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # Multimodal weights are handled by the multimodal wrapper.
-            "audio_tower.": None,
-            "vision_tower.": None,
-            "embed_audio.": None,
-            "embed_vision.": None,
-        },
-        orig_to_new_prefix={
-            # Gemma4ForConditionalGeneration already loads the text stack
-            # from `model.language_model.*`. We reuse that same checkpoint
-            # and adapter naming for the text-only Gemma4ForCausalLM path,
-            # so LoRA keys from the conditional wrapper map onto `model.*`.
-            "model.language_model.": "model.",
-        },
-    )
     # KV-shared layers only have q_proj, so qkv_proj packing applies to
     # the other layers.
     packed_modules_mapping = {
@@ -1564,4 +1547,3 @@ class Gemma4ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-

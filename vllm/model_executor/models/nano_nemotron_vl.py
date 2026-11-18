@@ -45,7 +45,6 @@ from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
 from vllm.model_executor.models.parakeet import ParakeetExtractor, ProjectedParakeet
 from vllm.model_executor.models.radio import RadioModel, calc_seq_lens
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -955,12 +954,6 @@ class NemotronH_Nano_VL_V2(
     embedding_modules = NemotronHForCausalLM.embedding_modules
     lora_skip_prefixes = NemotronHForCausalLM.lora_skip_prefixes
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "language_model.backbone": "language_model.model",
-        },
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -1676,7 +1669,6 @@ class NemotronH_Nano_VL_V2(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_vit_model_from_radio_config(self, hf_config):
         hf_config_vision = hf_config.vision_config

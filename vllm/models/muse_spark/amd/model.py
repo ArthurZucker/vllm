@@ -994,8 +994,6 @@ def _drop_gate_up_stacking(base: WeightsMapper) -> WeightsMapper:
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.
 @ignore_torch_compile
 class MuseSparkModel(LlamaModel):
-    hf_to_vllm_mapper = _drop_gate_up_stacking(LlamaModel.hf_to_vllm_mapper)
-
     def __init__(
         self,
         *,
@@ -1151,8 +1149,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper()
-
     def __init__(
         self,
         *,
@@ -1300,7 +1296,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 logits / self.output_soft_cap_temp
             )
         return logits
-
 
     def process_weights_after_loading(self) -> None:
         n_gates = materialize_residual_path_constants(self)

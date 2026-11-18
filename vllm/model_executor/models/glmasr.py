@@ -67,7 +67,6 @@ from .interfaces import (
     SupportsTranscription,
 )
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -395,14 +394,6 @@ class GlmAsrEncoder(nn.Module):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config,
@@ -502,7 +493,6 @@ class GlmAsrEncoder(nn.Module):
 
         # Return in a format compatible with transformers' BaseModelOutput
         return _GlmAsrEncoderOutput(last_hidden_state=hidden_states)
-
 
 
 class GlmAsrFeatureInputs(TensorSchema):
@@ -898,10 +888,6 @@ class GlmAsrForConditionalGeneration(
 ):
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"audio_tower.embed_positions": None}
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1067,7 +1053,6 @@ class GlmAsrForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     @classmethod
     def _get_audio_token(cls, model_config: ModelConfig) -> str:

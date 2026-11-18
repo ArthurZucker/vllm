@@ -77,7 +77,7 @@ from .qwen2_vl import (
     Qwen2VLMultiModalDataParser,
     _create_qwen2vl_field_factory,
 )
-from .utils import IntermediateTensors, WeightsMapper, maybe_prefix
+from .utils import IntermediateTensors, maybe_prefix
 
 
 class MiMoV2OmniAudioInputs(TypedDict):
@@ -421,13 +421,6 @@ class MiMoVisionBlock(nn.Module):
 
 
 class MiMoVisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            "mlp.gate_proj": ("mlp.gate_up_proj", 0),
-            "mlp.up_proj": ("mlp.gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         vision_cfg: PreTrainedConfig,
@@ -676,7 +669,6 @@ class MiMoVisionTransformer(nn.Module):
         x = x.squeeze(1)
         x = self.merger(x)
         return x
-
 
 
 def _video_timestamps(num_frames: int, metadata: dict | None) -> torch.Tensor:
@@ -1266,19 +1258,6 @@ class MiMoV2OmniForCausalLM(
     supports_encoder_tp_data = True
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # audio encoder
-            "speech_embeddings.": "audio_encoder.speech_embeddings.",
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "model.visual.": "visual.",
-            # mapping for original checkpoint
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-            "audio_tokenizer.": None,
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1603,4 +1582,3 @@ class MiMoV2OmniForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

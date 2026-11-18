@@ -52,7 +52,6 @@ from .interfaces import (
 )
 from .lfm3 import _short_conv_state_dtype, _short_conv_state_shape
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -289,32 +288,6 @@ class Lfm3AudioMultiModalProcessor(BaseMultiModalProcessor[Lfm3AudioProcessingIn
 class Lfm3AudioForConditionalGeneration(
     nn.Module, HasInnerState, IsHybrid, SupportsMultiModal, SupportsPP
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # Training-export layout of the hub checkpoints
-            "lfm.model.": "language_model.model.",
-            "lfm.lm_head.": "language_model.lm_head.",
-            "encoder.lfm.lfm.": "audio_encoder.lfm.",
-            "encoder.downsample.": "audio_encoder.downsample.",
-            "mlp.model.0.": "audio_projector.layer_norm.",
-            "mlp.model.1.": "audio_projector.linear_1.",
-            "mlp.model.3.": "audio_projector.linear_2.",
-            # Transformers layout
-            "model.language_model.": "language_model.model.",
-            "model.audio_encoder.": "audio_encoder.",
-            "model.audio_projector.": "audio_projector.",
-            "lm_head.": "language_model.lm_head.",
-            # Speech output head
-            "codebook_embedding.": None,
-            "depth_linear.": None,
-            "depth_embeddings.": None,
-            "depthformer.": None,
-            "mask_embedding": None,
-            "model.codebook_embedding.": None,
-            "model.depth_decoder.": None,
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
@@ -404,4 +377,3 @@ class Lfm3AudioForConditionalGeneration(
         return suppress_speech_mode(
             self.config, self.language_model.compute_logits(hidden_states)
         )
-

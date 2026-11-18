@@ -73,7 +73,6 @@ from vllm.utils.import_utils import is_numba_available
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -307,22 +306,6 @@ class KimiK25ForConditionalGeneration(
     supports_encoder_tp_data = True
     supports_encoder_cudagraph: ClassVar[Literal[True]] = True
     supports_mm_device_do_normalize = True
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # For legacy NVFP4 checkpoint compatibility:
-            # see https://github.com/vllm-project/vllm/pull/33346#issuecomment-3851475033
-            "language_model.layers.": "language_model.model.layers.",
-            # mm projector
-            "mm_projector.proj.0": "mm_projector.linear_1",
-            "mm_projector.proj.2": "mm_projector.linear_2",
-        },
-        orig_to_new_suffix={
-            ".self_attn.attn.q_scale": ".self_attn.mla_attn.mla_attn.q_scale",
-            ".self_attn.attn.k_scale": ".self_attn.mla_attn.mla_attn.k_scale",
-            ".self_attn.attn.v_scale": ".self_attn.mla_attn.mla_attn.v_scale",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -685,4 +668,3 @@ class KimiK25ForConditionalGeneration(
             )
         embeddings = self._process_media_input(media_input)
         return torch.cat(embeddings, dim=0)
-

@@ -33,7 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .granitemoe import GraniteMoeAttention, GraniteMoeModel, GraniteMoeMoE
+from .granitemoe import GraniteMoeAttention, GraniteMoeMoE
 from .interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import make_layers, maybe_prefix
 
@@ -219,8 +219,6 @@ class GraniteMoeSharedModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    hf_to_vllm_mapper = GraniteMoeModel.hf_to_vllm_mapper
-
 
 class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     fall_back_to_pt_during_load = False
@@ -294,4 +292,3 @@ class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsE
                 ),
             }
         )
-

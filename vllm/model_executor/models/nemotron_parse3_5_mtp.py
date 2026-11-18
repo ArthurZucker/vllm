@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """One-step auxiliary MTP proposer for Nemotron Parse 3.5."""
 
-
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.models.utils import WeightsMapper
 
 
 class _ParseAuxMTPInner(nn.Module):
@@ -29,14 +27,6 @@ class ParseAuxMTPModel(nn.Module):
 
     has_own_embed_tokens = False
     has_own_lm_head = False
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "decoder.embed_tokens.": "model.embed_tokens.",
-            "decoder.extra_heads.0.": "model.extra_head.",
-            "decoder.extra_proj.0.": "model.extra_proj.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -67,4 +57,3 @@ class ParseAuxMTPModel(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
-

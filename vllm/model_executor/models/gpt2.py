@@ -52,7 +52,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsCrossEncoding, SupportsPP
 from .utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -184,9 +183,6 @@ class GPT2Block(nn.Module):
 @support_torch_compile
 class GPT2Model(nn.Module):
     # Drop attention mask buffers; NOTE: "c_attn.bias" must not be dropped.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".attn.bias": None, ".attn.masked_bias": None}
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -259,7 +255,6 @@ class GPT2Model(nn.Module):
             yield name, loaded_weight
 
 
-
 class GPT2LMHeadModel(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -307,7 +302,6 @@ class GPT2LMHeadModel(nn.Module, SupportsPP):
         return logits
 
 
-
 class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
     """GPT2 Model for sequence classification.
 
@@ -343,7 +337,6 @@ class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.transformer.embed_input_ids(input_ids)
-
 
     def forward(
         self,

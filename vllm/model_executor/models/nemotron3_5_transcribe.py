@@ -61,7 +61,6 @@ from .nemotron3_5_transcribe_audio import Nemotron3_5TranscribeAudioTower
 from .nemotron_h import NemotronHForCausalLM
 from .nemotron_h_mtp import NemotronHMTP
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
@@ -397,17 +396,6 @@ class Nemotron3_5TranscribeForConditionalGeneration(
     # The BF16 checkpoint names the decoder in NeMo's layout (``llm.*``; Mamba
     # ``A_log``/``D``/``dt_bias`` in a float32 holder; final norm ``norm``). The FP8
     # and NVFP4 checkpoints, and their quantization configs, use Hugging Face names.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".mixer._fp32_params.": ".mixer."},
-        orig_to_new_prefix={
-            "llm.model.norm.": "language_model.model.norm_f.",
-            "llm.model.": "language_model.model.",
-            "llm.lm_head.": "language_model.lm_head.",
-            "backbone.": "language_model.model.",
-            "lm_head": "language_model.lm_head",
-            "perception.": "audio_tower.",
-        },
-    )
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
     @classmethod

@@ -77,7 +77,6 @@ from .minicpmv import (
     _minicpmv_field_config,
 )
 from .utils import (
-    WeightsMapper,
     cast_overflow_tensors,
     maybe_prefix,
 )
@@ -687,7 +686,6 @@ class MiniCPMOBaseModel(_MiniCPMOBaseModelBase):
     """Base mixin class for MiniCPM-O models with audio support."""
 
     # Unlike the vision-only MiniCPM-V models, audio weights are loaded here.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"tts": None})
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -733,7 +731,6 @@ class MiniCPMOBaseModel(_MiniCPMOBaseModelBase):
         )
         self.audio_encoder_layer = -1
         return model
-
 
     def subsequent_chunk_mask(
         self,

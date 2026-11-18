@@ -63,7 +63,6 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -378,16 +377,6 @@ class BailingMoeBlock(nn.Module):
 
 @support_torch_compile
 class BailingMoeModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         *,
@@ -478,7 +467,6 @@ class BailingMoeModel(nn.Module):
         return hidden_states
 
 
-
 class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     packed_modules_mapping = {
         "query_key_value": ["query_key_value"],
@@ -555,7 +543,6 @@ class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             if norm_head and "lm_head.weight" in name:
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
             yield name, loaded_weight
-
 
 
 class BailingMoeV2ForCausalLM(BailingMoeForCausalLM):

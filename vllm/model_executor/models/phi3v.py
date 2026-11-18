@@ -68,7 +68,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
@@ -532,15 +531,6 @@ class Phi3VMultiModalProcessor(BaseMultiModalProcessor[Phi3VProcessingInfo]):
     dummy_inputs=Phi3VDummyInputsBuilder,
 )
 class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.vision_embed_tokens.wte": "embed_tokens",
-            "model.vision_embed_tokens.": "vision_embed_tokens.",
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -679,4 +669,3 @@ class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant)
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

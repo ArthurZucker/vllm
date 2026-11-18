@@ -2134,7 +2134,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return self.model.get_expert_mapping()
 
 
-
 # TODO(refactor): this VL wrapper is platform-agnostic and byte-identical to the
 # NVIDIA copy — it only orchestrates the shared vision tower + the per-platform
 # language model (resolved via ``init_vllm_registered_model``). Hoist it into
@@ -2166,17 +2165,6 @@ class MiniMaxM3SparseForConditionalGeneration(
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "multi_modal_projector.": "vision_tower.multi_modal_projector.",
-            "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
-        },
-        orig_to_new_substr={
-            ".mlp.fc1": ".fc1",
-            ".mlp.fc2": ".fc2",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -2342,4 +2330,3 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
-

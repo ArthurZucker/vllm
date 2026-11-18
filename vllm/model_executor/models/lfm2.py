@@ -44,7 +44,6 @@ from .interfaces import HasInnerState, IsHybrid, SupportsLoRA, SupportsPP, Suppo
 from .interfaces_base import attn_type, default_pooling_type
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -399,16 +398,6 @@ class Lfm2Model(nn.Module):
     # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision
     # with the inner .conv.conv child (ShortConv has a child self.conv, so
     # naming the container .conv too makes _match_target_modules match both).
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".conv.": ".short_conv."},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".w1": (".w13", 0),
-            ".w3": (".w13", 1),
-        },
-    )
 
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", bidirectional: bool = False
@@ -491,7 +480,6 @@ class Lfm2Model(nn.Module):
         return hidden_states
 
 
-
 @attn_type("encoder_only")
 @default_pooling_type(seq_pooling_type="CLS")
 class Lfm2BidirectionalModel(Lfm2Model):
@@ -529,7 +517,6 @@ class Lfm2ForCausalLM(
     }
 
     # Reuse the backbone mapper so LoRA/quantization see the same name mapping.
-    hf_to_vllm_mapper = Lfm2Model.hf_to_vllm_mapper
 
     # LoRA specific attributes
     embedding_modules = {
@@ -620,4 +607,3 @@ class Lfm2ForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

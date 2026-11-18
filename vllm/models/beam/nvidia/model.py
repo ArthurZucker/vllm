@@ -331,7 +331,6 @@ class BeamModel(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-
 class BeamForCausalLM(
     nn.Module,
     SupportsPP,
@@ -341,7 +340,6 @@ class BeamForCausalLM(
 ):
     """Beam causal LM. LoRA support is deferred to a follow-up change."""
 
-    hf_to_vllm_mapper = BeamModel.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "qkv_gate_proj": ["q_proj", "k_proj", "v_proj", "output_gate_proj"],
@@ -463,4 +461,3 @@ class BeamForCausalLM(
         if logits is not None and self.final_logit_softcapping is not None:
             logits = beam_softcap_logits(logits, self.final_logit_softcapping)
         return logits
-

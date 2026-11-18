@@ -37,9 +37,6 @@ from vllm.model_executor.models.glm4_1v import (
     Glm4vProcessingInfo,
 )
 from vllm.model_executor.models.qwen2_vl import _create_qwen2vl_field_factory
-from vllm.model_executor.models.utils import (
-    WeightsMapper,
-)
 from vllm.model_executor.models.vision import (
     get_vit_attn_backend,
     is_vit_use_data_parallel,
@@ -349,15 +346,6 @@ class Glm5NextPatchMerger(nn.Module):
 
 class Glm5NextVisionTransformer(nn.Module):
     # Stacked-weight remap for the GLM-OCR/GLM-4V vision checkpoint layout.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".attn.q.": (".attn.qkv.", "q"),
-            ".attn.k.": (".attn.qkv.", "k"),
-            ".attn.v.": (".attn.qkv.", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
 
     def __init__(
         self,
@@ -604,7 +592,6 @@ class Glm5NextVisionTransformer(nn.Module):
         x = self.downsample(x).view(-1, self.out_hidden_size)
         x = self.merger(x)
         return x
-
 
 
 class Glm5NextProcessingInfo(Glm4vProcessingInfo):

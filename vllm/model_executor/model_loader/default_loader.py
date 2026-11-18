@@ -19,9 +19,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_eplb_local_expert_ids,
     compute_local_expert_ids,
+)
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
@@ -44,9 +48,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
-from vllm.model_executor.model_loader.ops_loader import (
-    load_weights as load_model_weights,
-)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -457,9 +458,7 @@ class DefaultModelLoader(BaseModelLoader):
         self._encoder_only_lm_prefixes = resolve_mm_encoder_only_lm_prefixes(
             getattr(model, "_language_model_names", None)
         )
-        self._encoder_only_weights_mapper = cast(
-            "WeightsMapper | None", getattr(model, "hf_to_vllm_mapper", None)
-        )
+        self._encoder_only_weights_mapper = rename_mapper(model)
 
     def _init_ep_weight_filter(
         self, model: nn.Module, model_config: ModelConfig

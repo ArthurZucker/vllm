@@ -78,7 +78,6 @@ from vllm.model_executor.models.kimi_k25_vit import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     init_vllm_registered_model,
     make_layers,
     maybe_prefix,
@@ -1481,14 +1480,6 @@ class KimiK3ForConditionalGeneration(
 
     supports_encoder_tp_data = True
     supports_mm_device_do_normalize = True
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "language_model.layers.": "language_model.model.layers.",
-            "mm_projector.proj.0": "mm_projector.linear_1",
-            "mm_projector.proj.2": "mm_projector.linear_2",
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

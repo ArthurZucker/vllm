@@ -2118,15 +2118,6 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoRA):
     # Required so quantization exclude lists match fused module prefixes.
     packed_modules_mapping = STEP5_PACKED_MODULES_MAPPING
 
-    hf_to_vllm_mapper = (
-        WeightsMapper(
-            orig_to_new_regex={
-                re.compile(r"^vit_large_projector\.weight$"): None,
-            },
-        )
-        | STEP5_SHARE_EXPERT_MAPPER
-    )
-
     def __init__(
         self,
         *,

@@ -58,7 +58,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from .idefics2_vision_model import Idefics2VisionTransformer
 from .interfaces import MultiModalEmbeddings, SupportsLoRA, SupportsMultiModal
 from .phi4mm_audio import AudioEmbedding
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 # <|endoftext10|> (see vocab.json in hf model)
 _IMAGE_PLACEHOLDER_TOKEN_ID = 200010
@@ -1044,19 +1044,6 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
         ],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "base_layer.": "",
-            "lora": None,
-        },
-        orig_to_new_prefix={
-            "model.embed_tokens_extend.audio_embed.audio_projection.vision.": "embed_tokens_extend.audio_projection_for_vision.",  # noqa: E501
-            "model.embed_tokens_extend.audio_embed.audio_projection.speech.": "embed_tokens_extend.audio_projection.",  # noqa: E501
-            "model.embed_tokens_extend.audio_embed.": "embed_tokens_extend.",
-            "model.embed_tokens_extend.image_embed.": "vision_encoder.",
-        },
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -1296,7 +1283,6 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

@@ -48,7 +48,6 @@ from .interfaces import (
 from .siglip import SiglipVisionModel
 from .utils import (
     StageMissingLayer,
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -324,9 +323,6 @@ class BagelForConditionalGeneration(
     """
 
     # pos_embed is handled by the PositionEmbedding module
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"vit_pos_embed.pos_embed": None}
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -521,4 +517,3 @@ class BagelForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

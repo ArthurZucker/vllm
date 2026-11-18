@@ -52,7 +52,6 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.intern_vit import InternMLP
-from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.utils.torch_utils import async_tensor_h2d
 
@@ -586,51 +585,6 @@ class RadioModel(nn.Module):
     # ``video_patch_projection`` must precede ``embedder`` (applied in order);
     # keys mapping to ``None`` are intentionally not loaded (input normalization
     # runs in the processor and ``summary_idxs`` comes from the config).
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # legacy remote-code layout onto the native module tree
-            "radio_model.model.patch_generator.video_embedder": (
-                "embeddings.video_patch_projection"
-            ),
-            "radio_model.model.patch_generator.embedder": (
-                "embeddings.patch_projection"
-            ),
-            "radio_model.model.patch_generator.pos_embed": (
-                "embeddings.position_embedding"
-            ),
-            "radio_model.model.patch_generator.cls_token.token": (
-                "embeddings.cls_register_token"
-            ),
-            "radio_model.model.blocks": "encoder.layer",
-            # legacy names onto the native tree: ``attn`` -> ``attention`` (its
-            # fused ``qkv``/``proj`` load directly) and bare ``ls1``/``ls2`` ->
-            # the ``layer_scale{1,2}`` LayerScale modules.
-            ".attn.": ".attention.",
-            ".ls1": ".layer_scale1.lambda1",
-            ".ls2": ".layer_scale2.lambda1",
-            # native attention output projection: ``attention.output.dense`` is
-            # current at transformers 5.x (Dinov2 naming); ``attention.o_proj``
-            # covers the post-refactor spelling on transformers main.
-            "attention.output.dense": "attention.proj",
-            "attention.o_proj": "attention.proj",
-            # dropped in both layouts: normalization runs in the processor and
-            # ``summary_idxs`` comes from the config.
-            "input_conditioner": None,
-            "summary_idxs": None,
-        },
-        orig_to_new_stacked={
-            # Native split q/k/v projections fuse into the ``qkv``
-            # QKVParallelLinear. ``attention.attention.{query,key,value}`` is
-            # current at transformers 5.x; ``attention.{q,k,v}_proj`` covers the
-            # post-refactor spelling on transformers main.
-            "attention.attention.query": ("attention.qkv", "q"),
-            "attention.attention.key": ("attention.qkv", "k"),
-            "attention.attention.value": ("attention.qkv", "v"),
-            "attention.q_proj": ("attention.qkv", "q"),
-            "attention.k_proj": ("attention.qkv", "k"),
-            "attention.v_proj": ("attention.qkv", "v"),
-        },
-    )
 
     def __init__(
         self,
@@ -708,7 +662,6 @@ class RadioModel(nn.Module):
             encoder_outputs = encoder_outputs.reshape(packed_batch_size, seq_len, -1)
 
         return self._extract_final(encoder_outputs, imgs_sizes=imgs_sizes)
-
 
     def _extract_final(
         self, y: torch.Tensor, imgs_sizes: list[tuple[int, int]] | None = None

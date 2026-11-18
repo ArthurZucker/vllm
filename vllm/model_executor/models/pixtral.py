@@ -8,7 +8,6 @@ from dataclasses import dataclass, fields
 from typing import Annotated, Any, ClassVar, Literal, TypedDict, cast
 
 import numpy as np
-import regex as re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,7 +41,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.models.utils import WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargsItems
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -603,41 +601,6 @@ class PixtralForConditionalGeneration(
     SupportsPP,
     PixtralEncoderCudaGraphMixin,
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_regex={
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wq(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.q_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wk(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.k_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wv(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.v_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wo(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.o_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.feed_forward\.w1(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.feed_forward.gate_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.feed_forward\.w2(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.feed_forward.down_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.feed_forward\.w3(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.feed_forward.up_proj",
-        },
-        orig_to_new_prefix={
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_encoder.",
-            "model.multi_modal_projector.": "vision_language_adapter.",
-        },
-        orig_to_new_substr={
-            ".linear_1.": ".w_in.",
-            ".linear_2.": ".w_out.",
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -816,7 +779,6 @@ class PixtralForConditionalGeneration(
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         self._require_language_model_eagle3()
         return self.language_model.get_eagle3_aux_hidden_state_layers()
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

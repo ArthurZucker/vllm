@@ -7,7 +7,6 @@
 # Copyright 2023 The vLLM team.
 """Inference-only Qwen2-RM model compatible with HuggingFace weights."""
 
-
 import torch
 from torch import nn
 
@@ -27,7 +26,6 @@ class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
     is_pooling_model = True
     pooler: Pooler
 
-    hf_to_vllm_mapper = Qwen3Model.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -84,7 +82,6 @@ class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states = hidden_states.to(self.head_dtype)
         logits = self.score(hidden_states)
         return logits
-
 
 
 @default_pooling_type(tok_pooling_type="ALL")

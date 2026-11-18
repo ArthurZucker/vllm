@@ -55,7 +55,6 @@ from .pixtral import (
     _merge_patches_by_index,
 )
 from .utils import (
-    WeightsMapper,
     get_layer_index,
     init_vllm_registered_model,
     maybe_prefix,
@@ -454,26 +453,6 @@ class Mistral3ForConditionalGeneration(
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "lm_head.": "language_model.lm_head.",
-            # Some PEFT LoRAs are trained against the text submodule directly
-            # and produce names like `base_model.model.model.layers.*`.
-            "model.": "language_model.model.",
-        },
-        orig_to_new_suffix={
-            # FP8 quantized HF checkpoints use "activation_scale" and
-            # "weight_scale_inv" but vLLM's FP8 linear layers register
-            # them as "input_scale" and "weight_scale"
-            ".activation_scale": ".input_scale",
-            ".weight_scale_inv": ".weight_scale",
-        },
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -661,7 +640,6 @@ class Mistral3ForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

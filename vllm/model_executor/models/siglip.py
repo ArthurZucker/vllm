@@ -546,14 +546,6 @@ class SiglipEncoder(nn.Module):
 
 
 class SiglipTextTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -596,7 +588,6 @@ class SiglipTextTransformer(nn.Module):
         last_hidden_state = self.final_layer_norm(last_hidden_state)
 
         return last_hidden_state
-
 
 
 class SiglipMultiheadAttentionPoolingHead(nn.Module):
@@ -788,7 +779,6 @@ class SiglipVisionTransformer(nn.Module):
         return encoder_outputs
 
 
-
 class SiglipVisionModel(nn.Module):
     def __init__(
         self,
@@ -884,8 +874,6 @@ class SiglipTextEmbeddings(nn.Module):
 )
 class SiglipEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
     is_pooling_model = True
-
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_substr={".position_ids": None})
 
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
@@ -1136,4 +1124,3 @@ class SiglipEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
         return merge_dual_encoder_text_and_vision(
             text_features, vision_embeds, self._mm_token_mask
         )
-

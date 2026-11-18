@@ -67,7 +67,6 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -449,16 +448,6 @@ class SarvamMLAModel(nn.Module, EagleModelMixin):
     """Sarvam MLA backbone with EAGLE3 auxiliary capture across pipeline stages."""
 
     supports_aux_hidden_states_over_pp = True
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        }
-    )
 
     def __init__(
         self,

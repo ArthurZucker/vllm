@@ -42,7 +42,6 @@ from .interns2_preview import (
 )
 from .qwen3_5 import (
     Qwen3_5ForCausalLMBase,
-    Qwen3_5Model,
     Qwen3_5RMSNorm,
 )
 from .qwen3_5_mtp import Qwen3_5MoeMTP
@@ -286,8 +285,6 @@ class InternS2MobiusDecoderLayer(nn.Module):
     }
 )
 class InternS2MobiusModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
 
@@ -402,7 +399,6 @@ class InternS2MobiusModel(nn.Module, EagleModelMixin):
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
-
 
 
 class InternS2MobiusForCausalLM(Qwen3_5ForCausalLMBase):

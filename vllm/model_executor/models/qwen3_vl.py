@@ -153,7 +153,6 @@ from .qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
 from .utils import (
     PPMissingLayer,
     StageMissingLayer,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -557,14 +556,6 @@ class Qwen3_VisionPatchMerger(nn.Module):
 
 
 class Qwen3_VisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            "attn.q.": ("attn.qkv.", "q"),
-            "attn.k.": ("attn.qkv.", "k"),
-            "attn.v.": ("attn.qkv.", "v"),
-        }
-    )
-
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
@@ -901,7 +892,6 @@ class Qwen3_VisionTransformer(nn.Module):
             [hidden_states] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
-
 
 
 class Qwen3VLMultiModalDataParser(Qwen2VLMultiModalDataParser):
@@ -1860,13 +1850,6 @@ class Qwen3VLForConditionalGeneration(
     supported_video_pruning_methods = ("evs", "vidcom2")
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.visual.": "visual.",
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -2883,7 +2866,6 @@ class Qwen3VLForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

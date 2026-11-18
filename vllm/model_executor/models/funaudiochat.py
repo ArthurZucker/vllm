@@ -53,7 +53,6 @@ from vllm.utils.import_utils import _has_module
 
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -81,14 +80,6 @@ class _SinusoidsPositionEmbedding(nn.Module):
 
 class FunAudioChatAudioAttention(nn.Module):
     """Multi-headed attention used inside the continuous audio tower."""
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
 
     def __init__(self, config: Any):
         super().__init__()
@@ -139,7 +130,6 @@ class FunAudioChatAudioAttention(nn.Module):
                 # HF FunAudioChat uses bias=False for k_proj. Ensure the missing
                 # shard starts as zeros, while allowing q/v shards to load.
                 self.qkv_proj.bias.zero_()
-
 
     def forward(
         self,
@@ -781,8 +771,6 @@ class FunAudioChatMultiModalProcessor(
     dummy_inputs=FunAudioChatDummyInputsBuilder,
 )
 class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"audio_invert_tower.": None})
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
@@ -990,4 +978,3 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

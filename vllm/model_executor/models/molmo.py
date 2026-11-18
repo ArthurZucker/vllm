@@ -74,7 +74,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -670,14 +669,6 @@ class MolmoDecoderNormAfterLayer(MolmoDecoderLayer):
 class MolmoVisionBackbone(nn.Module, SupportsQuant):
     packed_modules_mapping = {"merged_linear": ["gate_proj", "up_proj"]}
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # image_projector gate_up merge
-            "gate_proj": ("merged_linear", 0),
-            "up_proj": ("merged_linear", 1),
-        }
-    )
-
     def __init__(
         self,
         config: PreTrainedConfig,
@@ -804,7 +795,6 @@ class MolmoVisionBackbone(nn.Module, SupportsQuant):
         return image_features
 
 
-
 @support_torch_compile
 class MolmoModel(nn.Module, SupportsQuant):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -879,7 +869,6 @@ class MolmoModel(nn.Module, SupportsQuant):
         else:
             hidden_states = self.norm(hidden_states)
         return hidden_states
-
 
 
 def _lowest_multiple(x: int, k: int) -> int:
@@ -1270,34 +1259,6 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
 class MolmoForCausalLM(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA, SupportsQuant
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # vision backbone mapping
-            "image_projector.w1.": "image_projector.gate_proj.",
-            "image_projector.w3.": "image_projector.up_proj.",
-            "image_projector.w2.": "image_projector.down_proj.",
-            # language backbone mapping
-            "att_proj": "self_attn.qkv_proj",
-            "attn_out": "self_attn.o_proj",
-            "q_norm": "self_attn.q_norm",
-            "k_norm": "self_attn.k_norm",
-            "ff_proj": "mlp.gate_up_proj",
-            "ff_out": "mlp.down_proj",
-            "attn_norm": "input_layernorm",
-            "ff_norm": "post_attention_layernorm",
-        },
-        orig_to_new_prefix={
-            # vision backbone mapping
-            "model.vision_backbone.": "vision_backbone.",
-            # language backbone mapping
-            "model.transformer.blocks.": "model.layers.",
-            "model.transformer.ln_f.": "model.norm.",
-            # lm_head is renamed to model.transformer.mlp.down_proj firstly,
-            # we need to run a second renaming for it
-            "model.transformer.mlp.down_proj.": "lm_head.",
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["qkv_proj"],
         "gate_up_proj": ["gate_up_proj"],  # language model
@@ -1436,7 +1397,6 @@ class MolmoForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

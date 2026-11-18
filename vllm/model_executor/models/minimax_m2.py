@@ -419,9 +419,7 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-
 class MiniMaxM2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
-    hf_to_vllm_mapper = MiniMaxM2Model.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -477,4 +475,3 @@ class MiniMaxM2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

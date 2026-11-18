@@ -1093,16 +1093,7 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
         return self.norm(hidden_states)
 
 
-
 class Gemma3nForCausalLM(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "embed_audio.": None,
-            "embed_vision.": None,
-            "audio_tower.": None,
-            "vision_tower.": None,
-        }
-    )
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1157,4 +1148,3 @@ class Gemma3nForCausalLM(nn.Module):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.model.embed_tokens, hidden_states)
         return logits
-

@@ -36,7 +36,6 @@ from .paligemma import (
     PaliGemmaMultiModalProcessor,
     PaliGemmaProcessingInfo,
 )
-from .utils import WeightsMapper
 
 
 class ColPaliProcessingInfo(PaliGemmaProcessingInfo):
@@ -92,21 +91,6 @@ class ColPaliModel(
     is_pooling_model = True
 
     # Override hf_to_vllm_mapper to handle ColPali weight naming.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # HF transformers checkpoint (vidore/colpali-v1.3-hf)
-            # Weights: vlm.vision_tower.*, vlm.language_model.*,
-            # vlm.multi_modal_projector.*
-            "vlm.vision_tower.": "vision_tower.",
-            "vlm.language_model.": "language_model.",
-            "vlm.multi_modal_projector.": "multi_modal_projector.",
-            # colpali-engine checkpoint naming
-            "model.vision_tower.": "vision_tower.",
-            "model.language_model.": "language_model.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
@@ -172,4 +156,3 @@ class ColPaliModel(
     def _is_proj_weight(self, name: str) -> bool:
         """Check if a weight name belongs to the projection layer."""
         return any(proj_name in name for proj_name in self._PROJ_LAYER_NAMES)
-

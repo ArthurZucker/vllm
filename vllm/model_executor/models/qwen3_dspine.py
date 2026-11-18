@@ -18,7 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.v1.worker.gpu.spec_decode.dspine.config import DSpineSpeculatorConfig
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 _BRIDGE_METADATA = (
     "draft_block_causal_version",
@@ -203,10 +203,6 @@ def _score_transitions(
 
 
 class DSpineQwen3Model(DFlashQwen3Model):
-    hf_to_vllm_mapper = DFlashQwen3Model.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_substr={"transfer_embeddings": "transfer_codebook"},
-    )
-
     def __init__(
         self,
         *,

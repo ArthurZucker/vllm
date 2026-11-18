@@ -122,7 +122,6 @@ from .interfaces import (
 )
 from .qwen2_vl import _create_qwen2vl_field_factory
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -592,16 +591,6 @@ class Glm4vVisionEmbeddings(nn.Module):
 
 
 class Glm4vVisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".attn.q.": (".attn.qkv.", "q"),
-            ".attn.k.": (".attn.qkv.", "k"),
-            ".attn.v.": (".attn.qkv.", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         text_config: Glm4vTextConfig,
@@ -946,7 +935,6 @@ class Glm4vVisionTransformer(nn.Module):
         x = self.merger(x)
 
         return x
-
 
 
 class Glm4vMultiModalDataParser(MultiModalDataParser):
@@ -1961,13 +1949,6 @@ class Glm4vForConditionalGeneration(
     }
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-            "model.visual.": "visual.",
-        }
-    )
 
     supports_encoder_tp_data = True
     supports_tower_connector_lora = True
@@ -2339,7 +2320,6 @@ class Glm4vForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

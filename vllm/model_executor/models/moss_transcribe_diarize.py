@@ -32,7 +32,6 @@ from vllm.model_executor.models.interfaces import (
     _require_is_multimodal,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
@@ -265,14 +264,6 @@ def _add_vllm_audio_metadata(
 
 class MossTranscribeDiarizeWhisperEncoder(WhisperEncoder):
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."},
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-        },
-    )
 
     def __init__(
         self,
@@ -288,7 +279,6 @@ class MossTranscribeDiarizeWhisperEncoder(WhisperEncoder):
         )
         self.audio_merge_size = int(vllm_config.model_config.hf_config.audio_merge_size)
         self.max_encoder_batch: int | None = None
-
 
     def forward(
         self,
@@ -577,19 +567,6 @@ class MossTranscribeDiarizeForConditionalGeneration(
     supports_segment_timestamp = False
     supports_diarized_transcription = True
     supported_languages = ISO639_1_SUPPORTED_LANGS
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "language_model.layers.": "language_model.model.layers.",
-            "language_model.embed_tokens.": "language_model.model.embed_tokens.",
-            "language_model.norm.": "language_model.model.norm.",
-            "model.language_model.model.": "language_model.model.",
-            "model.language_model.lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-            "model.whisper_encoder.": "whisper_encoder.",
-            "model.vq_adaptor.": "vq_adaptor.",
-            "model.": None,
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -853,4 +830,3 @@ class MossTranscribeDiarizeForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

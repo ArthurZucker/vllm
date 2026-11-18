@@ -45,7 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class HrmTextMLP(nn.Module):
@@ -465,9 +465,6 @@ class HrmTextForCausalLM(nn.Module):
     # gate/q/k/v) and `mlp.gate_up_proj` (2-way fused gate/up) are loaded
     # directly via MergedColumnParallelLinear's fused-on-disk path; no
     # packed_modules_mapping entries are needed.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".attn.": ".self_attn."},
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -517,4 +514,3 @@ class HrmTextForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-

@@ -397,12 +397,14 @@ def configure_quant_config(
     function can be removed
     """
     if not issubclass(model_class, SupportsQuant):
-        hf_to_vllm_mapper = getattr(model_class, "hf_to_vllm_mapper", None)
+        from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
+
+        mapper = rename_mapper(model_class)
         packed_mapping = getattr(model_class, "packed_modules_mapping", None)
 
         # pass mappings by reference to quant_config
-        if hf_to_vllm_mapper is not None:
-            quant_config.apply_vllm_mapper(hf_to_vllm_mapper.get_rename_mapper())
+        if mapper is not None:
+            quant_config.apply_vllm_mapper(mapper)
         if packed_mapping is not None:
             quant_config.packed_modules_mapping = packed_mapping
 

@@ -44,7 +44,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
-    Qwen3_5Model,
 )
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
@@ -417,8 +416,6 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
 
 
 class Qwen4ExpModel(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -670,7 +667,6 @@ class Qwen4ExpModel(nn.Module):
         return sample_hidden_states
 
 
-
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
@@ -696,9 +692,6 @@ class Qwen4ExpForCausalLM(
             "_input_mix_padding",
         ],
     }
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.language_model.": "model."}
-    )
     requires_raw_input_tokens = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -903,7 +896,6 @@ class Qwen4ExpForCausalLM(
         return positions.unsqueeze(0).expand(3, -1), 0
 
 
-
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self) -> Qwen4ExpConfig:
         return self.ctx.get_hf_config(Qwen4ExpConfig)
@@ -1091,7 +1083,6 @@ class Qwen4ExpForConditionalGeneration(
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
-
 
     @classmethod
     def get_mamba_state_dtype_from_config(

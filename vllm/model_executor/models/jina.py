@@ -31,7 +31,6 @@ from .llama import LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM, Qwen3Model
 from .utils import (
     StageMissingLayer,
-    WeightsMapper,
     maybe_prefix,
     no_init_weights,
 )
@@ -41,8 +40,6 @@ logger = logging.getLogger(__name__)
 
 class JinaForRanking(nn.Module, SupportsLateInteraction):
     is_pooling_model = True
-
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"lm_head.": None})
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -232,9 +229,6 @@ class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):
     """
 
     is_pooling_model = True
-    hf_to_vllm_mapper = Qwen3ForCausalLM.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={"": "model."}
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         with no_init_weights(
@@ -256,9 +250,6 @@ class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
     """
 
     is_pooling_model = True
-    hf_to_vllm_mapper = LlamaForCausalLM.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={"": "model."}
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         with no_init_weights(

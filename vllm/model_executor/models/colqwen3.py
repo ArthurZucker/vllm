@@ -37,7 +37,6 @@ from .qwen3_vl import (
     Qwen3VLMultiModalProcessor,
     Qwen3VLProcessingInfo,
 )
-from .utils import WeightsMapper
 
 
 class ColQwen3ProcessingInfo(Qwen3VLProcessingInfo):
@@ -143,22 +142,6 @@ class ColQwen3Model(Qwen3VLForConditionalGeneration, SupportsLateInteraction):
     #   ColPali:     "model.visual.", "model.language_model."
     #   OpenSearch:  "visual.", "language_model." (no outer prefix,
     #                re-prefixed to "model.*" in load_weights)
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # TomoroAI naming convention (most specific first)
-            "vlm.model.visual.": "visual.",
-            "vlm.lm_head.": "language_model.lm_head.",
-            "vlm.model.language_model.": "language_model.model.",
-            # ColPali / nvidia naming convention
-            "model.visual.": "visual.",
-            "lm_head.": "language_model.lm_head.",
-            # OpenSearch-AI: after re-prefix, "language_model.model.*"
-            # becomes "model.language_model.model.*" — handle this before
-            # the shorter "model.language_model." rule to avoid double map
-            "model.language_model.model.": "language_model.model.",
-            "model.language_model.": "language_model.model.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -242,4 +225,3 @@ class ColQwen3Model(Qwen3VLForConditionalGeneration, SupportsLateInteraction):
     def _is_proj_weight(self, name: str) -> bool:
         """Check if a weight name belongs to the projection layer."""
         return any(proj_name in name for proj_name in self._PROJ_LAYER_NAMES)
-

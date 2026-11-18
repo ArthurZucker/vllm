@@ -79,7 +79,6 @@ from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     sequence_parallel_chunk,
 )
@@ -1982,8 +1981,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper()
-
     def __init__(
         self,
         *,
@@ -2156,7 +2153,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 logits / self.output_soft_cap_temp
             )
         return logits
-
 
     def process_weights_after_loading(self) -> None:
         if self.specialized_decode is not None:

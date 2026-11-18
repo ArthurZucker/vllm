@@ -21,7 +21,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -231,18 +230,6 @@ class DeepseekOCR2MultiModalProcessor(
     dummy_inputs=DeepseekOCR2DummyInputsBuilder,
 )
 class DeepseekOCR2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # map prefix for language backbone
-            "model.embed_tokens.": "language_model.model.embed_tokens.",
-            "model.layers.": "language_model.model.layers.",
-            "model.norm.": "language_model.model.norm.",
-            "lm_head.": "language_model.lm_head.",
-            # remove "model." prefix for other components
-            "model.": "",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -430,7 +417,6 @@ class DeepseekOCR2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Support
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

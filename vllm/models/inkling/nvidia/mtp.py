@@ -32,7 +32,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsMultiModalEmbeddings
-from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from ..configs import InklingModelConfig
@@ -256,9 +256,6 @@ class InklingMultiTokenPredictor(nn.Module):
 
 
 class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
-    hf_to_vllm_mapper = _TmlForCausalLMBase.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={"model.mtp.": "model."},
-    )
     packed_modules_mapping = _TmlForCausalLMBase.packed_modules_mapping
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -350,7 +347,6 @@ class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
         positive scalar, so the argmax is invariant and the scaling is
         skipped entirely."""
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
-
 
 
 def _load_inkling_mtp_weights(

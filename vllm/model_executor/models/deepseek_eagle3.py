@@ -3,7 +3,6 @@
 
 """Eagle3 speculative decoding model for DeepseekV2/V3 with MLP (no MoE)."""
 
-
 import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -26,7 +25,6 @@ from vllm.multimodal.inputs import NestedTensors
 
 from .interfaces import LocalArgmaxMixin
 from .utils import (
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -253,16 +251,6 @@ class DeepseekV2Eagle3Model(nn.Module):
         return hidden_states, aux_output
 
     # midlayer rename + gate_up / MLA fused_qkv_a merges
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={"midlayer.": "layers.0."},
-        orig_to_new_stacked={
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-            ".q_a_proj": (".fused_qkv_a_proj", 0),
-            ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
-        },
-    )
-
 
 
 class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
@@ -360,7 +348,6 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
                 dim=-1,
             )
         return self.model.fc(hidden_states)
-
 
 
 # Aliases for compatibility

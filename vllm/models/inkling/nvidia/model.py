@@ -370,43 +370,6 @@ class InklingModel(nn.Module):
 class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
     """Shared text-backbone causal-LM scaffolding for both entry classes."""
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".w13_dn": ".gate_up_proj",
-            ".w2_md": ".down_proj",
-        },
-        orig_to_new_stacked={
-            ".attn.wq_du.": (".attn.qkvr.", 0),
-            ".attn.wk_dv.": (".attn.qkvr.", 1),
-            ".attn.wv_dv.": (".attn.qkvr.", 2),
-            ".attn.wr_du.": (".attn.qkvr.", 3),
-        },
-        orig_to_new_prefix={
-            "model.llm.layers.": "model.layers.",
-            "model.llm.embed_norm": "model.embed_norm",
-            "model.llm.embed": "model.embed_tokens",
-            "model.llm.norm": "model.norm",
-            "model.llm.unembed": "lm_head",
-            "language_model.layers.": "model.layers.",
-            "language_model.lm_head.": "lm_head.",
-        },
-        orig_to_new_suffix={
-            # ModelOpt NVFP4 scales
-            ".w13_weight.scale": ".w13_weight_scale",
-            ".w13_weight.scale2": ".w13_weight_scale_2",
-            ".w2_weight.scale": ".w2_weight_scale",
-            ".w2_weight.scale2": ".w2_weight_scale_2",
-            # Compressed tensors NVFP4 parameters
-            ".w13_weight.input_global_scale": ".w13_input_global_scale",
-            ".w13_weight.weight_global_scale": ".w13_weight_global_scale",
-            ".w13_weight.weight_packed": ".w13_weight_packed",
-            ".w13_weight.weight_scale": ".w13_weight_scale",
-            ".w2_weight.input_global_scale": ".w2_input_global_scale",
-            ".w2_weight.weight_global_scale": ".w2_weight_global_scale",
-            ".w2_weight.weight_packed": ".w2_weight_packed",
-            ".w2_weight.weight_scale": ".w2_weight_scale",
-        },
-    )
     packed_modules_mapping = {
         "qkvr": ["wq_du", "wk_dv", "wv_dv", "wr_du"],
         "w13": ["w1", "w3"],
@@ -475,7 +438,6 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
         return self.logits_processor(self.lm_head, hidden_states)
 
 
-
 class InklingForCausalLM(_TmlForCausalLMBase):
     """Text-only entry point (`inkling_model` checkpoints)."""
 
@@ -498,13 +460,6 @@ class InklingForConditionalGeneration(_TmlForCausalLMBase, SupportsMultiModal):
     `forward` / `compute_logits` (the latter already applies muP) and this
     class only adds multimodal embedding + merge.
     """
-
-    hf_to_vllm_mapper = _TmlForCausalLMBase.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={
-            "model.audio.": "audio.",
-            "model.visual.": "visual.vision_encoder.",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

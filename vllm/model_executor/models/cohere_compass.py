@@ -124,7 +124,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
@@ -682,14 +681,6 @@ class Cohere_VisionPatchMerger(nn.Module):
 
 
 class Cohere_VisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q.": (".qkv.", "q"),
-            ".k.": (".qkv.", "k"),
-            ".v.": (".qkv.", "v"),
-        }
-    )
-
     def __init__(
         self,
         vision_config: CohereCompassVisionConfig,
@@ -1007,7 +998,6 @@ class Cohere_VisionTransformer(nn.Module):
         return hidden_states
 
 
-
 def _create_cohere_compass_field_factory(
     spatial_merge_size: int,
 ) -> Callable[
@@ -1320,13 +1310,6 @@ class CohereCompassForConditionalGeneration(
     supports_encoder_tp_data = True
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.visual.": "visual.",
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1949,7 +1932,6 @@ class CohereCompassForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models"""

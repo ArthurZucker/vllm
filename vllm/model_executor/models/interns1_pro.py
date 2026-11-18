@@ -73,7 +73,6 @@ from .qwen3_vl import (
 )
 from .qwen3_vl_moe import Qwen3MoeLLMModel
 from .utils import (
-    WeightsMapper,
     extract_layer_index,
     maybe_prefix,
 )
@@ -536,13 +535,6 @@ class InternS1ProForConditionalGeneration(
     }
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.visual.": "visual.",
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3VLForConditionalGeneration, self).__init__()
@@ -603,4 +595,3 @@ class InternS1ProForConditionalGeneration(
                     f"language_model.model.{name}"
                 )
         return mapper
-

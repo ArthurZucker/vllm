@@ -48,7 +48,6 @@ from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -276,17 +275,6 @@ class Gemma3DecoderLayer(nn.Module):
 
 @support_torch_compile
 class Gemma3Model(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -358,9 +346,7 @@ class Gemma3Model(nn.Module):
         return hidden_states
 
 
-
 class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    hf_to_vllm_mapper = Gemma3Model.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -422,4 +408,3 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

@@ -45,7 +45,6 @@ from vllm.v1.attention.backend import AttentionType
 from .interfaces import MixtureOfExperts, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -571,17 +570,12 @@ class Step3p5Model(nn.Module):
         return hidden_states
 
 
-
 class Step3p5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     # Required so quantization exclude lists match fused module prefixes.
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".share_expert.": ".moe.share_expert."}
-    )
 
     def __init__(
         self,
@@ -666,4 +660,3 @@ class Step3p5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             layer.n_physical_experts = num_physical_experts
             layer.n_redundant_experts = self.num_redundant_experts
             layer.experts.update_expert_map()
-

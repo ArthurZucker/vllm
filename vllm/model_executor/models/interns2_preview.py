@@ -11,7 +11,6 @@ from .qwen3_vl import (
     Qwen3VLMultiModalProcessor,
     Qwen3VLProcessingInfo,
 )
-from .utils import WeightsMapper
 
 
 class InternS2PreviewProcessingInfo(Qwen3VLProcessingInfo):
@@ -29,9 +28,4 @@ class InternS2PreviewProcessingInfo(Qwen3VLProcessingInfo):
 )
 class InternS2PreviewForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
     # `mtp.` is already dropped by `Qwen3_5ForConditionalGeneration`.
-    hf_to_vllm_mapper = Qwen3_5MoeForConditionalGeneration.hf_to_vllm_mapper | (
-        WeightsMapper(
-            orig_to_new_prefix={"model.time_series.": None, "time_series.": None}
-        )
-    )
-
+    pass

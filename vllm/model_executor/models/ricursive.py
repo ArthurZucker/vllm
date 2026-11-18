@@ -36,7 +36,6 @@ from vllm.transformers_utils.configs.ricursive import RicursiveConfig
 from .interfaces import EagleModelMixin, SupportsEagle3, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -349,15 +348,6 @@ class RicursiveModel(nn.Module, EagleModelMixin):
 
 
 class RicursiveForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkg_proj", 0),
-            ".k_proj": (".qkg_proj", 1),
-            ".g_proj": (".qkg_proj", 2),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
     packed_modules_mapping = {
         "qkg_proj": ["q_proj", "k_proj", "g_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -402,4 +392,3 @@ class RicursiveForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-

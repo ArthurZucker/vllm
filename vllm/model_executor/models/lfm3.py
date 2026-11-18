@@ -47,7 +47,6 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -270,16 +269,6 @@ class Lfm3Model(nn.Module, EagleModelMixin):
 
     # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision
     # with the inner .conv.conv child, see Lfm2Model.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".conv.": ".short_conv."},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".w1": (".w13", 0),
-            ".w3": (".w13", 1),
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -374,7 +363,6 @@ class Lfm3Model(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-
 def _short_conv_state_shape(
     vllm_config: VllmConfig, config: Lfm3Config
 ) -> tuple[tuple[int, int]]:
@@ -408,7 +396,6 @@ class Lfm3ForCausalLM(
     }
 
     # Reuse the backbone mapper so LoRA/quantization see the same name mapping.
-    hf_to_vllm_mapper = Lfm3Model.hf_to_vllm_mapper
 
     # LoRA specific attributes
     embedding_modules = {
@@ -471,4 +458,3 @@ class Lfm3ForCausalLM(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-

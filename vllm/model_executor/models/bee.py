@@ -18,7 +18,6 @@ from .llava_next import (
     LlavaNextProcessingInfo,
 )
 from .llava_onevision import LlavaOnevisionForConditionalGeneration
-from .utils import WeightsMapper
 
 
 class BeeProcessingInfo(LlavaNextProcessingInfo):
@@ -137,18 +136,6 @@ class BeeMultiModalProjector(nn.Module):
 class BeeForConditionalGeneration(LlavaOnevisionForConditionalGeneration):
     # Not validated for Bee; keep CPU-side normalisation.
     supports_mm_device_do_normalize = False
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # mapping for new names in checkpoint saved after transformers
-            # v4.55
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "model.image_newline": "image_newline",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)

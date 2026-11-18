@@ -103,7 +103,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -523,13 +522,6 @@ class Qwen2VisionPatchMerger(nn.Module):
 
 class Qwen2VisionTransformer(nn.Module):
     # Vision checkpoints store qkv pre-fused; merge separate q/k/v into qkv.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv", "q"),
-            ".k_proj": (".qkv", "k"),
-            ".v_proj": (".qkv", "v"),
-        }
-    )
 
     def __init__(
         self,
@@ -751,7 +743,6 @@ class Qwen2VisionTransformer(nn.Module):
         x = self.merger(x)
 
         return x
-
 
 
 def _create_qwen2vl_field_factory(
@@ -1341,16 +1332,6 @@ class Qwen2VLForConditionalGeneration(
     Qwen2VLEncoderCudaGraphMixin,
 ):
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "model.visual.": "visual.",
-            # mapping for original checkpoint
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        }
-    )
 
     supports_encoder_tp_data = True
     supports_mm_device_do_normalize = True
@@ -1695,7 +1676,6 @@ class Qwen2VLForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

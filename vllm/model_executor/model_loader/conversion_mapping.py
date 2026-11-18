@@ -16,6 +16,7 @@ To add a model: copy the closest entry, load it, read the "matching no param" wa
 import os
 import re
 from copy import deepcopy
+from typing import TYPE_CHECKING
 
 from torch import nn
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
@@ -27,6 +28,9 @@ from transformers.core_model_loading import (
 )
 
 from vllm.model_executor.model_loader.weight_ops import OutputConcatenate
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
 
 
 def rename(pattern: str, new: str) -> WeightRenaming:
@@ -2613,3 +2617,22 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
                 transform.scope_prefix, transform.base_model_prefix = scope, ""
             out.append(transform)
     return out
+
+
+def rename_mapper(model) -> "WeightsMapper | None":
+    """The renamings of a model (or a model class), for what names modules rather
+    than loading them: LoRA adapters, quantization configs' layer lists, EPLB. Dropped
+    names stay as they are."""
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    if isinstance(model, nn.Module):
+        transforms = get_conversion_mapping(model)
+    else:
+        transforms = _CONVERSION_MAPPING.get(model.__name__, [])
+    renamings = [
+        t
+        for t in transforms
+        if not isinstance(t, WeightConverter)
+        and "_dropped_" not in t._original_target_patterns
+    ]
+    return WeightsMapper(orig_to_new_renaming=renamings) if renamings else None

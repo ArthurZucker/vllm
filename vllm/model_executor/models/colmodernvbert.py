@@ -43,7 +43,7 @@ from .interfaces import (
 from .interfaces_base import default_pooling_type
 from .modernbert import ModernBertEmbeddings, ModernBertLayer
 from .siglip import SiglipVisionModel
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 # ---------------------------------------------------------------------------
 # Connector: pixel shuffle + simple linear projection
@@ -356,15 +356,3 @@ class ColModernVBertForRetrieval(
 
     # Checkpoint prefix → vLLM param prefix.
     # More-specific prefixes must appear before shorter ones.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.text_model.layers.": "text_layers.",
-            "model.text_model.embeddings.": "text_embeddings.",
-            "model.text_model.final_norm.": "text_final_norm.",
-            "model.connector.modality_projection.": "connector.proj.",
-            "model.custom_text_proj.": "custom_text_proj.",
-            "model.vision_model.vision_model.": "vision_model.vision_model.",
-            "model.": "",
-        },
-    )
-

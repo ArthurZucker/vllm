@@ -80,7 +80,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsReplaySSM,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -728,16 +727,6 @@ class NemotronHForCausalLM(
     # Relevant only if self.has_moe is True
     is_non_gated_moe = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"backbone": "model", "mtp": None},
-        orig_to_new_substr={"A_log": "A", "embeddings": "embed_tokens"},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -911,4 +900,3 @@ class NemotronHForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

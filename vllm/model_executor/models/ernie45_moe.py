@@ -65,7 +65,6 @@ from vllm.transformers_utils.config import set_default_rope_theta
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -395,20 +394,6 @@ class Ernie4_5_MoeDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Ernie4_5_MoeModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        },
-        orig_to_new_substr={"mtp": None},
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -500,7 +485,6 @@ class Ernie4_5_MoeModel(nn.Module):
                 name = name.replace("moe_statics", "gate")
                 loaded_weight = loaded_weight.squeeze(0)
             yield name, loaded_weight
-
 
 
 class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
@@ -623,4 +607,3 @@ class Ernie4_5_MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExpe
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

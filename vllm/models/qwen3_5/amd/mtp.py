@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
-
 import torch
 from torch import nn
 from transformers import Qwen3_5MoeTextConfig, Qwen3_5TextConfig
@@ -42,14 +41,12 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .model import Qwen3_5DecoderLayer, Qwen3_5Model, Qwen3_5RMSNorm
+from .model import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
 
 logger = init_logger(__name__)
 
 
 class Qwen3_5MultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -186,7 +183,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         return hidden_states
 
 
-
 class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -290,7 +286,6 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         return not name.startswith("mtp.") and not any(
             key in name for key in ["embed_tokens", "lm_head"]
         )
-
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

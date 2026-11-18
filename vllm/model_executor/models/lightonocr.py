@@ -17,7 +17,6 @@ from vllm.model_executor.models.mistral3 import (
 )
 from vllm.model_executor.models.pixtral import PixtralHFEncoderInfo
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -132,15 +131,6 @@ class LightOnOCRMultiModalProcessor(BaseMultiModalProcessor[LightOnOCRProcessing
 class LightOnOCRForConditionalGeneration(Mistral3ForConditionalGeneration):
     supports_mm_device_do_normalize = False
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.vision_encoder.": "vision_tower.",
-            "model.vision_projection.": "multi_modal_projector.",
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
 
@@ -188,4 +178,3 @@ class LightOnOCRForConditionalGeneration(Mistral3ForConditionalGeneration):
             return Mistral3ImageEmbeddingInputs(data=image_embeds)
 
         return super()._parse_and_validate_image_input(**kwargs)
-

@@ -42,7 +42,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -596,17 +595,6 @@ class FlintModel(nn.Module):
 
 
 class FlintForCausalLM(nn.Module, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_expert.gate_proj": (".shared_expert.gate_up_proj", 0),
-            ".shared_expert.up_proj": (".shared_expert.gate_up_proj", 1),
-        }
-    )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -670,7 +658,6 @@ class FlintForCausalLM(nn.Module, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
 
     def _apply_dequantized_scales(
         self, weights: Iterable[tuple[str, torch.Tensor]]

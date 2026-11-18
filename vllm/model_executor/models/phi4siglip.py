@@ -48,7 +48,6 @@ from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .lfm2_siglip2 import Siglip2Model
 from .llava import LlavaMultiModalProjector
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -219,17 +218,6 @@ class Phi4SiglipImagePixelInputs(TensorSchema):
     dummy_inputs=Phi4SiglipDummyInputsBuilder,
 )
 class Phi4ForCausalLMV(nn.Module, SupportsMultiModal, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.vision_tower.vision_tower.vision_model.head.": None,
-            "model.vision_tower.vision_tower.": "vision_tower.",
-            "model.mm_projector.0.": "multi_modal_projector.linear_1.",
-            "model.mm_projector.2.": "multi_modal_projector.linear_2.",
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        },
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -396,4 +384,3 @@ class Phi4ForCausalLMV(nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

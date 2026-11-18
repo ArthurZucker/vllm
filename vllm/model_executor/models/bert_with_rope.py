@@ -35,7 +35,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -444,8 +443,6 @@ class BertWithRopeEncoder(nn.Module):
 @support_torch_compile
 @default_pooling_type(seq_pooling_type="CLS")
 class BertWithRope(nn.Module, SupportsQuant):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.": ""})
-
     def __init__(
         self,
         *,
@@ -494,35 +491,11 @@ class BertWithRope(nn.Module, SupportsQuant):
 class NomicBertModel(BertWithRope):
     # for https://huggingface.co/nomic-ai/nomic-bert-2048
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "emb_ln": "embeddings.LayerNorm",
-            "attn.Wqkv": "attn.qkv_proj",
-            "norm1": "attn_ln",
-            "mlp.fc1.": "mlp.up_proj.",
-            "mlp.fc11": "mlp.up_proj",
-            "mlp.fc12": "mlp.gate_proj",
-            "mlp.fc2": "mlp.down_proj",
-            "norm2": "mlp_ln",
-            # MoE mapping
-            "experts.mlp.": "",
-            "experts.": "",
-            "router.layer": "router",
-        }
-    )
+    pass
 
 
 class GteNewModel(BertWithRope):
     # for https://huggingface.co/Alibaba-NLP/new-impl
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "new.": "",
-            "layer": "layers",
-            "attention.qkv_proj": "attn.qkv_proj",
-            "attention.o_proj": "attn.out_proj",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs):
         super().__init__(vllm_config=vllm_config, prefix=prefix, **kwargs)
@@ -552,29 +525,13 @@ class GteNewModel(BertWithRope):
 class SnowflakeGteNewModel(GteNewModel):
     # for Snowflake/snowflake-arctic-embed-m-v2.0
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "layer": "layers",
-            "attention.qkv_proj": "attn.qkv_proj",
-            "attention.o_proj": "attn.out_proj",
-        }
-    )
+    pass
 
 
 class JinaRobertaModel(BertWithRope):
     # for https://huggingface.co/jinaai/jina-embeddings-v3
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "emb_ln": "embeddings.LayerNorm",
-            "mixer.Wqkv": "attn.qkv_proj",
-            "mixer.out_proj": "attn.out_proj",
-            "norm1": "attn_ln",
-            "mlp.fc1.": "mlp.up_proj.",
-            "mlp.fc2": "mlp.down_proj",
-            "norm2": "mlp_ln",
-        }
-    )
+    pass
 
 
 @default_pooling_type(seq_pooling_type="CLS")

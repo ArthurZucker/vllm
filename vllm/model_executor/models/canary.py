@@ -10,7 +10,6 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import ClassVar
 
-import regex as re
 import torch
 from torch import nn
 from transformers import BatchFeature, CanaryConfig, ParakeetFeatureExtractor
@@ -53,7 +52,7 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsTranscription,
 )
-from .utils import WeightsMapper, make_layers, maybe_prefix
+from .utils import make_layers, maybe_prefix
 
 # See https://huggingface.co/nvidia/canary-1b-v2
 CANARY_SUPPORTED_LANGS = {
@@ -426,16 +425,6 @@ class CanaryForConditionalGeneration(
 
     # Only the decoder is built from vLLM layers; encoder weights keep their
     # Transformers names.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_regex={
-            re.compile(r"(decoder\.layers\.\d+\.\w+_attn)\.o_proj\."): (
-                r"\1.out_projection."
-            ),
-            re.compile(r"(decoder\.layers\.\d+\.mlp)\.fc1\."): r"\1.dense_in.",
-            re.compile(r"(decoder\.layers\.\d+\.mlp)\.fc2\."): r"\1.dense_out.",
-            re.compile(r"\.num_batches_tracked$"): None,
-        },
-    )
 
     supported_languages = CANARY_SUPPORTED_LANGS
     supports_transcription_only = True
@@ -609,4 +598,3 @@ class CanaryForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.proj_out, hidden_states, self.proj_out.bias)
-

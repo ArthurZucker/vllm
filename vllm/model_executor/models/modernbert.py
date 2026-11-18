@@ -31,7 +31,7 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsCrossEncoding, SupportsLoRA
 from .interfaces_base import attn_type, default_pooling_type
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class ModernBertEmbeddings(nn.Module):
@@ -244,14 +244,6 @@ class ModernBertEncoderLayer(nn.Module):
 @support_torch_compile
 @default_pooling_type(seq_pooling_type="CLS")
 class ModernBertModel(nn.Module, SupportsLoRA):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.layers.": "encoder_layer.layers.",
-            "layers.": "encoder_layer.layers.",
-            "model.": "",
-        }
-    )
-
     packed_modules_mapping = {
         "Wqkv": ["Wqkv"],
         "Wi": ["Wi"],
@@ -275,7 +267,6 @@ class ModernBertModel(nn.Module, SupportsLoRA):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embeddings.embed_input_ids(input_ids)
-
 
     def forward(
         self,
@@ -371,7 +362,6 @@ class ModernBertForSequenceClassification(nn.Module, SupportsCrossEncoding):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-
     def forward(
         self,
         input_ids: torch.LongTensor | None,
@@ -409,8 +399,6 @@ class ModernBertPredictionHead(nn.Module):
 class ModernBertForTokenClassification(nn.Module):
     is_pooling_model = True
 
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"drop": None})
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -431,7 +419,6 @@ class ModernBertForTokenClassification(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
-
 
     def forward(
         self,

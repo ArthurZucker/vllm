@@ -45,7 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import HasInnerState, IsHybrid
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class Zamba2LoRA(nn.Module):
@@ -840,18 +840,6 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
     """
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "A_log": "A",
-            "0.weight": "A.weight",
-            "1.weight": "B.weight",
-        },
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-        },
-    )
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -989,4 +977,3 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid):
         """
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

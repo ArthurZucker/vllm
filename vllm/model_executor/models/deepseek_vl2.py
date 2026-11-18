@@ -61,7 +61,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -344,12 +343,6 @@ class DeepseekVL2MultiModalProcessor(
 class DeepseekVLV2ForCausalLM(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsEncoderCudaGraph
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "language.": "language_model.",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -832,4 +825,3 @@ class DeepseekVLV2ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

@@ -19,7 +19,6 @@ Checkpoint layout (`gemma4_assistant`)::
     masked_embedding.token_ordering -- token-to-centroid mapping buffer
 """
 
-
 import torch
 from torch import nn
 
@@ -49,7 +48,6 @@ from vllm.v1.worker.gpu.spec_decode.gemma4.config import Gemma4MTPSpeculatorConf
 
 from .gemma4 import Gemma4MLP, _get_text_config
 from .utils import (
-    WeightsMapper,
     extract_layer_index,
     get_draft_quant_config,
     maybe_prefix,
@@ -451,17 +449,6 @@ class Gemma4MTP(nn.Module):
 
     has_own_lm_head = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "pre_projection.": "model.pre_projection.",
-            "post_projection.": "model.post_projection.",
-        },
-        orig_to_new_stacked={
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         speculative_config = vllm_config.speculative_config
@@ -591,7 +578,6 @@ class Gemma4MTP(nn.Module):
             hidden_states,
             self._get_full_lm_head_weight(),
         )
-
 
     def process_weights_after_loading(self) -> None:
         # Built here, outside inference mode, and refilled in place on reload.

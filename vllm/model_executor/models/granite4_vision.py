@@ -49,7 +49,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.siglip import SiglipVisionModel
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -452,16 +451,6 @@ class Granite4VisionForConditionalGeneration(
     # HF: model.language_model.layers.0...
     # vLLM: language_model.model.layers.0...
     # (because GraniteForCausalLM.model = GraniteModel)
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.language_model.": "language_model.model.",
-            "model.layerwise_projectors.": "layerwise_projectors.",
-            "model.spatial_projectors.": "spatial_projectors.",
-            "model.image_newline": "image_newline",
-            "model.vision_tower.": "vision_tower.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -921,4 +910,3 @@ class Granite4VisionForConditionalGeneration(
         # GraniteForCausalLM.compute_logits uses
         # LogitsProcessor(scale=1/logits_scaling)
         return self.language_model.compute_logits(hidden_states)
-

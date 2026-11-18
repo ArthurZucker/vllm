@@ -20,7 +20,6 @@ from vllm.model_executor.models.llama import (
 from vllm.model_executor.models.llama import LlamaForCausalLM
 
 from .utils import (
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -60,17 +59,6 @@ class LlamaDecoderLayer(BaseLlamaDecoderLayer):
 
 @support_torch_compile
 class LlamaModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         *,
@@ -136,7 +124,6 @@ class LlamaModel(nn.Module):
         return hidden_states, hidden_states
 
 
-
 class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -175,4 +162,3 @@ class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
                 f"{type(self).__name__} does not support multimodal inputs yet."
             )
         return self.model(input_ids, positions, hidden_states)
-

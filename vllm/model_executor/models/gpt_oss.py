@@ -52,7 +52,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -451,35 +450,6 @@ class GptOssForCausalLM(
 ):
     is_3d_moe_weight: typing.ClassVar[bool] = True
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".self_attn.": ".attn.",
-        },
-        orig_to_new_suffix={
-            ".embed_tokens.weight": ".embedding.weight",
-            # MoE MXFP4 weights
-            ".gate_up_proj_blocks": ".w13_weight",
-            ".down_proj_blocks": ".w2_weight",
-            ".gate_up_proj_scales": ".w13_weight_scale",
-            ".down_proj_scales": ".w2_weight_scale",
-            # MoE other weights
-            ".gate_up_proj": ".w13_weight",
-            ".down_proj": ".w2_weight",
-            # MoE Bias
-            ".gate_up_proj_bias": ".w13_bias",
-            ".down_proj_bias": ".w2_bias",
-            # For quark format
-            ".gate_up_proj.weight": ".w13_weight",
-            ".gate_up_proj.weight_scale": ".w13_weight_scale",
-            ".gate_up_proj.bias": ".w13_bias",
-            ".gate_up_proj.input_scale": ".w13_input_scale",
-            ".down_proj.weight": ".w2_weight",
-            ".down_proj.weight_scale": ".w2_weight_scale",
-            ".down_proj.bias": ".w2_bias",
-            ".down_proj.input_scale": ".w2_input_scale",
-        },
-    )
 
     def __init__(
         self,

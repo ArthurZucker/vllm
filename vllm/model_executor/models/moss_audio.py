@@ -72,7 +72,6 @@ from .interfaces import (
 from .module_mapping import MultiModelKeys
 from .qwen3 import Qwen3ForCausalLM, Qwen3Model
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -1485,20 +1484,6 @@ class MossAudioModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
         "lm_head": "output_embeddings",
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "lm_head.": "language_model.lm_head.",
-            "language_model.embed_tokens.": "language_model.model.embed_tokens.",
-            "language_model.layers.": "language_model.model.layers.",
-            "language_model.norm.": "language_model.model.norm.",
-            "audio_encoder.embed_positions": None,
-        },
-        orig_to_new_stacked={
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
-
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(
             language_model="language_model.",
@@ -1906,4 +1891,3 @@ class MossAudioModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

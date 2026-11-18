@@ -40,7 +40,6 @@ from .interfaces import SupportsLoRA, SupportsPP, SupportsQuant
 from .interfaces_base import default_pooling_type
 from .utils import (
     StageMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -246,14 +245,6 @@ class InternLMDecoderLayer(nn.Module):
 
 @support_torch_compile
 class InternLM2Model(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".w1": (".gate_up_proj", 0),
-            ".w3": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         *,
@@ -315,9 +306,7 @@ class InternLM2Model(nn.Module):
         return hidden_states
 
 
-
 class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsQuant):
-    hf_to_vllm_mapper = InternLM2Model.hf_to_vllm_mapper
     packed_modules_mapping: dict[str, list[str]] = {
         "wqkv": ["wqkv"],
         "gate_up_proj": ["w1", "w3"],
@@ -374,7 +363,6 @@ class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsQuant):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.output, hidden_states)
         return logits
-
 
 
 @default_pooling_type(tok_pooling_type="ALL")

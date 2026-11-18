@@ -34,7 +34,6 @@ from vllm.transformers_utils.configs.chatglm import ChatGLMConfig
 
 from .interfaces import SupportsLoRA, SupportsPP, SupportsQuant
 from .utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -312,10 +311,6 @@ class GLMTransformer(nn.Module):
 
 @support_torch_compile
 class ChatGLMModel(nn.Module, SupportsQuant):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".word_embeddings": ""},
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -379,7 +374,6 @@ class ChatGLMModel(nn.Module, SupportsQuant):
         return hidden_states
 
 
-
 class ChatGLMBaseModel(nn.Module):
     def __init__(
         self,
@@ -418,7 +412,6 @@ class ChatGLMBaseModel(nn.Module):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
 
 class ChatGLMForCausalLM(ChatGLMBaseModel, SupportsLoRA, SupportsPP, SupportsQuant):

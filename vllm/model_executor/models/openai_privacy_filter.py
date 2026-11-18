@@ -20,7 +20,7 @@ from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_classify
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.sequence import IntermediateTensors
 
-from .gpt_oss import GptOssForCausalLM, GptOssModel, OAIAttention, TransformerBlock
+from .gpt_oss import GptOssModel, OAIAttention, TransformerBlock
 from .interfaces_base import attn_type, default_pooling_type
 from .utils import maybe_prefix
 
@@ -80,7 +80,6 @@ def _interleave_gate_up_concat_to_pairs(
 @default_pooling_type(tok_pooling_type="ALL")
 class OpenAIPrivacyFilterForTokenClassification(nn.Module):
     is_pooling_model = True
-    hf_to_vllm_mapper = GptOssForCausalLM.hf_to_vllm_mapper
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -118,4 +117,3 @@ class OpenAIPrivacyFilterForTokenClassification(nn.Module):
         )
         hidden_states = hidden_states.to(self.head_dtype)
         return self.score(hidden_states)
-

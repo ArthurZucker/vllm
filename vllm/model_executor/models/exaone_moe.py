@@ -52,7 +52,6 @@ from .exaone4 import Exaone4GatedMLP as ExaoneMoeGatedMLP
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -458,20 +457,6 @@ class ExaoneMoeModel(nn.Module):
 
 
 class ExaoneMoeForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        },
-        orig_to_new_prefix={"mtp.": None},
-    )
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -545,4 +530,3 @@ class ExaoneMoeForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

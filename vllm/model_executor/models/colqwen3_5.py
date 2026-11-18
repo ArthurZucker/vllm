@@ -38,7 +38,6 @@ from .qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
     Qwen3VLMultiModalProcessor,
 )
-from .utils import WeightsMapper
 
 
 class ColQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
@@ -135,12 +134,6 @@ class ColQwen3_5Model(
     # ColPali saves weights as "language_model.*" but vLLM's
     # Qwen3_5ForCausalLM has them under "language_model.model.*".
     # Visual weights ("visual.*") already match the vLLM module path.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "language_model.": "language_model.model.",
-            "mtp.": None,
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -214,4 +207,3 @@ class ColQwen3_5Model(
     def _is_proj_weight(self, name: str) -> bool:
         """Check if a weight name belongs to the projection layer."""
         return any(proj_name in name for proj_name in self._PROJ_LAYER_NAMES)
-

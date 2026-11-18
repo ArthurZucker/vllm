@@ -54,7 +54,6 @@ from .interfaces import (
     supports_pp,
 )
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -493,13 +492,6 @@ class Step3VisionTransformer(nn.Module):
 class Step3VLForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsEncoderCudaGraph
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
-
     supports_encoder_tp_data = True
 
     @classmethod
@@ -985,4 +977,3 @@ class Step3VLForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-

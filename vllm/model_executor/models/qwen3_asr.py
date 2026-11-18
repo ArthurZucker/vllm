@@ -58,7 +58,6 @@ from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -409,21 +408,6 @@ class Qwen3ASRForConditionalGeneration(
     supported_languages = ISO639_1_SUPPORTED_LANGS
     supports_tower_connector_lora = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "thinker.lm_head.": "language_model.lm_head.",
-            "thinker.model.": "language_model.model.",
-            "thinker.": "",
-            # HF format mapper
-            "model.audio_tower.": "audio_tower.",
-            "model.language_model.": "language_model.model.",
-            "model.multi_modal_projector.linear_1.": "audio_tower.proj1.",
-            "model.multi_modal_projector.linear_2.": "audio_tower.proj2.",
-            "talker.": None,
-            "code2wav.": None,
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
@@ -586,7 +570,6 @@ class Qwen3ASRForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mrope_input_positions(
         self,

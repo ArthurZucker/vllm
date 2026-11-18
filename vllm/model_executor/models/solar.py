@@ -24,7 +24,6 @@
 # limitations under the License.
 """Inference-only Solar model compatible with HuggingFace weights."""
 
-
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
@@ -52,7 +51,6 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -345,16 +343,6 @@ class SolarModel(nn.Module):
 
 
 class SolarForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -417,4 +405,3 @@ class SolarForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

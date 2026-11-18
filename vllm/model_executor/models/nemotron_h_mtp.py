@@ -20,7 +20,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     get_draft_quant_config,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
@@ -325,8 +324,6 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
     has_own_embed_tokens = False
     has_own_lm_head = False
 
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"language_model.": ""})
-
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -414,4 +411,3 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
         drafter."""
         name = name.removeprefix("language_model.")
         return not name.startswith("mtp.")
-

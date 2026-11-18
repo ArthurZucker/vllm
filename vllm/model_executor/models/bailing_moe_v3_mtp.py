@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Bailing MoE v3 MTP model."""
 
-
 import torch
 import torch.nn as nn
 from transformers.configuration_utils import PreTrainedConfig
@@ -21,7 +20,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.bailing_moe_v3 import (
-    BailingMoeV3ForCausalLM,
     BailingMoeV3MLAAttention,
     BailingMoeV3MoE,
     _configure_ling_fp8_quant_config,
@@ -209,8 +207,6 @@ class BailingMoeV3MultiTokenPredictor(nn.Module):
     }
 )
 class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
-    hf_to_vllm_mapper = BailingMoeV3ForCausalLM.hf_to_vllm_mapper
-
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -292,4 +288,3 @@ class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
         )
-

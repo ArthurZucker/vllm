@@ -12,7 +12,6 @@ import copy
 from math import lcm
 from typing import TypeGuard
 
-import regex as re
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -97,7 +96,6 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from .interfaces import HasInnerState, IsHybrid, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     make_layers,
     maybe_prefix,
 )
@@ -266,16 +264,6 @@ def _configure_ling_fp8_quant_config(
         )
 
     quant_config.store_dtype = "mxfp4"
-
-
-_LING_MXFP4_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_regex={
-        re.compile(
-            r"(\.mlp\.experts\.\d+\."
-            r"(?:gate_proj|up_proj|down_proj)\.weight_scale)_inv$"
-        ): r"\1"
-    }
-)
 
 
 def _is_fp8_module_excluded(
@@ -1361,11 +1349,6 @@ class BailingMoeV3Model(nn.Module):
 
 
 class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".attention.": ".self_attn."},
-        orig_to_new_prefix={"attention.": "self_attn."},
-    )
-
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],

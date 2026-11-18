@@ -46,7 +46,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -378,17 +377,6 @@ class JambaForCausalLM(
     SupportsPP,
     IsHybrid,
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".self_attn.": ".", ".A_log": ".A"},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".feed_forward.gate_proj": (".feed_forward.gate_up_proj", 0),
-            ".feed_forward.up_proj": (".feed_forward.gate_up_proj", 1),
-        },
-    )
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -490,7 +478,6 @@ class JambaForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
 
 class JambaForSequenceClassification(JambaForCausalLM):

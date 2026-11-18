@@ -85,7 +85,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
@@ -752,17 +751,6 @@ class Molmo2VisionBackbone(nn.Module, SupportsQuant):
 
     # Runs after the top-level mapper, so image_pooling_2d/image_projector
     # source names are already renamed to q/k/v_proj and gate/up_proj.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            "wq": ("merged_qkv", "q"),
-            "wk": ("merged_qkv", "k"),
-            "wv": ("merged_qkv", "v"),
-            "k_proj": ("merged_kv", 0),
-            "v_proj": ("merged_kv", 1),
-            "gate_proj": ("merged_linear", 0),
-            "up_proj": ("merged_linear", 1),
-        },
-    )
 
     def __init__(
         self,
@@ -865,7 +853,6 @@ class Molmo2VisionBackbone(nn.Module, SupportsQuant):
         return pooled_features.view(-1, pooled_features.shape[-1])[
             valid_token.flatten()
         ]
-
 
 
 class Molmo2Attention(nn.Module):
@@ -1233,7 +1220,6 @@ class Molmo2TextModel(nn.Module, SupportsQuant):
         else:
             hidden_states = self.norm(hidden_states)
         return hidden_states
-
 
 
 def get_patches_grid_size(
@@ -2311,35 +2297,6 @@ class Molmo2MultiModalProcessor(BaseMultiModalProcessor[Molmo2ProcessingInfo]):
 class Molmo2ForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA, SupportsQuant
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # vision backbone mapping
-            "image_pooling_2d.wq": "image_pooling_2d.q_proj",
-            "image_pooling_2d.wk": "image_pooling_2d.k_proj",
-            "image_pooling_2d.wv": "image_pooling_2d.v_proj",
-            "image_pooling_2d.wo": "image_pooling_2d.o_proj",
-            "image_projector.w1": "image_projector.gate_proj",
-            "image_projector.w3": "image_projector.up_proj",
-            "image_projector.w2": "image_projector.down_proj",
-            # language backbone mapping
-            "att_proj": "qkv_proj",
-            "attn_out": "o_proj",
-            "q_norm": "q_norm",
-            "k_norm": "k_norm",
-            "ff_proj": "up_gate_proj",
-            "ff_out": "down_proj",
-            "attn_norm": "input_layernorm",
-            "ff_norm": "post_attention_layernorm",
-        },
-        orig_to_new_prefix={
-            # vision backbone mapping
-            "model.vision_backbone.": "vision_backbone.",
-            # language backbone mapping
-            "model.transformer.blocks.": "model.layers.",
-            "model.transformer.ln_f.": "model.norm.",
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["qkv_proj"],
         "up_gate_proj": ["up_gate_proj"],  # language model
@@ -2642,7 +2599,6 @@ class Molmo2ForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

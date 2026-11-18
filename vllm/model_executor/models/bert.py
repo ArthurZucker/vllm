@@ -47,7 +47,7 @@ from vllm.v1.pool.metadata import PoolingMetadata
 
 from .interfaces import SupportsCrossEncoding, SupportsLoRA, SupportsQuant
 from .interfaces_base import attn_type, default_pooling_type
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class BertEmbedding(nn.Module):
@@ -379,21 +379,6 @@ class BertModel(nn.Module, SupportsQuant):
 
     packed_modules_mapping = {"qkv_proj": ["query", "key", "value"]}
 
-    hf_to_vllm_mapper = WeightsMapper(
-        # Original google-bert checkpoints use the legacy `gamma`/`beta`
-        # LayerNorm names; rename to vLLM's `weight`/`bias`.
-        orig_to_new_substr={
-            "LayerNorm.gamma": "LayerNorm.weight",
-            "LayerNorm.beta": "LayerNorm.bias",
-        },
-        orig_to_new_stacked={
-            ".self.query": (".self.qkv_proj", "q"),
-            ".self.key": (".self.qkv_proj", "k"),
-            ".self.value": (".self.qkv_proj", "v"),
-        },
-        orig_to_new_prefix={"pooler.": None},
-    )
-
     def __init__(
         self,
         *,
@@ -432,7 +417,6 @@ class BertModel(nn.Module, SupportsQuant):
         return self.encoder(hidden_states)
 
 
-
 class BertPoolingModel(BertModel):
     is_pooling_model = True
 
@@ -455,7 +439,6 @@ class BertPoolingModel(BertModel):
         self.pooler = BertPooler(vllm_config.model_config)
 
 
-
 @default_pooling_type(seq_pooling_type="CLS")
 class BertEmbeddingModel(nn.Module, SupportsQuant, SupportsLoRA):
     """A model that uses Bert to provide embedding functionalities.
@@ -475,14 +458,6 @@ class BertEmbeddingModel(nn.Module, SupportsQuant, SupportsLoRA):
     packed_modules_mapping = {"qkv_proj": ["query", "key", "value"]}
     # PEFT adapters name modules relative to the HF backbone (optionally under
     # `bert.`/`roberta.`), while vLLM nests the backbone under `model.`.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "bert.": "model.",
-            "roberta.": "model.",
-            "encoder.": "model.encoder.",
-            "embeddings.": "model.embeddings.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -512,7 +487,6 @@ class BertEmbeddingModel(nn.Module, SupportsQuant, SupportsLoRA):
             inputs_embeds=inputs_embeds,
             intermediate_tensors=intermediate_tensors,
         )
-
 
     def _build_model(self, vllm_config: VllmConfig, prefix: str = "") -> BertModel:
         return BertModel(
@@ -733,7 +707,6 @@ class BertSpladeSparseEmbeddingModel(BertEmbeddingModel):
         )
 
 
-
 @default_pooling_type(seq_pooling_type="CLS")
 class BertForSequenceClassification(
     nn.Module, SupportsCrossEncoding, SupportsQuant, SupportsLoRA
@@ -783,7 +756,6 @@ class BertForSequenceClassification(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embed_input_ids(input_ids)
-
 
     def forward(
         self,
@@ -840,7 +812,6 @@ class BertForTokenClassification(nn.Module, SupportsLoRA):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embed_input_ids(input_ids)
 
-
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -882,23 +853,6 @@ class BertForMaskedLM(nn.Module):
     # submodule. Order matters: the ``None`` (drop) rules and the more specific
     # names are listed before the broader ``cls.predictions.decoder`` rule so
     # that substring replacement doesn't rewrite them first.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # Next-sentence-prediction head: not part of masked LM.
-            "cls.seq_relationship": None,
-            # Some checkpoints ship an explicit (tied) decoder bias; we load the
-            # canonical ``cls.predictions.bias`` instead, so drop the duplicate.
-            "cls.predictions.decoder.bias": None,
-            # Legacy LayerNorm affine names in the MLM head transform.
-            "cls.predictions.transform.LayerNorm.gamma": "mlm_head.layer_norm.weight",
-            "cls.predictions.transform.LayerNorm.beta": "mlm_head.layer_norm.bias",
-            "cls.predictions.transform.LayerNorm": "mlm_head.layer_norm",
-            "cls.predictions.transform.dense": "mlm_head.dense",
-            "cls.predictions.decoder": "mlm_head.decoder",
-            # In HF ``cls.predictions.bias`` *is* the decoder bias.
-            "cls.predictions.bias": "mlm_head.decoder.bias",
-        }
-    )
 
     embedding_class: type[nn.Module] = BertEmbedding
 
@@ -923,7 +877,6 @@ class BertForMaskedLM(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embed_input_ids(input_ids)
-
 
     def forward(
         self,

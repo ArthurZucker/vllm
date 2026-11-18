@@ -65,7 +65,6 @@ from .interfaces import (
 )
 from .qwen3 import Qwen3Model
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -621,14 +620,6 @@ class FunASRAudioInputs(TensorSchema):
 
 
 class FunASREncoder(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv", "v"),
-        }
-    )
-
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", init_in_fp32: bool = False
     ):
@@ -646,7 +637,6 @@ class FunASREncoder(nn.Module):
             freeze=True,
             prefix=maybe_prefix(prefix, "audio_encoder"),
         )
-
 
 
 class FunASRModel(nn.Module):
@@ -830,19 +820,6 @@ class FunASRMultiModalProcessor(BaseMultiModalProcessor[FunASRProcessingInfo]):
 class FunASRForConditionalGeneration(
     nn.Module, SupportsTranscription, SupportsMultiModal
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "linear_q.": "q_proj.",
-            "linear_k.": "k_proj.",
-            "linear_v.": "v_proj.",
-            "linear_out.": "out_proj.",
-            "audio_adaptor.": "model.encoder.audio_adaptor.",
-            "audio_encoder.": "model.encoder.audio_encoder.",
-            "llm.model.": "model.decoder.",
-            "llm.lm_head": "lm_head",
-        }
-    )
-
     supports_transcription_only = True
     supports_segment_timestamp = True
     supported_languages = ISO639_1_SUPPORTED_LANGS
@@ -997,4 +974,3 @@ class FunASRForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

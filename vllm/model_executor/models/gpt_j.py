@@ -21,7 +21,6 @@
 
 from itertools import islice
 
-import regex as re
 import torch
 from torch import nn
 from transformers import GPTJConfig
@@ -48,7 +47,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsPP
 from .utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -238,28 +236,6 @@ class GPTJModel(nn.Module):
 
 
 class GPTJForCausalLM(nn.Module, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        # Checkpoints store attention quantization scales on the HF attention
-        # module (`attn`), but vLLM's Attention layer is its `attn` child. The
-        # default cache scale rule skips names already ending in
-        # `.attn.k_scale`, so map them here.
-        orig_to_new_regex={
-            re.compile(r"(?<!\.attn)\.attn\.([qkv]_(?:scale|zero_point))$"): (
-                r".attn.attn.\1"
-            ),
-        },
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        },
-        orig_to_new_substr={
-            "attn.bias": None,
-            "attn.masked_bias": None,
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -303,4 +279,3 @@ class GPTJForCausalLM(nn.Module, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states, self.lm_head.bias)
         return logits
-

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next MTP model."""
 
-
 import torch
 from torch import nn
 from transformers import Qwen3NextConfig
@@ -19,7 +18,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextDecoderLayer,
-    Qwen3NextModel,
     Qwen3NextRMSNorm,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
@@ -50,8 +48,6 @@ def should_torch_compile_mtp_drafter(vllm_config: VllmConfig) -> bool:
 
 @support_torch_compile(enable_if=should_torch_compile_mtp_drafter)
 class Qwen3NextMultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = Qwen3NextModel.hf_to_vllm_mapper
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -157,7 +153,6 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         return hidden_states
 
 
-
 @support_torch_compile(enable_if=should_torch_compile_mtp_drafter)
 class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
     packed_modules_mapping = {
@@ -221,4 +216,3 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
         return not name.startswith("mtp.") and not any(
             key in name for key in ["embed_tokens", "lm_head"]
         )
-

@@ -41,7 +41,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -64,17 +63,6 @@ else:
 
 @support_torch_compile
 class LlamaModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.": ""},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
-
     def __init__(
         self,
         *,
@@ -139,7 +127,6 @@ class LlamaModel(nn.Module):
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states, hidden_states
-
 
     def validate_and_update_config(
         self, start_layer_id: int, quant_config: QuantizationConfig | None = None
@@ -225,4 +212,3 @@ class EagleLlama4ForCausalLM(_EagleLlama4ForCausalLMBase, SupportsMultiModalEmbe
         inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
-

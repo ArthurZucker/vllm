@@ -40,7 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 
 from .qwen3 import Qwen3ForCausalLM, Qwen3Model, use_qwen2_attention
-from .utils import PPMissingLayer, WeightsMapper, maybe_prefix
+from .utils import PPMissingLayer, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -89,7 +89,6 @@ class MiMoModel(Qwen3Model):
 
 class MiMoForCausalLM(Qwen3ForCausalLM, nn.Module):
     # MTP layers are loaded by the draft model, not the main model.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.mtp_layers.": None})
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -122,7 +121,6 @@ class MiMoForCausalLM(Qwen3ForCausalLM, nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-
 
     def compute_logits(
         self,

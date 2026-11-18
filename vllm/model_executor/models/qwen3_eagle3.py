@@ -20,7 +20,6 @@ from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM
 from vllm.multimodal.inputs import NestedTensors
 
 from .utils import (
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -137,17 +136,6 @@ class Qwen3Eagle3DecoderLayer(Qwen3DecoderLayer):
     }
 )
 class Qwen3Eagle3Model(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={"midlayer.": "layers.0."},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
-
     def __init__(
         self,
         *,
@@ -275,7 +263,6 @@ class Qwen3Eagle3Model(nn.Module):
         return hidden_states, aux_output
 
 
-
 class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -379,4 +366,3 @@ class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
             )
 
         return self.model.fc(hidden_states)
-

@@ -31,7 +31,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .longcat_flash import FlashModel
-from .utils import PPMissingLayer, WeightsMapper, maybe_prefix
+from .utils import PPMissingLayer, maybe_prefix
 
 
 def uses_ngram_embedding(config: LongcatFlashConfig) -> bool:
@@ -178,12 +178,10 @@ class FlashNgramModel(FlashModel):
             self.ngram_embeddings = None
 
 
-
 class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     """LongCat-Flash-Lite for causal LM (n-gram embedding)."""
 
     # MTP weights are not part of this model.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.mtp.": None})
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -235,7 +233,6 @@ class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def get_expert_mapping(self):
         return self.model.get_expert_mapping()
-
 
 
 class LongcatNgramModelState(DefaultModelState):

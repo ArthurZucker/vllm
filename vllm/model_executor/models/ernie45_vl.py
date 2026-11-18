@@ -87,7 +87,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    WeightsMapper,
     maybe_prefix,
     scatter_output_slices,
 )
@@ -585,7 +584,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
         return final_output
 
 
-
 # === Vision Inputs === #
 
 
@@ -849,7 +847,6 @@ class VariableResolutionResamplerModel(nn.Module):
             x = fwd_temporal(x)
         x = fwd_mlp(x)
         return x
-
 
 
 class Ernie4_5_VLProcessingInfo(BaseProcessingInfo):
@@ -1393,24 +1390,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(
     }
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-            # model.resampler_model.-> language_model.model.resampler_model.
-            # language_model.model.resampler_model. -> resampler_model.
-            "language_model.model.resampler_model.": "resampler_model.",
-        },
-        # resampler_weight_mappings
-        orig_to_new_substr={
-            "spatial_linear.0.": "spatial_linear1.",
-            "spatial_linear.2.": "spatial_linear2.",
-            "spatial_linear.3.": "spatial_norm.",
-            "temporal_linear.0.": "temporal_linear1.",
-            "temporal_linear.2.": "temporal_linear2.",
-            "temporal_linear.3.": "temporal_norm.",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1919,4 +1898,3 @@ class Ernie4_5_VLMoeForConditionalGeneration(
         )
 
         return hidden_states
-

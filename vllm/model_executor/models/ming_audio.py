@@ -19,7 +19,6 @@
 # limitations under the License.
 """Reusable Ming audio tower and checkpoint-compatible projector."""
 
-
 import torch
 from torch import nn
 from transformers import WhisperConfig
@@ -27,7 +26,6 @@ from transformers import WhisperConfig
 from vllm.config import VllmConfig
 from vllm.transformers_utils.configs.ming_v3_asr import MingAudioConfig
 
-from .utils import WeightsMapper
 from .whisper import WhisperEncoder
 
 
@@ -70,27 +68,6 @@ def get_audio_token_count(
 
 
 class MingAudioEncoder(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "blocks.": "layers.",
-            ".attn.query.": ".self_attn.q_proj.",
-            ".attn.key.": ".self_attn.k_proj.",
-            ".attn.value.": ".self_attn.v_proj.",
-            ".attn.out.": ".self_attn.out_proj.",
-            ".attn_ln.": ".self_attn_layer_norm.",
-            ".mlp_ln.": ".final_layer_norm.",
-            ".mlp.0.": ".mlp.fc1.",
-            ".mlp.2.": ".mlp.fc2.",
-            "ln_post.": "layer_norm.",
-        },
-        orig_to_new_suffix={"positional_embedding": "embed_positions.weight"},
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-        },
-    )
-
     def __init__(
         self, *, vllm_config: VllmConfig, config: MingAudioConfig, prefix: str
     ) -> None:
@@ -114,7 +91,6 @@ class MingAudioEncoder(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.encoder([features.transpose(0, 1)])[0]
-
 
 
 class Transpose(nn.Module):

@@ -52,7 +52,6 @@ from vllm.model_executor.models.qwen3_next import (
     _should_replicate_misaligned_shared_expert,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     extract_layer_index,
     get_fused_shared_expert_layers,
     make_layers,
@@ -427,24 +426,6 @@ class AliceAIDecoderBlock(nn.Module):
 
 @support_torch_compile
 class AliceAIModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".linear_attn.a_log_bias": ".linear_attn.A_log",
-        },
-        orig_to_new_stacked={
-            ".linear_attn.q_proj": (".linear_attn.in_proj_qkvgfab", 0),
-            ".linear_attn.k_proj": (".linear_attn.in_proj_qkvgfab", 1),
-            ".linear_attn.v_proj": (".linear_attn.in_proj_qkvgfab", 2),
-            ".linear_attn.b_proj": (".linear_attn.in_proj_qkvgfab", 3),
-            ".linear_attn.f_a_proj": (".linear_attn.in_proj_qkvgfab", 4),
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-            ".shared_expert.gate_proj": (".shared_expert.gate_up_proj", 0),
-            ".shared_expert.up_proj": (".shared_expert.gate_up_proj", 1),
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -540,8 +521,6 @@ class AliceAIModel(nn.Module):
 class AliceAIForCausalLM(
     nn.Module, HasInnerState, IsHybrid, SupportsLoRA, MixtureOfExperts
 ):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"mtp.": None})
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],

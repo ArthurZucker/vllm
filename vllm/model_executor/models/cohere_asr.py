@@ -71,7 +71,7 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsTranscription,
 )
-from .utils import WeightsMapper, make_layers, maybe_prefix
+from .utils import make_layers, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -1810,7 +1810,6 @@ class CohereASRModel(nn.Module):
             raise NotImplementedError("List input_features not supported")
 
 
-
 class CohereASRProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> PreTrainedConfig:
         return self.ctx.get_hf_config()
@@ -1999,18 +1998,6 @@ class CohereAsrForConditionalGeneration(
         ],
         "encoder_attn.kv_proj": ["encoder_attn.k_proj", "encoder_attn.v_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".fc1.": ".mlp.fc1.",
-            ".fc2.": ".mlp.fc2.",
-            "model.conv.batch_norm.num_batches_tracked": None,
-        },
-        orig_to_new_prefix={
-            "model.preprocessor.featurizer.fb": None,
-            "model.preprocessor.featurizer.window": None,
-        },
-    )
 
     supports_transcription_only = True
     supported_languages = ISO639_1_SUPPORTED_LANGS
@@ -2257,4 +2244,3 @@ class CohereAsrForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.proj_out, hidden_states, self.proj_out.bias)
         return logits
-

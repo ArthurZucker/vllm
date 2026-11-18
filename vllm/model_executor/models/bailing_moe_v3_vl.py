@@ -69,7 +69,6 @@ from .qwen2_vl import (
 )
 from .qwen3_vl import Qwen3_VisionTransformer
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -541,18 +540,6 @@ class BailingMoeV3VLForConditionalGeneration(
         "qkv": ["qkv"],
     }
 
-    hf_to_vllm_mapper = BailingMoeV3ForCausalLM.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={
-            # Match module names as well as parameter names for quantization.
-            "model.visual": "visual",
-            "model.linear_proj": "linear_proj",
-            "linear_proj.0": "linear_proj.linear_fc1",
-            "linear_proj.2": "linear_proj.linear_fc2",
-            "lm_head": "language_model.lm_head",
-            "model.": "language_model.model.",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -758,7 +745,6 @@ class BailingMoeV3VLForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

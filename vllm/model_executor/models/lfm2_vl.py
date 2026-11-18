@@ -61,7 +61,6 @@ from .interfaces import (
 )
 from .lfm2_siglip2 import Siglip2Model
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -611,15 +610,6 @@ class Lfm2VLForConditionalGeneration(
 ):
     supports_tower_connector_lora = True
     merge_by_field_config = True
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1252,7 +1242,6 @@ class Lfm2VLForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

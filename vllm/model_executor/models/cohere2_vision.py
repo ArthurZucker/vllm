@@ -53,7 +53,6 @@ from .interfaces import (
 )
 from .siglip import SiglipVisionModel
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -313,14 +312,6 @@ class Cohere2VisionMultiModalProcessor(
 class Cohere2VisionForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "model.language_model.": "language_model.model.",
-        }
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -361,7 +352,6 @@ class Cohere2VisionForConditionalGeneration(
     @property
     def dtype(self):
         return next(self.parameters()).dtype
-
 
     def _process_image_input(
         self, image_input: Cohere2VisionImagePixelInputs, **kwargs: object

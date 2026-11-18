@@ -62,7 +62,6 @@ from vllm.sequence import IntermediateTensors
 from .granite import granite_layer_attn_params
 from .interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -300,23 +299,6 @@ class GraniteMoeDecoderLayer(nn.Module):
 
 @support_torch_compile
 class GraniteMoeModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper: WeightsMapper = WeightsMapper(
-        orig_to_new_suffix={
-            # Legacy names to new names
-            "moe.input_linear.weight": "moe.experts.gate_up_proj",
-            "moe.output_linear.weight": "moe.experts.down_proj",
-            ".router.layer.weight": ".gate.weight",
-            # Checkpoint name to vLLM name
-            ".router.weight": ".gate.weight",
-        },
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -380,7 +362,6 @@ class GraniteMoeModel(nn.Module, EagleModelMixin):
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
-
 
 
 class GraniteMoeForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
@@ -454,4 +435,3 @@ class GraniteMoeForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3)
                 ),
             }
         )
-

@@ -46,7 +46,6 @@ from .interfaces import (
 )
 from .interfaces_base import VllmModelForPooling
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -94,9 +93,6 @@ class NemotronVLProcessingInfo(BaseInternVLProcessingInfo):
 class LlamaNemotronVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
     # Ignore registered buffers, see
     # https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/input_conditioner.py#L28
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={"norm_mean": None, "norm_std": None}
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -385,7 +381,6 @@ class LlamaNemotronVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, Suppor
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
         return MultiModelKeys.from_string_field(
@@ -478,18 +473,6 @@ class LlamaNemotronVLForEmbedding(LlamaNemotronVLChatModel, VllmModelForPooling)
 
     # Weight mapping from checkpoint format to vLLM format
     # Different from parent class due to different vision model structure
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # Language model mapping
-            "language_model.layers.": "language_model.model.layers.",
-            "language_model.embed_tokens.": "language_model.model.embed_tokens.",
-            "language_model.norm.": "language_model.model.norm.",
-            # Vision model mapping (SiglipVisionModel has nested vision_model)
-            "vision_model.encoder.": "vision_model.vision_model.encoder.",
-            "vision_model.embeddings.": "vision_model.vision_model.embeddings.",
-            "vision_model.post_layernorm.": "vision_model.vision_model.post_layernorm.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -554,7 +537,6 @@ class LlamaNemotronVLForEmbedding(LlamaNemotronVLChatModel, VllmModelForPooling)
         return self.vision_model(pixel_values)
 
 
-
 class LlamaNemotronVLForSequenceClassification(
     LlamaNemotronVLForEmbedding, SupportsCrossEncoding
 ):
@@ -562,9 +544,6 @@ class LlamaNemotronVLForSequenceClassification(
 
     # Reranker checkpoint places base model weights under `model.*`,
     # while `score.*` remains at the top level.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.": ""}) | (
-        LlamaNemotronVLForEmbedding.hf_to_vllm_mapper
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -586,4 +565,3 @@ class LlamaNemotronVLForSequenceClassification(
         pooler_config = model_config.pooler_config
         assert pooler_config is not None
         self.pooler = DispatchPooler.for_seq_cls(pooler_config, classifier=self.score)
-

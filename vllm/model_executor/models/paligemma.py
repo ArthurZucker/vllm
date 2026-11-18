@@ -46,7 +46,6 @@ from .interfaces import (
 from .module_mapping import MultiModelKeys
 from .siglip import SiglipVisionModel
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -245,16 +244,6 @@ class PaliGemmaForConditionalGeneration(
         ],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
-
     supports_tower_connector_lora = True
 
     @classmethod
@@ -383,7 +372,6 @@ class PaliGemmaForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

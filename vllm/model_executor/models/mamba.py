@@ -34,7 +34,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.sequence import IntermediateTensors
 
 from .utils import (
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -171,8 +170,6 @@ class MambaModel(nn.Module):
 class MambaForCausalLM(
     nn.Module, HasInnerState, IsAttentionFree, SupportsPP, SupportsMambaPrefixCaching
 ):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_substr={".A_log": ".A"})
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
 
@@ -256,4 +253,3 @@ class MambaForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

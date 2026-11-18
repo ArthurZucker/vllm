@@ -54,7 +54,6 @@ from vllm.multimodal.processing.processor import PromptUpdateDetails
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -259,17 +258,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
       * `load_weights` — ignore-prefix list excludes the absent towers.
       * `get_mm_mapping` — no tower entries.
     """
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.embed_audio.": "embed_audio.",
-            "model.embed_vision.": "embed_vision.",
-            "model.language_model.": "language_model.model.",
-            "model.vision_embedder.": "vision_embedder.",
-            "lm_head.": "language_model.lm_head.",
-            "model": "language_model.model",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # LightOnOCR-style rebuild: do NOT call super().__init__ — that
@@ -537,7 +525,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     # ------------------------------------------------------------------ #
     # Weight loading
     # ------------------------------------------------------------------ #
-
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping

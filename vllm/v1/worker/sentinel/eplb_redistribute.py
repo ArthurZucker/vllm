@@ -163,7 +163,10 @@ def reload_experts_from_disk(
     if not reload_set:
         return
 
+    from transformers.core_model_loading import rename_source_key
+
     from vllm.model_executor.model_loader import get_model_loader
+    from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
     from vllm.model_executor.model_loader.reload import (
         finalize_layerwise_reload,
         initialize_layerwise_reload,
@@ -171,16 +174,15 @@ def reload_experts_from_disk(
     from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 
     moe_layers = list(model.moe_layers)
-    prefix_renames = getattr(
-        getattr(model, "hf_to_vllm_mapper", None), "orig_to_new_prefix", {}
+    mapper = rename_mapper(model)
+    # the checkpoint's name of a vLLM module: the model's renamings, reversed
+    reverse = (
+        [r.reverse_transform() for r in mapper.orig_to_new_renaming] if mapper else []
     )
 
     def ckpt_prefix(layer_idx: int) -> str:
         prefix = moe_layers[layer_idx].layer_name + "."
-        for orig, new in prefix_renames.items():
-            if new and prefix.startswith(new):
-                return orig + prefix[len(new) :]
-        return prefix
+        return rename_source_key(prefix, reverse[::-1], [], reverse=True)[0]
 
     # Runtime-format expert reload: processing can merge scales or repack weights.
     # Reload every expert in an affected layer so finalization never consumes
@@ -248,7 +250,10 @@ def reload_experts_from_disk(
 
     logger.info("[FT] Reloading %d (layer, expert) pair(s) from disk.", len(reload_set))
 
-    from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
+    from vllm.model_executor.model_loader.ops_loader import (
+        load_weights as load_model_weights,
+    )
+
     loaded = load_model_weights(model, filtered_iter())
 
     unmatched = set(layer_indices) - matched

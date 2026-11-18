@@ -29,7 +29,6 @@ from vllm.model_executor.models.qwen3_dspark import (
     Qwen3DSparkForCausalLM,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -449,17 +448,6 @@ class MuseSparkDSparkForCausalLM(Qwen3DSparkForCausalLM):
 
     has_own_lm_head = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj.": (".self_attn.qkv_proj.", "q"),
-            ".self_attn.k_proj.": (".self_attn.qkv_proj.", "k"),
-            ".self_attn.v_proj.": (".self_attn.qkv_proj.", "v"),
-            ".self_attn.o_gate_proj.": (".self_attn.qkv_proj.", "o_gate"),
-            ".feed_forward.gate_proj.": (".feed_forward.gate_up_proj.", 0),
-            ".feed_forward.up_proj.": (".feed_forward.gate_up_proj.", 1),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
         assert vllm_config.speculative_config is not None
@@ -638,7 +626,6 @@ class MuseSparkDSparkForCausalLM(Qwen3DSparkForCausalLM):
             # Each rank holds its block of output columns for every token.
             out = gather_columns(out.view(-1, out.shape[-1])).view(*out.shape[:-1], -1)
         return out
-
 
     def process_weights_after_loading(self) -> None:
         if self.model.specialized_draft is not None or self._markov_sampler is not None:

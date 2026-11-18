@@ -74,7 +74,6 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -423,20 +422,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Qwen3MoeModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_expert.gate_proj": (".shared_expert.gate_up_proj", 0),
-            ".shared_expert.up_proj": (".shared_expert.gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         *,
@@ -516,7 +501,6 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-
 class Qwen3MoeForCausalLM(
     nn.Module,
     SupportsPP,
@@ -526,7 +510,6 @@ class Qwen3MoeForCausalLM(
     MixtureOfExperts,
     SupportsQuant,
 ):
-    hf_to_vllm_mapper = Qwen3MoeModel.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -630,4 +613,3 @@ class Qwen3MoeForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

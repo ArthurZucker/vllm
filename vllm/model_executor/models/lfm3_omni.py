@@ -390,11 +390,6 @@ class Lfm3OmniMultiModalProcessor(Qwen3VLMultiModalProcessor):
     dummy_inputs=Lfm3OmniDummyInputsBuilder,
 )
 class Lfm3OmniForConditionalGeneration(Lfm3VlForConditionalGeneration):
-    hf_to_vllm_mapper = (
-        Lfm3VlForConditionalGeneration.hf_to_vllm_mapper
-        | Lfm3AudioForConditionalGeneration.hf_to_vllm_mapper
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):

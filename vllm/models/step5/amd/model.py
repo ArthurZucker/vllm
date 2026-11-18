@@ -36,7 +36,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -650,14 +649,6 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".share_expert.": ".moe.share_expert.",
-            ".self_attn.sparse_indexer_": ".self_attn.indexer.sparse_indexer_",
-            ".self_attn.ssmax_s": None,
-        },
-        orig_to_new_prefix={"vision_model.": None, "vit_large_projector.": None},
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

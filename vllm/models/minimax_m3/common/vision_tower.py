@@ -25,7 +25,6 @@ from vllm.model_executor.layers.rotary_embedding.mrope_vit_setup import (
     VitMropeSetup,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import (
@@ -610,14 +609,6 @@ class MiniMaxVLPatchMerger(nn.Module):
 
 
 class MiniMaxVLVisionModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj.": (".qkv_proj.", "q"),
-            ".k_proj.": (".qkv_proj.", "k"),
-            ".v_proj.": (".qkv_proj.", "v"),
-        }
-    )
-
     """Full vision model: ViT → projector → patch merger."""
 
     def __init__(
@@ -687,4 +678,3 @@ class MiniMaxVLVisionModel(nn.Module):
         hidden = self.multi_modal_projector(hidden)
         hidden = self.patch_merge_mlp(hidden)
         return hidden
-

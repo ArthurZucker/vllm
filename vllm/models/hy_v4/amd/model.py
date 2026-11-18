@@ -47,7 +47,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     copy_pp_buffers,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -445,7 +444,6 @@ class HYV4Model(nn.Module):
 
         return loaded_local_expert
 
-
     @torch.no_grad()
     def process_weights_after_loading(self) -> None:
         """Make static iHC weights contiguous for the ROCm Triton kernels."""
@@ -457,16 +455,6 @@ class HYV4Model(nn.Module):
 
 
 class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_a_proj": (".fused_qkv_a_proj", 0),
-            ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        }
-    )
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         # MLA runs both latent down-projections as one GEMM.
@@ -534,7 +522,6 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             logits = soft_cap * torch.nn.functional.tanh(logits / soft_cap)
 
         return logits
-
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

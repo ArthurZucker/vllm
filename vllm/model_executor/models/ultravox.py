@@ -56,7 +56,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    WeightsMapper,
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
@@ -378,14 +377,6 @@ def _build_chunk_attn_metadata(
 # Maps HF whisper encoder layer names to vLLM's fused qkv_proj and nested
 # mlp; `_create_fake_bias_for_k_proj` supplies the fused bias' k-slice
 # (HF whisper k_proj has no bias).
-_WHISPER_ENCODER_MAPPER = WeightsMapper(
-    orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."},
-    orig_to_new_stacked={
-        ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-        ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-        ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-    },
-)
 
 
 class UltravoxFeedForwardProjector(nn.Module):
@@ -607,16 +598,6 @@ class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "audio_tower.model.encoder.": "audio_tower.",
-            # A whisper checkpoint loaded via `audio_model_id` also carries
-            # decoder and LM-head weights the tower does not use.
-            "audio_tower.model.": None,
-            "audio_tower.proj_out.": None,
-        }
-    )
 
     supports_tower_connector_lora = True
 
