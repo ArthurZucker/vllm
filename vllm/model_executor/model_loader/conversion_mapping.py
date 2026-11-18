@@ -1495,10 +1495,17 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("head.probe"),
         drop("packing_position_embedding"),
     ],
-    "SnowflakeGteNewModel": [
+    # Snowflake's GTE inherits it
+    "GteNewModel": [
+        rename("new.", ""),
         rename("layer", "layers"),
         rename("attention.qkv_proj", "attn.qkv_proj"),
         rename("attention.o_proj", "attn.out_proj"),
+        drop("^classifier"),
+        # stored [up, gate], the param is [gate, up]
+        WeightConverter(
+            ".mlp.up_gate_proj", ".mlp.gate_up_proj", operations=[SwapHalves()]
+        ),
     ],
     "Step3p5ForCausalLM": [
         rename(".share_expert.", ".moe.share_expert."),
@@ -1607,19 +1614,6 @@ _CONVERSION_MAPPING["Exaone4_5_ForConditionalGeneration"] = _CONVERSION_MAPPING[
 ]
 _CONVERSION_MAPPING["GLM4VModel"] = _CONVERSION_MAPPING["GLM4VForCausalLM"]
 _CONVERSION_MAPPING["GraniteMoeSharedModel"] = _CONVERSION_MAPPING["GraniteMoeModel"]
-_CONVERSION_MAPPING["GteNewModel"] = (
-    [
-        rename("new.", ""),
-    ]
-    + _CONVERSION_MAPPING["SnowflakeGteNewModel"]
-    + [
-        drop("^classifier"),
-        # stored [up, gate], the param is [gate, up]
-        WeightConverter(
-            ".mlp.up_gate_proj", ".mlp.gate_up_proj", operations=[SwapHalves()]
-        ),
-    ]
-)
 _CONVERSION_MAPPING["InternS1ProForConditionalGeneration"] = _CONVERSION_MAPPING[
     "CohereCompassForConditionalGeneration"
 ]
@@ -1888,9 +1882,16 @@ def _layer_experts(model: nn.Module) -> list[WeightTransform]:
 
 
 def _entry_name(cls: type) -> str | None:
-    """The class's entry, or the one it inherits (as it inherited its mapper)"""
+    """The class's entry, or the one it inherits (as it inherited its mapper). vLLM's
+    classes only: a Transformers module inside a vLLM model (Lfm3 audio's `Lfm2Model`)
+    keeps its checkpoint names"""
     return next(
-        (c.__name__ for c in cls.__mro__ if c.__name__ in _CONVERSION_MAPPING), None
+        (
+            c.__name__
+            for c in cls.__mro__
+            if c.__name__ in _CONVERSION_MAPPING and c.__module__.startswith("vllm.")
+        ),
+        None,
     )
 
 

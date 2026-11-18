@@ -16,6 +16,8 @@ This module provides:
 Reference: https://arxiv.org/abs/2004.12832
 """
 
+import re
+
 import torch
 from torch import nn
 
@@ -29,15 +31,32 @@ from .interfaces_base import default_pooling_type
 from .lfm2 import Lfm2ForCausalLM, Lfm2Model
 
 
+def _checkpoint_colbert_dim() -> int | None:
+    """The projection's size, when only its checkpoint tensor has it"""
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.model_executor.model_loader.conversion_mapping import COLBERT_LINEAR
+    from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return None
+    model = config.model_config
+    pattern = COLBERT_LINEAR._original_source_patterns[0]
+    metadata = get_safetensors_params_metadata(model.model, revision=model.revision)
+    shapes = [
+        info["shape"] for name, info in metadata.items() if re.match(pattern, name)
+    ]
+    return shapes[0][0] if shapes else None
+
+
 class ColBERTMixin(nn.Module, SupportsLateInteraction):
     """Mixin that adds ColBERT late interaction support to any embedding model.
 
     ColBERT (Contextualized Late Interaction over BERT) uses per-token
     embeddings with a linear projection layer.  This mixin provides:
 
-    - ColBERT linear projection initialisation / lazy creation
-    - Weight loading helpers for the projection layer
-    - A builder for the token-embedding pooler
+    - the ColBERT linear projection, sized by the config or the checkpoint
+    - a builder for the token-embedding pooler
 
     **Integration:**
 
@@ -45,8 +64,7 @@ class ColBERTMixin(nn.Module, SupportsLateInteraction):
     2. In `__init__`: call `super().__init__()`, then
        `_init_colbert_components`, then create `self.model`
        (the backbone) and `self.pooler` via `_build_colbert_pooler`.
-    3. In `load_weights`: use `_load_colbert_weights` to separate
-       the ColBERT projection weight, then delegate the rest to the backbone.
+    The checkpoint's names are in `conversion_mapping.py` (`COLBERT_LINEAR`).
     """
 
     # Set during _init_colbert_components
@@ -74,10 +92,10 @@ class ColBERTMixin(nn.Module, SupportsLateInteraction):
 
         """
         self.hidden_size = hidden_size
-        self.colbert_dim = colbert_dim
+        self.colbert_dim = colbert_dim or _checkpoint_colbert_dim()
         self.head_dtype = head_dtype
 
-        if colbert_dim is not None:
+        if self.colbert_dim is not None:
             self.colbert_linear = self._build_colbert_linear()
         else:
             self.colbert_linear = None
