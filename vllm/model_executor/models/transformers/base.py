@@ -52,6 +52,7 @@ from vllm.model_executor.layers.attention import (
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import MoERunner
+from vllm.model_executor.model_loader.conversion_mapping import to_vllm
 from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.weight_ops import OutputConcatenate
 from vllm.model_executor.models.interfaces import (
@@ -915,7 +916,7 @@ class Base(
             getattr(self.config, "quantization_config", None),
             serialized=self.quant_config is not None,
         )
-        conversions = [*self._weight_conversions(), *self._fused_conversions()]
+        conversions = to_vllm([*self._weight_conversions(), *self._fused_conversions()])
         if hf_quantizer is not None:
             conversions = hf_quantizer.update_weight_conversions(
                 conversions, self.model

@@ -3,7 +3,7 @@
 """Conversion ops vLLM adds to Transformers' (`transformers.core_model_loading`)."""
 
 import torch
-from transformers.core_model_loading import Concatenate
+from transformers.core_model_loading import Concatenate, ConversionOps
 
 
 class OutputConcatenate(Concatenate):
@@ -22,3 +22,19 @@ class OutputConcatenate(Concatenate):
             param = None
         self.dim = getattr(param, "output_dim", None) or 0
         return super().convert(input_dict, source_patterns, target_patterns, **kwargs)
+
+
+class PadToParam(ConversionOps):
+    """The tensor padded to its target param's shape with the param's `pad_value`
+    (default 0): a vocab padded to a multiple of the ranks, sink heads (-inf)"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        param = kwargs["model"].get_parameter(kwargs["full_layer_name"])
+        tensor = next(iter(input_dict.values()))
+        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        if tensor.shape != param.shape and tensor.dim() == param.dim():
+            padded = tensor.new_full(param.shape, getattr(param, "pad_value", 0))
+            padded[tuple(slice(0, n) for n in tensor.shape)] = tensor
+            tensor = padded
+        return {target_patterns[0]: tensor}

@@ -206,6 +206,7 @@ class RoutedExperts(PluggableLayer):
         }
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        self._declare_sharding()
 
         loader = self.shared_expert_online_loader
         if loader is not None and loader.stages_shared_experts:
@@ -213,6 +214,22 @@ class RoutedExperts(PluggableLayer):
 
         self.lora_base_layer_prefix = ""
         self._flag_padding_for_reload()
+
+    def _declare_sharding(self) -> None:
+        """How each param is sharded, for the loader (`ops_loader`), like a linear's
+        `output_dim`: experts along `expert_dim` over the EP ranks, the intermediate
+        size along `shard_dim` over the TP ranks. w2's bias is added once, after the
+        reduce: `partial`, only TP rank 0 holds it."""
+        for name, param in self.named_parameters(recurse=False):
+            if param.dim() < 2:  # per-expert scalars
+                continue
+            w2 = name.startswith("w2_")
+            dim = 2 if w2 else 1
+            if getattr(param, "is_transposed", False):
+                dim = 3 - dim
+            param.expert_dim, param.shard_dim = 0, dim if dim < param.dim() else None
+            if w2 and name.endswith("bias"):
+                param.shard_dim, param.partial = None, True
 
     def _flag_padding_for_reload(self) -> None:
         """Flag the params a direct reload zero-fills whole at begin; decided
