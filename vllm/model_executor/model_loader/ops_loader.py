@@ -39,6 +39,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -66,6 +67,8 @@ def _read(source, dim: int | None = None, start: int = 0, length: int | None = N
 
 def _placement(layer: nn.Module, param: nn.Parameter) -> tuple[int | None, int, int]:
     """(sharded dim, rank, ranks) of a param, as vLLM recorded it"""
+    if isinstance(layer, ReplicatedLinear):  # every rank holds all of it
+        return None, 0, 1
     if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
         row = isinstance(layer, RowParallelLinear)
         dim = getattr(param, "input_dim" if row else "output_dim", None)
