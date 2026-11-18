@@ -59,6 +59,10 @@ from vllm.model_executor.models.interfaces import (
     SupportsQuant,
 )
 from vllm.model_executor.models.interfaces_base import VllmModel
+from vllm.model_executor.models.transformers.conversion import (
+    convert_weights,
+    streamable_converters,
+)
 from vllm.model_executor.models.transformers.fuser import BaseFuser, Fusers
 from vllm.model_executor.models.transformers.fusers import AttentionFuser, MLAFuser
 from vllm.model_executor.models.transformers.fusers.attention import (
@@ -345,7 +349,6 @@ class Base(
             # Handle weights which have been renamed in Transformers
             if isinstance(mapping, WeightRenaming):
                 orig_to_new_renaming.append(mapping)
-            # TODO: Handle WeightConverter to enable layer merging
 
         # Handle unexpected weights which should be ignored
         if self.model._keys_to_ignore_on_load_unexpected is not None:
@@ -911,6 +914,8 @@ class Base(
             ignore_unexpected_prefixes=self.ignore_unexpected_prefixes,
             ignore_unexpected_suffixes=self.ignore_unexpected_suffixes,
         )
+        converters = streamable_converters(self._weight_conversions())
+        weights = convert_weights(weights, converters, self.config)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @staticmethod
