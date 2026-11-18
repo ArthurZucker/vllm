@@ -131,8 +131,9 @@ def convert_weights(
     config=None,
     hf_quantizer: HfQuantizer | None = None,
     checkpoint_keys: Iterable[str] = (),
+    renamings: list[WeightTransform] = (),
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """`weights`, through Transformers' converters and quantization plan.
+    """`weights`, through Transformers' renamings, converters and quantization plan.
 
     A converter's tensors are held until it has them all, then converted: as many
     as `checkpoint_keys` name for its target, else one per source pattern. Keys no
@@ -142,9 +143,7 @@ def convert_weights(
 
     def rename(name):
         name = hf_quantizer.rename_layer(name) if hf_quantizer else name
-        # ponytail: matched on checkpoint names, renamings stay in `WeightsMapper`.
-        # A converter whose pattern only exists after a renaming is missed
-        return rename_source_key(name, [], converters)
+        return rename_source_key(name, renamings, converters)
 
     expected = Counter(
         target for target, pattern in map(rename, checkpoint_keys) if pattern
@@ -154,7 +153,7 @@ def convert_weights(
     for name, tensor in weights:
         target, pattern = rename(name)
         if pattern is None:
-            yield name, tensor
+            yield target, tensor  # renamed, if a renaming matched
             continue
         if target not in pending:
             converter = next(c for c in converters if pattern in c.source_patterns)

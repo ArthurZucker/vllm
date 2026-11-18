@@ -29,8 +29,12 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from transformers.core_model_loading import Concatenate, ConversionOps
+from transformers.core_model_loading import Concatenate, ConversionOps, WeightConverter
 
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -95,6 +99,37 @@ def _run(ops, tensors: dict, sources: list[str], targets: list[str]):
     for op in ops:
         tensors = op.convert(tensors, sources, targets)
     return tensors
+
+
+def _param_ops(param: nn.Parameter, tensor: torch.Tensor) -> torch.Tensor:
+    """The param's own `load_ops` (Transformers `ConversionOps`, e.g. A_log's
+    `-exp`), on the checkpoint tensor before it is sharded and placed"""
+    for op in getattr(param, "load_ops", ()):
+        out = next(iter(op.convert({"t": [tensor]}, ["t"], ["t"]).values()))
+        tensor = out[0] if isinstance(out, list) else out
+    return tensor
+
+
+def _load_other(param: nn.Parameter, tensor: torch.Tensor) -> None:
+    """A param outside linears and experts: replicated, or sharded along its
+    `shard_dim`, in `shard_segments` (full sizes of the segments concatenated along
+    it, e.g. mamba's conv1d `[x, B, C]`) each sharded on its own"""
+    dim = getattr(param, "shard_dim", None)
+    if dim is None or tensor.dim() <= dim:
+        return _copy(param, tensor, None)
+    rank = getattr(param, "tp_rank", None)
+    rank = get_tensor_model_parallel_rank() if rank is None else rank
+    size = getattr(param, "tp_size", None) or get_tensor_model_parallel_world_size()
+    segments = getattr(param, "shard_segments", None) or [tensor.shape[dim]]
+    names = [str(i) for i in range(len(segments))]
+    fractions = [segment / sum(segments) for segment in segments]
+    ops = [Split(dim, fractions), Shard(dim, rank, size, [1] * len(names))]
+    if len(segments) == 1:  # the param's own size, e.g. padded
+        ops = [Shard(dim, rank, size, [1], param.shape[dim])]
+        names = ["0"]
+    out = _run(ops, {"0": [tensor]}, names, names)
+    value = _run([Concatenate(dim)], out, names, ["param"])["param"]
+    _copy(param, value, dim)
 
 
 def _copy(param: nn.Parameter, value: torch.Tensor, dim: int | None) -> None:
@@ -306,6 +341,15 @@ def load_with_ops(
     model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
     """Load `weights` into `model` with Transformers' ops. Returns the params loaded."""
+    if conversions := getattr(model, "weight_conversions", None):
+        # The model's own Transformers conversions, on checkpoint names
+        from vllm.model_executor.models.transformers.conversion import (
+            convert_weights,
+        )
+
+        converters = [c for c in conversions if isinstance(c, WeightConverter)]
+        renamings = [c for c in conversions if not isinstance(c, WeightConverter)]
+        weights = convert_weights(weights, converters, renamings=renamings)
     mapper = getattr(model, "hf_to_vllm_mapper", None)
     if mapper is not None:
         weights = mapper.apply(weights)
@@ -322,6 +366,7 @@ def load_with_ops(
         param_name, shard, expert = resolved
         shard = getattr(tensor, "shard_id", shard)  # from `orig_to_new_stacked`
         param = params[param_name]
+        tensor = _param_ops(param, tensor)
         layer = model.get_submodule(param_name.rpartition(".")[0])
         if callable(custom := getattr(param, "weight_loader", None)):
             # a param with its own layout, e.g. mamba's conv1d or sharded sinks
@@ -338,7 +383,7 @@ def load_with_ops(
                 continue
             _load_linear(layer, param, pending.pop(param_name))
         else:
-            _copy(param, tensor, None)
+            _load_other(param, tensor)
         loaded.add(param_name)
     if pending:
         raise ValueError(f"Missing shards of fused params: {sorted(pending)[:8]}")
