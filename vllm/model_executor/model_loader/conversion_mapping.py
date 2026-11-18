@@ -922,10 +922,11 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename(".w13_dn", ".gate_up_proj"),
         rename(".w2_md", ".down_proj"),
         rename("^model.llm.layers.", "model.layers."),
-        rename("^model.llm.embed_norm", "model.embed_norm"),
-        rename("^model.llm.embed", "model.embed_tokens"),
+        # the target's embedding norm, applied before the depth layers
+        rename("^model.llm.embed_norm.weight$", "model.backbone_embed_norm.weight"),
+        drop("^model.llm.embed.weight$"),  # embedding and head: the target's
         rename("^model.llm.norm", "model.norm"),
-        rename("^model.llm.unembed", "lm_head"),
+        drop("^model.llm.unembed."),
         rename("^language_model.layers.", "model.layers."),
         rename("^language_model.lm_head.", "lm_head."),
         rename("^model.mtp.", "model."),

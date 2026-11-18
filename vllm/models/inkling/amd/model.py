@@ -14,7 +14,6 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
@@ -28,12 +27,11 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+from vllm.models.inkling.common.loading import load_inkling_weights
 from vllm.models.inkling.common.mm_preprocess import (
     InklingDummyInputsBuilder,
     InklingMultiModalProcessor,
@@ -401,6 +399,9 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return load_inkling_weights(self, weights)
+
 
 class InklingForCausalLM(_TmlForCausalLMBase):
     """Text-only entry point (`inkling_model` checkpoints)."""
@@ -557,76 +558,8 @@ class InklingForConditionalGeneration(_TmlForCausalLMBase, SupportsMultiModal):
 # ===========================================================================
 
 
-_MOE_EXPERT_WEIGHT_RE = re.compile(
-    r"^(?P<mlp>.*\.mlp)\.(?P<rest>(?:shared_)?experts\..+)$"
-)
-
-
 def _is_peft_adapter_weight(name: str) -> bool:
     return ".lora_A." in name or ".lora_B." in name
-
-
-def _load_inkling_weights(
-    module: nn.Module,
-    weights: Iterable[tuple[str, torch.Tensor]],
-    config: InklingModelConfig,
-) -> set[str]:
-    moe_modules = {
-        name: mod for name, mod in module.named_modules() if isinstance(mod, InklingMoE)
-    }
-    loaded: set[str] = set()
-    tp_size = get_tensor_model_parallel_world_size()
-    tp_rank = get_tensor_model_parallel_rank()
-    local_ids = set(config.local_layer_ids)
-
-    def _iter_loadable_weights() -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in module.hf_to_vllm_mapper.apply(weights):
-            # LightSeek's MXFP4 conversion bundles a quantized copy of the
-            # standalone PEFT adapter in the base safetensors index. These are
-            # not base-model parameters; adapters remain opt-in at serving.
-            if _is_peft_adapter_weight(name):
-                continue
-            shard_id = getattr(weight, "shard_id", None)
-            # Replicate K/V conv-free GQA heads when tp_size > num_kv_heads.
-            if (
-                shard_id in (1, 2)
-                and name.endswith(".attn.qkvr.weight")
-                and weight.shape[0] > 0
-            ):
-                lid = _layer_id(name)
-                if lid is not None:
-                    is_local = lid in local_ids
-                    n_kv = (
-                        config.swa_num_key_value_heads
-                        if is_local
-                        else config.num_key_value_heads
-                    )
-                    head_dim = config.swa_head_dim if is_local else config.head_dim
-                    if tp_size > n_kv and weight.shape[0] == n_kv * head_dim:
-                        kv_idx = (tp_rank * n_kv) // tp_size
-                        weight = weight.narrow(0, kv_idx * head_dim, head_dim)
-                        weight.shard_id = shard_id
-
-            # MoE expert tensors (fused stacked, routed + shared sink): translate
-            # the checkpoint layout to per-expert MoERunner loads.
-            moe_match = _MOE_EXPERT_WEIGHT_RE.match(name)
-            if moe_match is not None and moe_match.group("mlp") in moe_modules:
-                moe = moe_modules[moe_match.group("mlp")]
-                for rel in moe.load_expert_weight(moe_match.group("rest"), weight):
-                    loaded.add(f"{moe_match.group('mlp')}.{rel}")
-                continue
-
-            yield name, weight
-
-    mapper = WeightsMapper(orig_to_new_prefix={"model.mtp.": None})
-    loader = AutoWeightsLoader(module)
-    loaded |= loader.load_weights(_iter_loadable_weights(), mapper=mapper)
-
-    # Post-load MoE fixups (default input scales, zeroed EP-padding experts).
-    for moe_name, moe in moe_modules.items():
-        for rel in moe.finalize_load():
-            loaded.add(f"{moe_name}.{rel}")
-    return loaded
 
 
 EntryClass = [InklingForCausalLM, InklingForConditionalGeneration]

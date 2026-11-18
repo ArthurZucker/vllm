@@ -104,6 +104,16 @@ def _placement(layer: nn.Module, param: nn.Parameter) -> tuple[int | None, int, 
     )
 
 
+def _replicas(layer: nn.Module, shard) -> int:
+    """How many ranks share a shard's rows: a kv head over more ranks than kv heads
+    (`QKVParallelLinear`, or a layer's `shard_replicas`, e.g. Inkling's `qkvr`)"""
+    if (replicas := getattr(layer, "shard_replicas", None)) is not None:
+        return replicas.get(shard, 1)
+    if isinstance(layer, QKVParallelLinear) and shard in ("k", "v"):
+        return layer.num_kv_head_replicas
+    return 1
+
+
 class VllmShard:
     """Shard-on-read for one source of one target param, Transformers'
     `DtensorShardOperation` interface: `shard_tensor(source, tensor_idx)` is this
@@ -179,11 +189,7 @@ class VllmShard:
         elif self.sources == 1:  # the param's own range, e.g. a padded vocab
             local = target[dim]
         else:
-            if isinstance(layer, QKVParallelLinear) and shards[self.index] in (
-                "k",
-                "v",
-            ):
-                replicas = layer.num_kv_head_replicas  # ranks sharing a kv head
+            replicas = _replicas(layer, shards[self.index])
             local = shape[dim] * replicas // size
         start = min(rank // replicas * local, shape[dim])
         return _read(source, dim, start, min(local, shape[dim] - start))
@@ -210,10 +216,7 @@ class VllmShard:
         """Split (by the layer's shard sizes) -> Shard each -> Concatenate: this rank's
         slice of every segment of a tensor fused on disk, read alone"""
         layer, length = self.layer, _shape(source)[dim]
-        qkv = isinstance(layer, QKVParallelLinear)
-        replicas = [
-            layer.num_kv_head_replicas if qkv and s in ("k", "v") else 1 for s in shards
-        ]
+        replicas = [_replicas(layer, shard) for shard in shards]
         rows = [
             layer._get_shard_size_mapping(s) * size // r
             for s, r in zip(shards, replicas)

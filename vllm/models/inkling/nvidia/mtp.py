@@ -30,9 +30,9 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsMultiModalEmbeddings
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.models.inkling.common.loading import load_inkling_weights
 from vllm.sequence import IntermediateTensors
 
 from ..configs import InklingModelConfig
@@ -348,98 +348,8 @@ class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
         skipped entirely."""
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
-
-def _load_inkling_mtp_weights(
-    module: InklingMTP,
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> set[str]:
-    """Load `model.mtp.*` weights into the MTP module.
-
-    Checkpoint keys look like `model.mtp.chain_norm.weight` and
-    `model.mtp.layers.{i}.{...}`. The transformer block reuses the backbone
-    layer's fused-projection layout, so we apply the same qkvr / gate_up / down
-    remapping as `_load_inkling_weights`. Token embedding and LM head are shared
-    (provided by `load_eagle_model`) and are not present in mtp.safetensors.
-    """
-    # Per-depth attention is full or sliding-window (config.local_layer_ids);
-    # each depth's qkvr MergedColumnParallelLinear is built with the matching
-    # (swa_)num_key_value_heads, and its weight_loader handles the TP sharding.
-    # The sconv SWA cache pins tp_size <= num_key_value_heads, so tp never
-    # exceeds a layer's kv-head count and no GQA K/V replication is needed here.
-    params = dict(module.named_parameters())
-    loaded: set[str] = set()
-
-    def _load(name: str, weight: torch.Tensor, shard_id: object = None) -> bool:
-        param = params.get(name)
-        if param is None:
-            return False
-        loader = getattr(param, "weight_loader", default_weight_loader)
-        if shard_id is None:
-            if loader is default_weight_loader or param.shape == weight.shape:
-                default_weight_loader(param, weight)
-            else:
-                loader(param, weight)
-        else:
-            loader(param, weight, shard_id)  # type: ignore[call-arg]
-        loaded.add(name)
-        return True
-
-    for name, weight in weights:
-        depth = _mtp_depth_from_name(name)
-        # Token embedding and LM head are never materialized on the draft
-        # (no params to load into); load_eagle_model attaches the target's.
-        if name in ("model.llm.embed.weight", "model.llm.unembed.weight"):
-            continue
-        # The backbone embed_norm, applied to the shared embedding before the
-        # depth layers (see InklingMultiTokenPredictor.embed_input_ids). The
-        # per-depth mtp.layers.{i}.embed_norm keys carry ".mtp." and are loaded
-        # below. Only the shared backbone key routes here.
-        if name == "model.llm.embed_norm.weight":
-            _load("model.backbone_embed_norm.weight", weight)
-            continue
-        # Only consume the MTP weights; everything else belongs to the target.
-        if ".mtp." not in name:
-            continue
-        # Skip depth blocks beyond the ones we built (num_speculative_tokens).
-        if depth is not None and depth >= module.model.num_mtp_layers:
-            continue
-        # model.mtp.chain_norm.weight -> model.chain_norm.weight
-        # model.mtp.layers.{i}.X      -> model.layers.{i}.X
-        original_name = name
-        name = name.replace(".mtp.layers.", ".layers.").replace(
-            ".mtp.chain_norm.", ".chain_norm."
-        )
-
-        if ".chain_norm." in name and module.model.chain_norm is None:
-            raise ValueError(
-                "Inkling checkpoint contains chain_norm weights but "
-                "chain_hidden_post_norm is disabled."
-            )
-
-        # Fused attention qkvr (wq_du/wk_dv/wv_dv/wr_du -> qkvr).
-        matched = False
-        for pname, wname, shard in _ATTENTION_PARAMS_MAPPING:
-            if f".attn.{wname}." in name:
-                mapped_name = name.replace(f".{wname}.", f".{pname}.")
-                if not _load(mapped_name, weight, shard):
-                    raise ValueError(f"Unexpected Inkling MTP weight: {original_name}")
-                matched = True
-                break
-        if matched:
-            continue
-
-        # Dense MLP fused gate/up + down.
-        if ".mlp.w13_dn." in name:
-            loaded_weight = _load(name.replace(".w13_dn.", ".gate_up_proj."), weight)
-        elif ".mlp.w2_md." in name:
-            loaded_weight = _load(name.replace(".w2_md.", ".down_proj."), weight)
-        else:
-            if name.endswith(".bias") and name not in params:
-                continue
-            loaded_weight = _load(name, weight)
-        if not loaded_weight:
-            raise ValueError(f"Unexpected Inkling MTP weight: {original_name}")
-    return loaded
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return load_inkling_weights(self, weights)
 
 
 EntryClass = [InklingMTP]
