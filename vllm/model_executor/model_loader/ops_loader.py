@@ -294,11 +294,11 @@ def load_with_ops(
     """Load `weights` (tensors, or lazy safetensors slices: then each rank reads its
     bytes only) into `model` with `conversions` (default: the model's entries in
     `conversion_mapping`). Returns the params loaded."""
-    stream = []  # functions of the whole stream (pair scales, repack), run first
+    # functions of the whole stream, run first: a model's (Jina v5's task LoRA merged,
+    # MiniMax M3's ROCm redirect), then the quant config's (pair scales, repack)
+    stream = list(getattr(model, "checkpoint_transforms", []))
     if conversions is None:
         conversions = get_conversion_mapping(model)
-        if (own := getattr(model, "hf_to_vllm_mapper", None)) is not None:
-            stream += own.weights_transforms  # e.g. MiniMax M3's ROCm redirect
     # the quant config's: KV-cache scales onto `attn`, ModelOpt's CSF pairing, ...
     modules = (model, *model.children())
     quant = next(

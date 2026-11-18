@@ -490,7 +490,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename(r"(decoder.layers.\d+.\w+_attn).o_proj.", r"\1.out_projection."),
         rename(r"(decoder.layers.\d+.mlp).fc1.", r"\1.dense_in."),
         rename(r"(decoder.layers.\d+.mlp).fc2.", r"\1.dense_out."),
-        drop(".num_batches_tracked$"),
         fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
     ],
     "ChatGLMModel": [

@@ -565,3 +565,6 @@ class LlamaNemotronVLForSequenceClassification(
         pooler_config = model_config.pooler_config
         assert pooler_config is not None
         self.pooler = DispatchPooler.for_seq_cls(pooler_config, classifier=self.score)
+        # the inner LM's own seq-cls head is unused, and not in the checkpoint
+        for param in getattr(self.language_model, "score", nn.Identity()).parameters():
+            param.loaded_at_init = True

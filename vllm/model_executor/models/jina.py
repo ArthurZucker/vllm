@@ -4,6 +4,8 @@
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Iterable
+from functools import partial
 
 import torch
 from safetensors.torch import load as safetensors_load
@@ -219,6 +221,28 @@ def _setup_jina_v5_task_and_pooler(model: nn.Module, vllm_config: VllmConfig) ->
     pooler_config = vllm_config.model_config.pooler_config
     assert pooler_config is not None
     model.pooler = DispatchPooler.for_embedding(pooler_config)
+    model.checkpoint_transforms = [partial(_merge_task_lora, model)]
+
+
+def _merge_task_lora(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The selected task's LoRA adapter merged into the base weights (`W + B A s`)"""
+    adapter = _load_adapter(model._model_name, model._task, model._revision)
+    if adapter is None:
+        logger.warning("No adapter for task %r: raw base weights", model._task)
+        yield from weights
+        return
+    config, adapter_weights = adapter
+    scaling = config["lora_alpha"] / config["r"]
+    pairs = _build_lora_pairs(adapter_weights)
+    for name, tensor in weights:
+        pair = pairs.get(name.removeprefix("model."), {})
+        if "A" in pair and "B" in pair:
+            tensor = tensor if isinstance(tensor, torch.Tensor) else tensor[...]
+            a, b = (pair[k].to(tensor.device, tensor.dtype) for k in ("A", "B"))
+            tensor = tensor + (b @ a) * scaling
+        yield name, tensor
 
 
 class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):

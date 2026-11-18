@@ -1688,8 +1688,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             self.lm_head = PPMissingLayer()
         if self.model.use_mega_moe:
             redirect = partial(_redirect_fused_shared_experts, model=self.model)
-            transforms = WeightsMapper(weights_transforms=[redirect])
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | transforms
+            self.checkpoint_transforms = [redirect]
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
