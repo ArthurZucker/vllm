@@ -1961,3 +1961,17 @@ def remap_moe_expert_weights(
     for name, weight in weights:
         remapped_name = maybe_remap_moe_expert_param_name(name, params_dict)
         yield (remapped_name, weight)
+
+
+def checkpoint_shapes(pattern: str) -> dict[str, list[int]]:
+    """The shapes of the model being loaded's checkpoint tensors matching `pattern`,
+    from the safetensors headers: for a layer the config does not size (a pooling
+    projection), built before loading"""
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+    if (config := get_current_vllm_config_or_none()) is None:
+        return {}
+    model = config.model_config
+    metadata = get_safetensors_params_metadata(model.model, revision=model.revision)
+    return {k: v["shape"] for k, v in metadata.items() if re.search(pattern, k)}

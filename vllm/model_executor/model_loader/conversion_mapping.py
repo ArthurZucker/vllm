@@ -42,13 +42,18 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 
+def _names(pattern: str) -> str:
+    """Module names, no escaping: `.` is a dot, unless a quantifier follows (`.*`)"""
+    return re.sub(r"(?<!\\)\.(?![*+?{])", r"\.", pattern)
+
+
 def rename(pattern: str, new: str) -> WeightRenaming:
-    return WeightRenaming(pattern, new)
+    return WeightRenaming(_names(pattern), new)
 
 
 def drop(pattern: str) -> WeightRenaming:
     """A checkpoint tensor the model does not load"""
-    return WeightRenaming(pattern, "_dropped_")
+    return WeightRenaming(_names(pattern), "_dropped_")
 
 
 class Fused(WeightConverter):
@@ -165,6 +170,8 @@ COLBERT_LINEAR = rename(r"^(.*\.)?(colbert_)?linear\.weight$", "colbert_linear.w
 TRANSFORMER_PREFIX = rename(r"^(?!transformer\.|lm_head\.|score\.)", "transformer.")
 GPT2 = [
     TRANSFORMER_PREFIX,
+    drop(".attn.bias"),  # attention mask buffers (not `c_attn.bias`)
+    drop(".attn.masked_bias"),
     *(
         WeightConverter(f".{proj}.weight", f".{proj}.weight", operations=[Transpose()])
         for proj in ("c_attn", "c_proj", "c_fc")
@@ -497,6 +504,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: tensor_ops
     "ColPaliModel": [
+        rename("^embedding_proj_layer.", "custom_text_proj."),
         rename("^vlm.vision_tower.", "vision_tower."),
         rename("^vlm.language_model.", "language_model."),
         rename("^vlm.multi_modal_projector.", "multi_modal_projector."),

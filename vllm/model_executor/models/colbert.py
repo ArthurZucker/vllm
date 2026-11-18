@@ -16,14 +16,14 @@ This module provides:
 Reference: https://arxiv.org/abs/2004.12832
 """
 
-import re
-
 import torch
 from torch import nn
 
 from vllm.config import PoolerConfig, VllmConfig
 from vllm.model_executor.layers.pooler import Pooler
 from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
+from vllm.model_executor.model_loader.conversion_mapping import COLBERT_LINEAR
+from vllm.model_executor.model_loader.weight_utils import checkpoint_shapes
 
 from .bert import BertEmbeddingModel, BertModel
 from .interfaces import HasInnerState, IsHybrid, SupportsLateInteraction
@@ -33,20 +33,8 @@ from .lfm2 import Lfm2ForCausalLM, Lfm2Model
 
 def _checkpoint_colbert_dim() -> int | None:
     """The projection's size, when only its checkpoint tensor has it"""
-    from vllm.config import get_current_vllm_config_or_none
-    from vllm.model_executor.model_loader.conversion_mapping import COLBERT_LINEAR
-    from vllm.transformers_utils.config import get_safetensors_params_metadata
-
-    config = get_current_vllm_config_or_none()
-    if config is None:
-        return None
-    model = config.model_config
     pattern = COLBERT_LINEAR._original_source_patterns[0]
-    metadata = get_safetensors_params_metadata(model.model, revision=model.revision)
-    shapes = [
-        info["shape"] for name, info in metadata.items() if re.match(pattern, name)
-    ]
-    return shapes[0][0] if shapes else None
+    return next((shape[0] for shape in checkpoint_shapes(pattern).values()), None)
 
 
 class ColBERTMixin(nn.Module, SupportsLateInteraction):

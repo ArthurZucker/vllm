@@ -24,6 +24,7 @@ from transformers import ColPaliConfig, PaliGemmaConfig, PaliGemmaProcessor
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
+from vllm.model_executor.model_loader.weight_utils import checkpoint_shapes
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing.processor import HFMultiModalInputs
@@ -112,17 +113,20 @@ class ColPaliModel(
             or getattr(config, "colbert_dim", None)
         )
 
-        # Build the projection layer if embed_dim is known
-        if self.embed_dim is not None:
-            self.custom_text_proj = nn.Linear(
+        # sized (and biased) as the checkpoint's projection
+        shapes = checkpoint_shapes(r"(custom_text_proj|embedding_proj_layer)\.\w+$")
+        weight = next((v for k, v in shapes.items() if k.endswith(".weight")), None)
+        self.embed_dim = self.embed_dim or (weight[0] if weight else None)
+        self.custom_text_proj = (
+            nn.Linear(
                 hidden_size,
                 self.embed_dim,
-                bias=False,
+                bias=any(k.endswith(".bias") for k in shapes),
                 dtype=head_dtype,
             )
-        else:
-            # Will be created during load_weights when dim is inferred
-            self.custom_text_proj = None
+            if self.embed_dim is not None
+            else None
+        )
 
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
@@ -146,13 +150,3 @@ class ColPaliModel(
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-
-    # Names used for the projection layer across different ColPali variants
-    _PROJ_LAYER_NAMES = {
-        "custom_text_proj",  # vLLM internal naming
-        "embedding_proj_layer",  # colpali-engine / HF naming
-    }
-
-    def _is_proj_weight(self, name: str) -> bool:
-        """Check if a weight name belongs to the projection layer."""
-        return any(proj_name in name for proj_name in self._PROJ_LAYER_NAMES)
