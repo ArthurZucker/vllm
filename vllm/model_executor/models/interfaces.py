@@ -1292,7 +1292,8 @@ class SupportsQuant:
             return
         from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
 
-        if (mapper := rename_mapper(self)) is not None:
+        # called from `__new__`: the class's renamings, its modules are not built yet
+        if (mapper := rename_mapper(type(self))) is not None:
             self.quant_config.apply_vllm_mapper(mapper)
         if packed_modules_mapping := getattr(self, "packed_modules_mapping", None):
             self.quant_config.packed_modules_mapping.update(packed_modules_mapping)
