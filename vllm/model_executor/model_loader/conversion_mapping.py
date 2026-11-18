@@ -61,7 +61,8 @@ class Fused(WeightConverter):
 def fused(target: str, *sources: str | tuple[str, int]) -> WeightConverter:
     """`sources` concatenated into the fused `target`, in its shard order; a source
     filling several shards is `(pattern, shards)`"""
-    patterns = [s if isinstance(s, str) else s[0] for s in sources]
+    # module names, not regexes: `.k.` must not match the `ock` of `blocks`
+    patterns = [re.escape(s if isinstance(s, str) else s[0]) for s in sources]
     converter = Fused(patterns, target, operations=[OutputConcatenate()])
     converter.shards = [1 if isinstance(s, str) else s[1] for s in sources]
     return converter
@@ -2620,12 +2621,18 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
         if getattr(getattr(module, "config", None), "model_type", None)
     }
     out = to_vllm([e for t in sorted(model_types) for e in transformers_experts(t)])
+    seen: set[tuple] = set()
     out += _layer_experts(model)
     for cls, names in sorted(instances.items(), key=lambda kv: min(map(len, kv[1]))):
         parts = os.path.commonprefix([name.split(".") for name in names])
         scope = ".".join(p for p in parts if not p.isdigit())
         entry = _CONVERSION_MAPPING[cls]  # a list, or a function of the module (config)
         for transform in entry(first[cls]) if callable(entry) else entry:
+            # an inner class repeating its outer class's transform applies it once
+            key = (type(transform), *transform._original_source_patterns)
+            if key in seen:
+                continue
+            seen.add(key)
             transform = deepcopy(transform)
             if scope:
                 transform.scope_prefix, transform.base_model_prefix = scope, ""
