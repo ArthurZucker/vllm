@@ -108,6 +108,35 @@ def transformers_experts(model_type: str) -> list[WeightTransform]:
     ]
 
 
+# Mistral's own checkpoint format (`consolidated.safetensors`) onto the HF names
+MISTRAL_FORMAT = [
+    rename(r"^layers\.", "model.layers."),
+    rename(r"^norm\.weight$", "model.norm.weight"),
+    rename(r"^tok_embeddings\.weight$", "model.embed_tokens.weight"),
+    rename(r"^output\.weight$", "lm_head.weight"),
+    rename(r"\.attention_norm\.", ".input_layernorm."),
+    rename(r"\.ffn_norm\.", ".post_attention_layernorm."),
+    rename(r"\.attention\.wq_a\.", ".self_attn.q_a_proj."),
+    rename(r"\.attention\.q_a_norm\.", ".self_attn.q_a_layernorm."),
+    rename(r"\.attention\.wq_b\.", ".self_attn.q_b_proj."),
+    rename(r"\.attention\.wkv_a_with_mqa\.", ".self_attn.kv_a_proj_with_mqa."),
+    rename(r"\.attention\.kv_a_norm\.", ".self_attn.kv_a_layernorm."),
+    rename(r"\.attention\.wkv_b\.", ".self_attn.kv_b_proj."),
+    rename(r"\.attention\.wo\.", ".self_attn.o_proj."),
+    rename(r"\.feed_forward\.w1\.", ".mlp.gate_proj."),
+    rename(r"\.feed_forward\.w2\.", ".mlp.down_proj."),
+    rename(r"\.feed_forward\.w3\.", ".mlp.up_proj."),
+    rename(r"(\.\d+)\.gate\.weight$", r"\1.mlp.gate.weight"),
+    rename(r"\.shared_experts\.w1\.", ".mlp.shared_experts.gate_proj."),
+    rename(r"\.shared_experts\.w2\.", ".mlp.shared_experts.down_proj."),
+    rename(r"\.shared_experts\.w3\.", ".mlp.shared_experts.up_proj."),
+    rename(r"\.experts\.(\d+)\.w1\.", r".mlp.experts.\1.gate_proj."),
+    rename(r"\.experts\.(\d+)\.w2\.", r".mlp.experts.\1.down_proj."),
+    rename(r"\.experts\.(\d+)\.w3\.", r".mlp.experts.\1.up_proj."),
+    rename(r"\.qscale_act$", ".input_scale"),
+    rename(r"\.qscale_weight$", ".weight_scale"),
+]
+
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
@@ -454,11 +483,8 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("\\.output_quantizer\\."),
         fused(".qkv_proj.", ".q_proj.", ".k_proj.", ".v_proj."),
     ],
-    # TODO: 1 renames with several groups (Mistral-format names)
     "Cosmos3ForConditionalGeneration": [
-        rename(
-            "^(layers\\.|embed_tokens\\.|norm\\.)(.+)$", "language_model.model.\\1\\2"
-        ),
+        rename("^(layers|embed_tokens|norm)\\.", "language_model.model.\\1."),
         rename(
             "^(blocks\\.|merger\\.|patch_embed\\.|pos_embed\\.|deepstack_merger_list\\.)",
             "visual.\\1",
@@ -626,91 +652,8 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".gate_up_proj", ".gate_proj", ".up_proj"),
         fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj"),
     ],
-    # TODO: 14 renames with several groups (Mistral-format names)
     "EagleMistralLarge3ForCausalLM": [
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention_norm\\.weight\\Z",
-            "model.layers.\\1.input_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.q_a_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.q_a_norm\\.weight\\Z",
-            "model.layers.\\1.self_attn.q_a_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.q_b_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.kv_a_proj_with_mqa.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.kv_a_norm\\.weight\\Z",
-            "model.layers.\\1.self_attn.kv_a_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.kv_b_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.o_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.ffn_norm\\.weight\\Z",
-            "model.layers.\\1.post_attention_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.gate_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.down_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.up_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.gate\\.weight\\Z", "model.layers.\\1.mlp.gate.weight"
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.shared_experts.gate_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.shared_experts.down_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.shared_experts.up_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.experts.\\2.gate_proj.\\3",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.experts.\\2.down_proj.\\3",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.experts.\\2.up_proj.\\3",
-        ),
-        rename("\\Anorm\\.weight\\Z", "model.norm.weight"),
-        rename("\\Atok_embeddings\\.weight\\Z", "model.embed_tokens.weight"),
-        rename("\\Aoutput\\.weight\\Z", "lm_head.weight"),
-        rename("\\Aeagle_linear\\.weight\\Z", "model.fc.weight"),
-        rename("\\Aeagle_linear\\.qscale_act\\Z", "model.fc.input_scale"),
-        rename("\\Aeagle_linear\\.qscale_weight\\Z", "model.fc.weight_scale"),
-        rename("\\.qscale_act$", ".input_scale"),
-        rename("\\.qscale_weight$", ".weight_scale"),
+        *MISTRAL_FORMAT,
     ],
     # TODO: mapper _embedding_gemma2_weights_mapper() not literal
     "EmbeddingGemma2Model": [],
@@ -1701,88 +1644,8 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("\\.activation_scale$", ".input_scale"),
         rename("\\.weight_scale_inv$", ".weight_scale"),
     ],
-    # TODO: 14 renames with several groups (Mistral-format names)
     "MistralLarge3ForCausalLM": [
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention_norm\\.weight\\Z",
-            "model.layers.\\1.input_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wq_a\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.q_a_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.q_a_norm\\.weight\\Z",
-            "model.layers.\\1.self_attn.q_a_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wq_b\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.q_b_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wkv_a_with_mqa\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.kv_a_proj_with_mqa.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.kv_a_norm\\.weight\\Z",
-            "model.layers.\\1.self_attn.kv_a_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wkv_b\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.kv_b_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.attention\\.wo\\.(\\w+)\\Z",
-            "model.layers.\\1.self_attn.o_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.ffn_norm\\.weight\\Z",
-            "model.layers.\\1.post_attention_layernorm.weight",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.feed_forward\\.w1\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.gate_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.feed_forward\\.w2\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.down_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.feed_forward\\.w3\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.up_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.gate\\.weight\\Z", "model.layers.\\1.mlp.gate.weight"
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.shared_experts\\.w1\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.shared_experts.gate_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.shared_experts\\.w2\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.shared_experts.down_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.shared_experts\\.w3\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.shared_experts.up_proj.\\2",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w1\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.experts.\\2.gate_proj.\\3",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w2\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.experts.\\2.down_proj.\\3",
-        ),
-        rename(
-            "\\Alayers\\.(\\d+)\\.experts\\.(\\d+)\\.w3\\.(\\w+)\\Z",
-            "model.layers.\\1.mlp.experts.\\2.up_proj.\\3",
-        ),
-        rename("\\Anorm\\.weight\\Z", "model.norm.weight"),
-        rename("\\Atok_embeddings\\.weight\\Z", "model.embed_tokens.weight"),
-        rename("\\Aoutput\\.weight\\Z", "lm_head.weight"),
-        rename("\\.qscale_act$", ".input_scale"),
-        rename("\\.qscale_weight$", ".weight_scale"),
+        *MISTRAL_FORMAT,
     ],
     "MixtralForCausalLM": [
         rename("\\.gate_proj\\.", ".w1."),
