@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: SIM117
-from vllm.model_executor.model_loader.ops_loader import (
-    load_weights as load_model_weights,
-)
 import copy
 from collections.abc import Generator
 
@@ -14,6 +11,9 @@ from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
+)
 from vllm.model_executor.model_loader.tensorizer import (
     TensorizerConfig,
     deserialize_tensorizer_model,

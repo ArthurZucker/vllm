@@ -29,10 +29,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.utils import storage_view
 from vllm.model_executor.model_loader.ops_loader import (
     load_weights as load_model_weights,
 )
+from vllm.model_executor.utils import storage_view
 
 from .bake import Copy, Targets, Traced, trace_loads
 from .direct import direct_reload_active, direct_reload_enabled

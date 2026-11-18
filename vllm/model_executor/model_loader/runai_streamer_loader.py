@@ -17,6 +17,9 @@ from vllm.config.load import LoadConfig
 from vllm.distributed import get_world_group, in_single_pp_stage
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -24,9 +27,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     runai_safetensors_weights_iterator,
 )
 from vllm.transformers_utils.repo_utils import resolve_revision
-from vllm.model_executor.model_loader.ops_loader import (
-    load_weights as load_model_weights,
-)
 from vllm.transformers_utils.runai_utils import (
     is_runai_obj_uri,
     list_safetensors,
