@@ -51,16 +51,17 @@ def experts(
     up: str = "up_proj",
     down: str = "down_proj",
 ) -> list[WeightTransform]:
-    """Per-expert checkpoint tensors into the fused `w13_*` / `w2_*` params"""
+    """Per-expert checkpoint tensors into the fused experts' `w13_*` / `w2_*` params
+    (vLLM's `FusedMoE` keeps them in its `routed_experts`)"""
     return [
         WeightConverter(
             [f"{prefix}.*.{gate}.weight", f"{prefix}.*.{up}.weight"],
-            f"{prefix}.w13_weight",
+            f"{prefix}.routed_experts.w13_weight",
             operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
         ),
         WeightConverter(
             f"{prefix}.*.{down}.weight",
-            f"{prefix}.w2_weight",
+            f"{prefix}.routed_experts.w2_weight",
             operations=[MergeModulelist(dim=0)],
         ),
     ]
@@ -87,14 +88,25 @@ _CONVERSION_MAPPING: dict[str, list[WeightTransform]] = {
         *fused_attention("attn"),
         # Experts fused on disk (MXFP4 blocks + scales), gate/up interleaved: their
         # contiguous TP slice keeps both, so they are only renamed
-        WeightRenaming("mlp.experts.gate_up_proj_blocks", "mlp.experts.w13_weight"),
         WeightRenaming(
-            "mlp.experts.gate_up_proj_scales", "mlp.experts.w13_weight_scale"
+            "mlp.experts.gate_up_proj_blocks", "mlp.experts.routed_experts.w13_weight"
         ),
-        WeightRenaming("mlp.experts.gate_up_proj_bias", "mlp.experts.w13_bias"),
-        WeightRenaming("mlp.experts.down_proj_blocks", "mlp.experts.w2_weight"),
-        WeightRenaming("mlp.experts.down_proj_scales", "mlp.experts.w2_weight_scale"),
-        WeightRenaming("mlp.experts.down_proj_bias", "mlp.experts.w2_bias"),
+        WeightRenaming(
+            "mlp.experts.gate_up_proj_scales",
+            "mlp.experts.routed_experts.w13_weight_scale",
+        ),
+        WeightRenaming(
+            "mlp.experts.gate_up_proj_bias", "mlp.experts.routed_experts.w13_bias"
+        ),
+        WeightRenaming(
+            "mlp.experts.down_proj_blocks", "mlp.experts.routed_experts.w2_weight"
+        ),
+        WeightRenaming(
+            "mlp.experts.down_proj_scales", "mlp.experts.routed_experts.w2_weight_scale"
+        ),
+        WeightRenaming(
+            "mlp.experts.down_proj_bias", "mlp.experts.routed_experts.w2_bias"
+        ),
     ],
 }
 
