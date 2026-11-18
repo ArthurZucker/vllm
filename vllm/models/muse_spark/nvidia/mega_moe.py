@@ -7,7 +7,6 @@ The ModelOpt NVFP4 checkpoint maps onto the kernel without requantization.
 
 import functools
 import inspect
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -217,17 +216,6 @@ class MuseSparkMegaMoEExperts(nn.Module):
             )
         param.data.copy_(shard.to(param.data.dtype))
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        for name, tensor in weights:
-            param = getattr(self, name, None)
-            if param is None:
-                raise AttributeError(
-                    f"{self.prefix}: unexpected expert weight {name!r}"
-                )
-            self.weight_loader(param, tensor, name)
-            yield name
 
     def finalize_weights(self) -> None:
         """Repack checkpoint tensors into the layout the kernel reads."""

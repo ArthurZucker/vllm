@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 from torch import nn
 from transformers import Glm5NextTextConfig
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, VllmConfig, get_current_vllm_config
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
@@ -29,7 +27,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
     RoutedScaleMode,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
@@ -65,7 +62,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
-    maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.deepseek_v2 import _get_moe_router_dtype
 from vllm.model_executor.models.glm4_1v import (
@@ -80,12 +76,9 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    extract_layer_index,
     get_fused_shared_expert_layers,
     init_vllm_registered_model,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
@@ -1047,176 +1040,6 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             if isinstance(layer, Glm5NextDecoderLayer):
                 layer.split_hc_fns()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-            # MLA: fuse q_a_proj and kv_a_proj_with_mqa
-            (".fused_qkv_a_proj", ".q_a_proj", 0),
-            (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-            # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
-            (".in_proj_qkvbfg_a", ".q_proj", 0),
-            (".in_proj_qkvbfg_a", ".k_proj", 1),
-            (".in_proj_qkvbfg_a", ".v_proj", 2),
-            (".in_proj_qkvbfg_a", ".b_proj", 3),
-            (".in_proj_qkvbfg_a", ".f_a_proj", 4),
-            (".in_proj_qkvbfg_a", ".g_a_proj", 5),
-            # KDA: fuse the q, k, v short convs into one conv1d
-            (".conv1d", ".q_conv1d", 0),
-            (".conv1d", ".k_conv1d", 1),
-            (".conv1d", ".v_conv1d", 2),
-        ]
-        if _is_moe(self.config):
-            # Params for weights, fp8 weight scales, fp8 activation scales
-            # (param_name, weight_name, expert_id, shard_id)
-            # EPLB: the mapping enumerates physical experts, so it must cover
-            # the redundant replicas or their slots are never loaded.
-            num_redundant_experts = next(
-                (
-                    layer.mlp.n_redundant_experts
-                    for layer in self.layers
-                    if isinstance(layer, Glm5NextDecoderLayer)
-                    and isinstance(layer.mlp, Glm5NextMoE)
-                ),
-                0,
-            )
-            num_fused_shared = _num_fused_shared_experts(
-                self.config.n_shared_experts,
-                bool(self.fused_shared_expert_layers),
-            )
-            expert_params_mapping = fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                # NOTE: global despite per-layer FSE; non-fused layers skip the extras.
-                num_experts=self.config.n_routed_experts + num_fused_shared,
-                num_redundant_experts=num_redundant_experts,
-                routed_experts_prefix="" if self.use_mega_moe else "routed_experts",
-            )
-        else:
-            expert_params_mapping = []
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
-        # ``kv_a_proj_with_mqa``; pad them with zeros for the model shape.
-        kv_a_pad_size = 0
-        if self.config.mla_use_nope and self.config.qk_rope_head_dim > 0:
-            kv_a_pad_size = self.config.qk_rope_head_dim
-
-        for args in weights:
-            name, loaded_weight = args[:2]
-            kwargs: dict = args[2] if len(args) > 2 else {}
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if self.use_mega_moe and ".shared_experts." in name:
-                mlp = self.get_submodule(name.partition(".shared_experts.")[0])
-                loaded_params.add(
-                    mlp.experts.load_shared_expert_weight(name, loaded_weight)
-                )
-                continue
-            # Only parse the layer index when FSE is enabled.
-            if (
-                "mlp.shared_experts." in name
-                and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
-                and extract_layer_index(name) in self.fused_shared_expert_layers
-            ):
-                name = _fused_shared_expert_name(name, self.config.n_routed_experts)
-
-            name, loaded_weight = _mla_proj_checkpoint_tensor(
-                name, loaded_weight, params_dict, self.config, kv_a_pad_size
-            )
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                # QKV fusion: skip if fused module doesn't exist in model
-                if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
-                    continue
-                name = name_mapped
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                is_expert_weight = False
-                for (
-                    param_name,
-                    weight_name,
-                    expert_id,
-                    expert_shard_id,
-                ) in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    # A checkpoint expert may map to several physical replicas
-                    # under EPLB; keep `name` intact and try the next entry
-                    # when this physical expert is not local to the rank.
-                    is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(name_mapped, self):
-                        continue
-                    param = params_dict[name_mapped]
-                    weight_loader = param.weight_loader
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        expert_id=expert_id,
-                        shard_id=expert_shard_id,
-                        return_success=True,
-                    )
-                    if success:
-                        name = name_mapped
-                        break
-                else:
-                    if is_expert_weight:
-                        continue
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and name not in params_dict
-                        and not _is_linear_attn(self.config)
-                    ):  # noqa: E501
-                        continue
-                    # Remapping the name of FP8 kv-scale.
-                    remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                    if remapped_name is None:
-                        continue
-                    name = remapped_name
-                    if is_pp_missing_parameter(name, self):
-                        continue
-
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight, **kwargs)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class Glm5NextForCausalLM(
@@ -1336,9 +1159,6 @@ class Glm5NextForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
     def process_weights_after_loading(self) -> None:
         for module in self.modules():

@@ -3,7 +3,6 @@
 """Minimal implementation of BlipVisionModel intended to be only used
 within a vision language model."""
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -21,7 +20,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from .interfaces import SupportsQuant
-from .utils import AutoWeightsLoader, WeightsMapper
+from .utils import WeightsMapper
 
 
 def get_blip_patch_grid_length(*, image_size: int, patch_size: int) -> int:
@@ -318,16 +317,3 @@ class BlipVisionModel(nn.Module, SupportsQuant):
 
         return self.post_layernorm(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        # omit layers when num_hidden_layers_override is set
-        def _filter(ws):
-            for name, weight in ws:
-                if name.startswith("encoder.layers.") and int(
-                    name.split(".")[2]
-                ) >= len(self.encoder.layers):
-                    continue
-                yield name, weight
-
-        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)

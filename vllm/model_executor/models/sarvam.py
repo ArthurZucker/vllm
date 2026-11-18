@@ -67,7 +67,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     make_empty_intermediate_tensors_factory,
@@ -586,14 +585,6 @@ class SarvamMLAModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _normalized_weights(weights), mapper=self.hf_to_vllm_mapper
-        )
 
 
 class SarvamMixtureOfExperts(MixtureOfExperts):
@@ -736,16 +727,9 @@ class SarvamMLAForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
 
 class SarvamMoEForCausalLM(BailingMoeForCausalLM):
     """Same as BailingMoeForCausalLM, but normalizes gate expert_bias pre-load."""
+    pass
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_normalized_weights(weights))

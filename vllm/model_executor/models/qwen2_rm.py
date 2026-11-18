@@ -7,7 +7,6 @@
 # Copyright 2023 The vLLM team.
 """Inference-only Qwen2-RM model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -21,7 +20,7 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsLoRA, SupportsPP
 from .interfaces_base import default_pooling_type
 from .qwen3 import Qwen3Model, use_qwen2_attention
-from .utils import AutoWeightsLoader, maybe_prefix
+from .utils import maybe_prefix
 
 
 class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
@@ -86,9 +85,6 @@ class Qwen2RewardBaseModel(nn.Module, SupportsLoRA, SupportsPP):
         logits = self.score(hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["lm_head."])
-        return loader.load_weights(weights)
 
 
 @default_pooling_type(tok_pooling_type="ALL")

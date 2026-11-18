@@ -1279,7 +1279,9 @@ class ShardedRDTWeightTransferEngine(
             # the single load pass runs the loaders on meta and records via the
             # fake's copy_ — with no inline _layerwise_process, no deferral.
             self._install_recording_stamps(model, recorder)
-            model.load_weights(
+            from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
+            load_model_weights(
+                model,
                 self._build_fake_weights(names, recorder, self.device, into._name_meta)
             )
             # Keep only fully-loaded modules (copied numel >= loadable size, the

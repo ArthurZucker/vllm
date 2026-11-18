@@ -351,8 +351,6 @@ class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
         skipped entirely."""
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_inkling_mtp_weights(self, weights)
 
 
 def _load_inkling_mtp_weights(

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """One-step auxiliary MTP proposer for Nemotron Parse 3.5."""
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -10,7 +9,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.utils import WeightsMapper
 
 
 class _ParseAuxMTPInner(nn.Module):
@@ -69,13 +68,3 @@ class ParseAuxMTPModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def mtp_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            for name, weight in weights:
-                if name == "decoder.embed_tokens.weight" or name.startswith(
-                    ("decoder.extra_heads.0.", "decoder.extra_proj.0.")
-                ):
-                    yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(mtp_weights(), mapper=self.hf_to_vllm_mapper)

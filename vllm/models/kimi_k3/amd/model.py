@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3 multimodal model implementation for vLLM."""
 
-from collections.abc import Iterable
 from typing import cast
 
 import torch
@@ -29,7 +28,6 @@ from vllm.model_executor.models.kimi_k25_vit import (
     vision_tower_forward,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -269,6 +267,3 @@ class KimiK3ForConditionalGeneration(
             vllm_config, attn_page_size_1_token, mamba_page_size, alignment
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -8,7 +8,6 @@ without performing actual token generation. It's used with the
 extract_hidden_states speculative decoding method.
 """
 
-from collections.abc import Iterable
 from dataclasses import replace
 from typing import ClassVar
 
@@ -373,6 +372,3 @@ class ExtractHiddenStatesModel(nn.Module):
         # Output is ignored - we only care about the KV cache side effects
         _ = self.cache_only_layers[str(self.target_num_hidden_layers)](hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """No weights to load for this dummy model."""
-        return set()

@@ -24,7 +24,6 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from itertools import islice
 from typing import ClassVar, cast
 
@@ -110,7 +109,6 @@ from vllm.model_executor.models.qwen3_vl import (
     mrope_positions_factor,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
@@ -643,9 +641,6 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Qwen3_5ForCausalLMBase(
@@ -789,9 +784,6 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mrope_input_positions(
         self,
@@ -938,9 +930,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits_local(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

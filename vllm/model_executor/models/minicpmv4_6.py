@@ -67,7 +67,6 @@ from .minicpmv import (
 from .module_mapping import MultiModelKeys
 from .qwen3_5 import Qwen3_5ForCausalLM
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     flatten_bn,
@@ -1513,15 +1512,6 @@ class MiniCPMV4_6ForConditionalGeneration(
 
     # ----- Weight loading -----
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _stack_vit_merger_qkv(weights),
-            mapper=self.hf_to_vllm_mapper,
-        )
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

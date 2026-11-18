@@ -16,7 +16,6 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import StackedColumnParallelLinear
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
@@ -45,6 +44,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
+from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -564,7 +564,7 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model, model_config)
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        loaded_weights = load_model_weights(model, self.get_all_weights(model_config, model))
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
@@ -595,10 +595,6 @@ class DefaultModelLoader(BaseModelLoader):
         weights_to_load = {name for name, _ in model.named_parameters()}
         if loaded_weights is not None:
             for name, module in model.named_modules():
-                if isinstance(module, StackedColumnParallelLinear):
-                    weights_to_load.update(
-                        f"{name}.{shard_id}" for shard_id in module.pop_missing_shards()
-                    )
                 # ignore online quantization scales
                 quant_method = getattr(module, "quant_method", None)
                 has_online_quant = getattr(quant_method, "uses_meta_device", False)

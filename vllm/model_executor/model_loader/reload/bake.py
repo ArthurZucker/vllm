@@ -26,6 +26,7 @@ from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
 
 from .direct import loadable_tensors
 from .trace import TraceTensor
@@ -314,7 +315,7 @@ def _bake(
         with torch.no_grad(), _TargetGuard(sink):
             while start < len(names):
                 try:
-                    model.load_weights(weights(names[start:]))
+                    load_model_weights(model, weights(names[start:]))
                     break
                 except _BakeStopped as stop:
                     # Resume after the name that stopped (not after the last

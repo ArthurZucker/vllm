@@ -62,7 +62,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     make_empty_intermediate_tensors_factory,
@@ -478,9 +477,6 @@ class BailingMoeModel(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
@@ -560,9 +556,6 @@ class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
             yield name, loaded_weight
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(self._normalize_lm_head(weights))
 
 
 class BailingMoeV2ForCausalLM(BailingMoeForCausalLM):

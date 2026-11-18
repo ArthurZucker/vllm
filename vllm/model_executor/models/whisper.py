@@ -79,7 +79,6 @@ from .interfaces import (
     SupportsTranscription,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     cast_overflow_tensors,
     make_layers,
@@ -1043,9 +1042,6 @@ class WhisperForConditionalGeneration(
         logits = self.logits_processor(self.proj_out, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 def _create_fake_bias_for_k_proj(

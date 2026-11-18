@@ -7,7 +7,7 @@ weights are skipped on load.
 """
 
 import copy
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal, TypeAlias
 
 import torch
@@ -52,7 +52,6 @@ from .interfaces import (
 )
 from .lfm3 import _short_conv_state_dtype, _short_conv_state_shape
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -406,6 +405,3 @@ class Lfm3AudioForConditionalGeneration(
             self.config, self.language_model.compute_logits(hidden_states)
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     runai_safetensors_weights_iterator,
 )
 from vllm.transformers_utils.repo_utils import resolve_revision
+from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
 from vllm.transformers_utils.runai_utils import (
     is_runai_obj_uri,
     list_safetensors,
@@ -281,4 +282,4 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into a model."""
-        model.load_weights(self.get_all_weights(model_config, model))
+        load_model_weights(model, self.get_all_weights(model_config, model))

@@ -24,7 +24,7 @@
 """Inference-only Cohere Compass model compatible with HuggingFace weights."""
 
 import math
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from functools import lru_cache, partial
 from itertools import islice
 from typing import Annotated, Any, Literal, TypeAlias
@@ -124,7 +124,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
@@ -1007,9 +1006,6 @@ class Cohere_VisionTransformer(nn.Module):
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 def _create_cohere_compass_field_factory(
@@ -1954,9 +1950,6 @@ class CohereCompassForConditionalGeneration(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models"""

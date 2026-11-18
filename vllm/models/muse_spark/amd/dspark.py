@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dense Muse Spark DSpark draft model for AMD ROCm GPUs."""
 
-from collections.abc import Iterable
 from copy import copy
 
 import torch
@@ -24,7 +23,6 @@ from vllm.model_executor.models.qwen3_dspark import (
     Qwen3DSparkForCausalLM,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
@@ -383,26 +381,6 @@ class MuseSparkDSparkForCausalLM(Qwen3DSparkForCausalLM):
             hidden_states.to(self.model.fc.weight.dtype)
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        model_weights = {}
-        for name, loaded_weight in weights:
-            if name == "t2d":
-                continue
-            if name == "d2t":
-                name = "draft_id_to_target_id"
-            elif "lm_head" not in name:
-                name = "model." + name
-            model_weights[name] = loaded_weight
-        mapper = WeightsMapper(
-            orig_to_new_substr={
-                "model.embed_tokens": None,
-                "model.mask_embedding": None,
-            },
-            orig_to_new_stacked=self.hf_to_vllm_mapper.orig_to_new_stacked,
-        )
-        return AutoWeightsLoader(self).load_weights(
-            model_weights.items(), mapper=mapper
-        )
 
     def process_weights_after_loading(self) -> None:
         super().process_weights_after_loading()

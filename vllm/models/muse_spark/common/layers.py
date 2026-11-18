@@ -3,7 +3,6 @@
 """Platform-neutral Muse Spark building blocks shared by the NVIDIA and AMD stacks."""
 
 import math
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -405,16 +404,6 @@ class MuseSparkQKVOGateParallelLinear(ColumnParallelLinear):
         assert param_shard.shape == loaded_weight.shape
         param_shard.copy_(loaded_weight)
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        for name, loaded_weight in weights:
-            shard_id = getattr(loaded_weight, "shard_id", None)
-            if name == "bias" and self.bias is None:
-                continue
-            param = getattr(self, name)
-            self.weight_loader(param, loaded_weight, shard_id)
-            yield name
 
 
 __all__ = [

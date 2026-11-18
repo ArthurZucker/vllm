@@ -21,7 +21,6 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
@@ -541,11 +540,6 @@ class K3DSparkForCausalLM(nn.Module):
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        # read: 1. all weights. 2. context kv weights
-        weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()

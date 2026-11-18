@@ -70,7 +70,7 @@ from vllm.model_executor.models.transformers.fusers.attention import (
     VLLM_ATTN_IMPL,
     VLLM_MLA_ATTN_IMPL,
 )
-from vllm.model_executor.models.transformers.loader import load_with_ops
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.models.transformers.utils import (
     attrsetter,
     can_enable_torch_compile,
@@ -86,7 +86,6 @@ from vllm.model_executor.models.transformers.utils import (
     replace_linear_class,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     ShardId,
     WeightsMapper,
@@ -912,11 +911,6 @@ class Base(
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=self.ignore_unexpected_prefixes,
-            ignore_unexpected_suffixes=self.ignore_unexpected_suffixes,
-        )
         # vLLM kept a quant config: its kernels take the tensors as they are. Else the
         # format is one only Transformers reads, dequantized by its ops
         hf_quantizer = quantization_plan(
@@ -938,19 +932,7 @@ class Base(
             hf_quantizer,
             checkpoint_keys,
         )
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        loaded: set[str] = set()
-        # ponytail: env switch back to the layers' `weight_loader`s, for A/B checks
-        if os.environ.get("VLLM_TRANSFORMERS_WEIGHT_LOADERS") != "1":
-            weights = load_with_ops(self, weights, loaded)
-        rest = loader.load_weights(weights)
-        logger.info(
-            "Loaded %d params with Transformers' ops, %d with weight_loaders: %s",
-            len(loaded),
-            len(rest),
-            sorted(rest)[:8],
-        )
-        return loaded | rest
+        return load_with_ops(self, weights)
 
     @staticmethod
     def check_version(min_version: str, feature: str):

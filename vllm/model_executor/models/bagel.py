@@ -7,7 +7,7 @@ BAGEL is a unified multimodal model for image understanding and generation.
 For vLLM, we focus on the image understanding (vision-to-text) capabilities.
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
 import torch
@@ -47,7 +47,6 @@ from .interfaces import (
 )
 from .siglip import SiglipVisionModel
 from .utils import (
-    AutoWeightsLoader,
     StageMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
@@ -523,46 +522,3 @@ class BagelForConditionalGeneration(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights from checkpoint."""
-        # Skip generation-related weights since we only support text2text and image2text
-        # Filter out all image generation components:
-        # - 'moe_gen': MoE generation weights
-        # - 'latent_pos_embed': Latent position embeddings for VAE
-        # - 'llm2vae', 'vae2llm': LLM-VAE projections
-        # - 'time_embedder': Timestep embeddings for diffusion
-        # - VAE encoder/decoder: Use specific prefixes to avoid matching vision encoder
-        generation_keywords = [
-            "moe_gen",
-            "latent_pos_embed",
-            "llm2vae",
-            "vae2llm",
-            "time_embedder",
-        ]
-        vae_prefixes = [
-            "decoder.",
-            "encoder.",
-        ]  # VAE encoder/decoder, not vision encoder
-        filtered_weights = []
-        for name, tensor in weights:
-            # Skip generation-related keywords
-            if any(skip in name for skip in generation_keywords):
-                continue
-            if any(name.startswith(prefix) for prefix in vae_prefixes):
-                continue
-
-            if "patch_embedding.weight" in name and tensor.ndim == 2:
-                out_channels = tensor.shape[0]
-                in_features = tensor.shape[1]
-                patch_size = self.config.vit_config.patch_size
-                in_channels = self.config.vit_config.num_channels
-                if in_features == in_channels * patch_size * patch_size:
-                    tensor = tensor.reshape(
-                        out_channels, patch_size, patch_size, in_channels
-                    )
-                    tensor = tensor.permute(0, 3, 1, 2).contiguous()
-
-            filtered_weights.append((name, tensor))
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)

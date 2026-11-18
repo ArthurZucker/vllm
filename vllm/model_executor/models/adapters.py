@@ -148,7 +148,7 @@ def _create_pooling_model_cls(orig_cls: type[_T]) -> type[_T]:
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-    from .utils import AutoWeightsLoader, StageMissingLayer, no_init_weights
+    from .utils import StageMissingLayer, no_init_weights
 
     class ModelForPooling(orig_cls, VllmModelForPooling):  # type: ignore[valid-type,misc]
         is_pooling_model = True
@@ -256,16 +256,10 @@ def _create_pooling_model_cls(orig_cls: type[_T]) -> type[_T]:
                 for name, weight in itertools.chain(seen_weights, weights)
             )
 
-            def default_load_weights(weights):
-                loader = AutoWeightsLoader(self)
-                mapper = getattr(self, "hf_to_vllm_mapper", None)
-                return loader.load_weights(weights, mapper=mapper)
+            from vllm.model_executor.model_loader.ops_loader import load_with_ops
 
-            load_weights = getattr(super(), "load_weights", default_load_weights)
-            return load_weights(mapped_weights)
+            return load_with_ops(self, mapped_weights)
 
-        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-            return self._load_pooling_model_weights(weights)
 
     return ModelForPooling
 
@@ -400,34 +394,6 @@ def as_seq_cls_model(cls: type[_T]) -> type[_T]:
 
             return DispatchPooler.for_seq_cls(pooler_config, classifier=self.score)
 
-        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-            hf_config = self.config
-            text_config = hf_config.get_text_config()
-            tokens = getattr(
-                hf_config,
-                "classifier_from_token",
-                getattr(text_config, "classifier_from_token", None),
-            )
-            method = getattr(hf_config, "method", getattr(text_config, "method", None))
-
-            def auto_set_score_bias(weights):
-                for name, weight in weights:
-                    if name == "score.bias":
-                        device = self.score.weight.device
-                        dtype = self.score.weight.dtype
-                        bias = weight.to(device).to(dtype)
-                        self.score.bias = torch.nn.Parameter(bias)
-                        self.score.skip_bias_add = False
-                    else:
-                        yield name, weight
-
-            weights = auto_set_score_bias(weights)
-            if tokens is None and method is None:
-                return super().load_weights(weights)
-            else:
-                # Online convert ForCausalLM into
-                # ForSequenceClassification model.
-                return seq_cls_model_loader(self, weights)
 
     ModelForSequenceClassification.__name__ = _get_pooling_model_name(
         cls.__name__, "ForSequenceClassification"

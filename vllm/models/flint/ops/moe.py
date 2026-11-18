@@ -22,7 +22,6 @@ Triton combine. Both paths read the same weights in FlashInfer's layout (see
 `FlintMoEWeights.from_modelopt`).
 """
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 import regex as re
@@ -909,28 +908,6 @@ class FlintNvfp4Experts(nn.Module):
         self._join = torch.cuda.Event()
         self.weights: FlintMoEWeights | None = None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded: set[str] = set()
-        inter = self.w2_weight.shape[2] * 2
-        for name, w in weights:
-            m = _EXPERT_PARAM.fullmatch(name)
-            if m is None:
-                raise ValueError(f"Unexpected Flint expert weight: {name}")
-            e, proj, kind = int(m.group(1)), m.group(2), m.group(3)
-            param_name = ("w2_" if proj == "down_proj" else "w13_") + kind
-            param = getattr(self, param_name)
-            if proj == "down_proj":
-                param.data[e].copy_(w)
-            elif kind == "weight_scale_2":
-                param.data[e, int(proj == "up_proj")].copy_(w)
-            else:
-                rows = slice(inter, 2 * inter) if proj == "up_proj" else slice(inter)
-                param.data[e, rows].copy_(w)
-            loaded.add(param_name)
-            self._loaded_names.add(name)
-        if len(self._loaded_names) == 9 * self.num_experts:
-            self._repack()
-        return loaded
 
     def _repack(self) -> None:
         gs = self.w13_weight_scale_2.data

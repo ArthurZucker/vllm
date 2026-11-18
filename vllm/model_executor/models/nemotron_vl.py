@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import math
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -48,7 +46,6 @@ from .interfaces import (
 )
 from .interfaces_base import VllmModelForPooling
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -388,9 +385,6 @@ class LlamaNemotronVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, Suppor
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
@@ -559,10 +553,6 @@ class LlamaNemotronVLForEmbedding(LlamaNemotronVLChatModel, VllmModelForPooling)
         ).view(original_shape)
         return self.vision_model(pixel_values)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Override to use different weight mapping for SigLIP."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class LlamaNemotronVLForSequenceClassification(
@@ -597,23 +587,3 @@ class LlamaNemotronVLForSequenceClassification(
         assert pooler_config is not None
         self.pooler = DispatchPooler.for_seq_cls(pooler_config, classifier=self.score)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded_weights = super().load_weights(weights)
-
-        # reranker checkpoint omits the inner LM seq-cls head
-        # (`language_model.score.*`). It is unused by this outer model, but
-        # the default loader expects all parameters to be initialized.
-        for name, param in self.named_parameters():
-            if not name.startswith("language_model.score.") or name in loaded_weights:
-                continue
-
-            if name.endswith(".weight"):
-                torch.nn.init.kaiming_uniform_(param, a=math.sqrt(5))
-            elif name.endswith(".bias"):
-                torch.nn.init.zeros_(param)
-            else:
-                torch.nn.init.normal_(param, mean=0.0, std=0.02)
-
-            loaded_weights.add(name)
-
-        return loaded_weights

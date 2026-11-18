@@ -3,7 +3,7 @@
 """EmbeddingGemma2: bidirectional Gemma4-derived multimodal embedding model."""
 
 import dataclasses
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import torch
@@ -57,7 +57,6 @@ from vllm.model_executor.models.transformers.utils import (
     recursive_replace_linear,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
@@ -1125,19 +1124,6 @@ class EmbeddingGemma2Model(nn.Module, SupportsMultiModal, VllmModelForPooling):
     ) -> torch.Tensor:
         return self.language_model(input_ids, positions, inputs_embeds=inputs_embeds)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        ignore_prefixes = [
-            "embed_vision.embedding.",
-            "embed_audio.embedding.",
-        ]
-        if self.audio_tower is None:
-            ignore_prefixes.extend(["audio_tower.", "embed_audio."])
-        if self.vision_tower is None:
-            ignore_prefixes.extend(["vision_tower.", "embed_vision."])
-        return AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=ignore_prefixes,
-        ).load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int = 0) -> str | None:

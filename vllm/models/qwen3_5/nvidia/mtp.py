@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -30,7 +29,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     _merge_multimodal_embeddings,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
@@ -165,9 +163,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = hidden_states[: positions.shape[-1]]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
@@ -271,19 +266,6 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             key in name for key in ["embed_tokens", "lm_head"]
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def remap_weight_names(weights):
-            for name, weight in weights:
-                if self.is_unused_checkpoint_weight(name):
-                    continue
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif "embed_tokens" in name:
-                    name = name.replace("language_model.", "")
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

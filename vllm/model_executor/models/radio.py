@@ -52,7 +52,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.intern_vit import InternMLP
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.utils.torch_utils import async_tensor_h2d
 
@@ -709,33 +709,6 @@ class RadioModel(nn.Module):
 
         return self._extract_final(encoder_outputs, imgs_sizes=imgs_sizes)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load RADIO checkpoint weights, remapping legacy remote-code and
-        native Transformers keys onto this module tree via
-        `hf_to_vllm_mapper`."""
-        if isinstance(weights, dict):
-            weights = weights.items()
-        # Keep only tensors belonging to the RADIO tower (legacy ``radio_model.*``
-        # or native top-level keys); ignore any auxiliary keys a fuller checkpoint
-        # may carry (an unmapped tower key still errors).
-        prefixes = (
-            "radio_model.",
-            "embeddings.",
-            "encoder.",
-            "input_conditioner.",
-            "summary_idxs",
-        )
-        weights = ((name, w) for name, w in weights if name.startswith(prefixes))
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        if not loaded:
-            logger.warning(
-                "RadioModel.load_weights matched no checkpoint tensors; the "
-                "vision tower will keep its random initialization. Expected "
-                "legacy 'radio_model.*' or native 'embeddings.*'/'encoder.*' "
-                "keys."
-            )
-        return loaded
 
     def _extract_final(
         self, y: torch.Tensor, imgs_sizes: list[tuple[int, int]] | None = None

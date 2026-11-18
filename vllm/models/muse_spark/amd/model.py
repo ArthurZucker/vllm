@@ -4,7 +4,6 @@
 
 import functools
 import math
-from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -38,7 +37,6 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
@@ -1303,36 +1301,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             )
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def interleaved_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            config = self.model.config
-            qk_rows = (
-                config.num_attention_heads * config.head_dim,
-                config.num_key_value_heads * config.head_dim,
-            )
-            for name, weight in weights:
-                if (
-                    name.startswith(
-                        ("model.language_model.layers.", "model.layers.", "layers.")
-                    )
-                    and (".self_attn.q_proj." in name or ".self_attn.k_proj." in name)
-                    and name.rsplit(".", 1)[-1].startswith("weight")
-                    and weight.dim() >= 1
-                    and weight.shape[0] in qk_rows
-                ):
-                    # HF stores Q/K rows as [even | odd] per head (NoPE too);
-                    # restore interleaved pairs before TP slicing. Per-row
-                    # scales move with their rows; 0-d scales stay.
-                    shape = weight.shape
-                    weight = (
-                        weight.reshape(-1, 2, config.head_dim // 2, *shape[1:])
-                        .transpose(1, 2)
-                        .reshape(shape)
-                    )
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(interleaved_weights(), mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         n_gates = materialize_residual_path_constants(self)

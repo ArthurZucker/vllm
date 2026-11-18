@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only ZAYA1 model."""
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -30,7 +29,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import maybe_prefix, sequence_parallel_chunk
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -580,34 +578,3 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.named_parameters(remove_duplicate=False))
-        params.update(self.named_buffers())
-        loaded: set[str] = set()
-
-        def load_expert(name: str, weight: torch.Tensor, shard_id: str) -> None:
-            param = params[name]
-            for expert_id, expert_weight in enumerate(weight):
-                param.weight_loader(
-                    param, expert_weight, name, shard_id=shard_id, expert_id=expert_id
-                )
-            loaded.add(name)
-
-        for name, weight in weights:
-            # Experts are stacked: `experts.{gate_up,down}_proj[.<quant param>]`
-            prefix, is_expert, suffix = name.partition(".mlp.experts.")
-            proj, _, param_name = suffix.partition(".")
-            experts = f"{prefix}.mlp.experts.routed_experts"
-            param_name = param_name or "weight"
-            if is_expert and proj == "gate_up_proj":
-                gate, up = weight.chunk(2, dim=1)
-                load_expert(f"{experts}.w13_{param_name}", gate, "w1")
-                load_expert(f"{experts}.w13_{param_name}", up, "w3")
-            elif is_expert and proj == "down_proj":
-                load_expert(f"{experts}.w2_{param_name}", weight, "w2")
-            elif name != "lm_head.weight" or not self.config.tie_word_embeddings:
-                param = params[name]
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, weight)
-                loaded.add(name)
-        return loaded

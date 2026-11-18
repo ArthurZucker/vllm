@@ -4,7 +4,7 @@
 
 import copy
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 
 import torch
 from torch import nn
@@ -12,7 +12,6 @@ from transformers import PreTrainedConfig
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -20,12 +19,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.model_executor.models.utils import (
-    is_pp_missing_parameter,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
@@ -713,129 +707,3 @@ class HYV4MTP(nn.Module):
                 loaded_params.add(name_mapped)
         return consumed
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        mtp_start = self.config.num_hidden_layers
-        shared_weights = {
-            "model.embed_tokens.weight": "model.embed_tokens.weight",
-            "lm_head.weight": f"model.layers.{mtp_start}.shared_head.head.weight",
-        }
-
-        num_experts = getattr(self.config, "n_routed_experts", 0)
-
-        # Routed-expert weights come in two checkpoint layouts:
-        #   split: mlp.experts.<id>.gate_proj.weight
-        #   fused: mlp.experts.gate_up_proj (all experts in one tensor)
-        # The split layout is resolved through the shared EPLB helper so the
-        # target param names stay in sync with the RoutedExperts module layout;
-        # the fused layout is resolved from the live parameter names.
-        split_expert_params_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=num_experts,
-        )
-        fused_expert_param_names: dict[tuple[str, str], str] = {}
-        for param_name in params_dict:
-            for tag in ("w13_weight", "w2_weight"):
-                if param_name.endswith(tag) and ".experts." in param_name:
-                    base = param_name.split(".experts.")[0]
-                    fused_expert_param_names[base, tag] = param_name
-        stacked_mapping = [
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-            # MLA runs both latent down-projections as one GEMM.
-            (".fused_qkv_a_proj", ".q_a_proj", 0),
-            (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-        ]
-
-        for name, loaded_weight in weights:
-            if name in shared_weights:
-                target_name = shared_weights[name]
-                if target_name in params_dict:
-                    param = params_dict[target_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(target_name)
-                continue
-
-            spec_layer = None
-            if name.startswith("model.mtp_layers."):
-                parts = name.split(".")
-                if len(parts) > 3 and parts[2].isdigit():
-                    spec_layer = mtp_start + int(parts[2])
-                    name = name.replace(
-                        f"model.mtp_layers.{parts[2]}.",
-                        f"model.layers.{spec_layer}.",
-                    )
-            else:
-                spec_layer = _get_spec_layer_idx_from_weight_name(self.config, name)
-
-            if spec_layer is None:
-                continue
-
-            name = self._rewrite_spec_layer_name(spec_layer, name)
-            if name == "__skip__":
-                continue
-            name, loaded_weight = _prepare_mtp_fp8_expert_scale(
-                self.quant_config, name, loaded_weight
-            )
-
-            if "mlp.gate.e_score_correction_bias" in name:
-                name = name.replace("gate.e_score_correction_bias", "expert_bias")
-
-            is_loaded = False
-            for param_name, weight_name, shard_id in stacked_mapping:
-                if weight_name not in name or ".experts." in name:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                if name_mapped not in params_dict:
-                    if is_pp_missing_parameter(name_mapped, self):
-                        is_loaded = True
-                    break
-                param = params_dict[name_mapped]
-                param.weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name_mapped)
-                is_loaded = True
-                break
-            if is_loaded:
-                continue
-
-            is_loaded = False
-            if ".experts." in name:
-                is_loaded = self._load_expert_weight(
-                    name,
-                    loaded_weight,
-                    params_dict,
-                    loaded_params,
-                    split_expert_params_mapping,
-                    fused_expert_param_names,
-                    num_experts,
-                )
-            if is_loaded:
-                continue
-
-            remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            if remapped_name is None:
-                continue
-            name = remapped_name
-            if name not in params_dict:
-                if is_pp_missing_parameter(name, self):
-                    continue
-                if _should_skip_missing_mtp_scale_param(self.quant_config, name):
-                    continue
-                logger.warning_once("Skipping unknown MTP weight: %s", name)
-                continue
-
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        logger.info_once("HYV4 MTP draft model loaded: %d params", len(loaded_params))
-        return loaded_params

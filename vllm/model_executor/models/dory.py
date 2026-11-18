@@ -4,7 +4,6 @@
 """Dory: normalized latent recurrent transformer."""
 
 import math
-from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -26,8 +25,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.sequence import IntermediateTensors
 
 from .utils import maybe_prefix
@@ -329,58 +326,6 @@ class DoryForCausalLM(nn.Module):
             )
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked = [
-            # (target, artifact shard name, shard id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params = dict(self.named_parameters())
-        loaded: set[str] = set()
-        for name, w in weights:
-            mapped = False
-            for target, shard_name, shard_id in stacked:
-                if f".{shard_name}." not in name:
-                    continue
-                pname = name.replace(f".{shard_name}.", f".{target}.")
-                param = params[pname]
-                if target == "qkv_proj":
-                    heads = (
-                        self.config.num_attention_heads
-                        if shard_id == "q"
-                        else self.config.num_key_value_heads
-                    )
-                    rows = heads * self.config.head_dim
-                else:
-                    rows = self.config.intermediate_size
-                if isinstance(param, PerTensorScaleParameter):
-                    shape = () if w.ndim == 0 else (1,)
-                else:
-                    # Preserve packed input columns and per-block scale columns.
-                    shape = (rows, *param.shape[1:])
-                self._check_weight_shape(name, w, shape)
-                param.weight_loader(param, w, shard_id)
-                loaded.add(pname)  # report the MODEL param name, not the artifact name
-                mapped = True
-                break
-            if mapped:
-                continue
-
-            param = params[name]
-            shape = (
-                (self.config.vocab_size, self.config.hidden_size)
-                if name in ("backbone.embeddings.weight", "lm_head.weight")
-                else tuple(param.shape)
-            )
-            if isinstance(param, PerTensorScaleParameter) and w.ndim == 0:
-                shape = ()
-            self._check_weight_shape(name, w, shape)
-            getattr(param, "weight_loader", default_weight_loader)(param, w)
-            loaded.add(name)
-        return loaded
 
     @staticmethod
     def _check_weight_shape(name, weight, expected):

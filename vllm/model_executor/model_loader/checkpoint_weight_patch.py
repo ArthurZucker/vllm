@@ -17,6 +17,10 @@ from typing import NamedTuple
 
 import torch
 
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
+)
+
 _DEFAULT_PATCH_CHUNK_BYTES = 512 << 20
 
 __all__ = [
@@ -80,7 +84,7 @@ def _load_nan_masked_weights(
 
     torch.Tensor.copy_ = copy_non_nan_
     try:
-        return model.load_weights(weights)
+        return load_model_weights(model, weights)
     finally:
         torch.Tensor.copy_ = original_copy
 
@@ -132,7 +136,7 @@ def _load_weight_chunk(
     if sparse:
         loaded_names = _load_nan_masked_weights(model, weights)
     else:
-        loaded_names = model.load_weights(weights)
+        loaded_names = load_model_weights(model, weights)
     return set() if loaded_names is None else set(loaded_names)
 
 
@@ -265,7 +269,7 @@ def load_checkpoint_weight_patches(
         _validate_sparse_patches(patch_list, max_chunk_bytes, validate_unique_indices)
 
     loaded_names: set[str] = set()
-    # Collect checkpoint tensors for one model.load_weights() call.
+    # Collect checkpoint tensors for one load_model_weights() call.
     weight_chunk: list[tuple[str, torch.Tensor]] = []
     chunk_names: set[str] = set()
     chunk_bytes = 0

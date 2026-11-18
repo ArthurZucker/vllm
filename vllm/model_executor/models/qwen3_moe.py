@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
@@ -74,7 +73,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
@@ -517,19 +515,6 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_suffixes=[
-                ".bias",
-                "_bias",
-                ".weight_scale",
-                "_weight_scale",
-                ".input_scale",
-                "_input_scale",
-            ],
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Qwen3MoeForCausalLM(
@@ -646,6 +631,3 @@ class Qwen3MoeForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

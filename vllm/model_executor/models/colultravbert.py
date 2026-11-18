@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 import torch
 from torch import nn
@@ -31,7 +31,6 @@ from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import (
     ImageProcessorItems,
@@ -57,7 +56,7 @@ from .interfaces import (
 )
 from .interfaces_base import default_pooling_type
 from .siglip import SiglipVisionModel
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 
 
 class UltraBertAttention(nn.Module):
@@ -231,30 +230,6 @@ class UltraBertModel(nn.Module):
             hidden_states = layer(positions, hidden_states)
         return self.norm(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class ColUltraVBertConnector(nn.Module):
@@ -518,16 +493,3 @@ class ColUltraVBertForRetrieval(nn.Module, SupportsMultiModal, SupportsLateInter
             input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
         )
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        projector = getattr(self.pooler.head, "projector", None)
-        if isinstance(projector, nn.Module):
-            loaded |= {
-                f"pooler.head.projector.{name}"
-                for name, _ in projector.named_parameters()
-            }
-        return loaded

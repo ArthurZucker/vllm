@@ -19,7 +19,6 @@ Checkpoint layout (`gemma4_assistant`)::
     masked_embedding.token_ordering -- token-to-centroid mapping buffer
 """
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -50,7 +49,6 @@ from vllm.v1.worker.gpu.spec_decode.gemma4.config import Gemma4MTPSpeculatorConf
 
 from .gemma4 import Gemma4MLP, _get_text_config
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     extract_layer_index,
     get_draft_quant_config,
@@ -594,9 +592,6 @@ class Gemma4MTP(nn.Module):
             self._get_full_lm_head_weight(),
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         # Built here, outside inference mode, and refilled in place on reload.

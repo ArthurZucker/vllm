@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Bailing MoE v2.5 MTP model."""
 
-from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
@@ -18,10 +17,6 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
-)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.bailing_moe_linear import (
     BailingMoeV25,
@@ -244,119 +239,3 @@ class BailingMoeV25MTPModel(nn.Module):
             num_redundant_experts=0,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".fused_qkv_a_proj", ".q_a_proj", 0),
-            (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        expert_params_mapping = list(self.get_expert_mapping())
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        def load_param(
-            name: str,
-            loaded_weight: torch.Tensor,
-            shard_id=None,
-        ) -> bool:
-            remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            if remapped_name is None:
-                return False
-            name = remapped_name
-            if name not in params_dict:
-                return False
-
-            param = params_dict[name]
-            weight_loader: Callable[..., None] = getattr(
-                param, "weight_loader", default_weight_loader
-            )
-            if shard_id is None:
-                weight_loader(param, loaded_weight)
-            elif isinstance(shard_id, int):
-                weight_loader(param, loaded_weight, shard_id)
-            else:
-                weight_loader(
-                    param,
-                    loaded_weight,
-                    name,
-                    expert_id=shard_id[0],
-                    shard_id=shard_id[1],
-                )
-            loaded_params.add(name)
-            return True
-
-        def get_spec_layer_idx(name: str) -> int | None:
-            if not name.startswith("model.layers."):
-                return None
-            try:
-                layer_idx = int(name.split("model.layers.", 1)[1].split(".", 1)[0])
-            except (IndexError, ValueError):
-                return None
-            mtp_idx = layer_idx - self.config.num_hidden_layers
-            if 0 <= mtp_idx < self.config.num_nextn_predict_layers:
-                return layer_idx
-            return None
-
-        def normalize_name(name: str) -> str:
-            name = name.replace(".attention.dense", ".self_attn.o_proj")
-            name = name.replace(".attention.", ".self_attn.")
-            return name.replace(
-                "mlp.gate.e_score_correction_bias",
-                "mlp.gate.expert_bias",
-            )
-
-        def load_lm_head(loaded_weight: torch.Tensor) -> None:
-            for layer_idx in range(
-                self.model.mtp_start_layer_idx,
-                self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
-            ):
-                name = f"model.layers.{layer_idx}.shared_head.head.weight"
-                load_param(name, loaded_weight)
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if name == "model.word_embeddings.weight":
-                load_param("model.embed_tokens.weight", loaded_weight)
-                continue
-            if name == "lm_head.weight":
-                load_lm_head(loaded_weight)
-                continue
-
-            spec_layer = get_spec_layer_idx(name)
-            if spec_layer is None:
-                continue
-            name = normalize_name(name)
-
-            loaded = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "mlp.experts." in name and name not in params_dict:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                if load_param(mapped_name, loaded_weight, shard_id):
-                    loaded = True
-                    break
-            if loaded:
-                continue
-
-            if "mlp.experts" in name:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, expert_shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    mapped_name = name.replace(weight_name, param_name)
-                    if load_param(
-                        mapped_name,
-                        loaded_weight,
-                        (expert_id, expert_shard_id),
-                    ):
-                        break
-                continue
-
-            load_param(name, loaded_weight)
-
-        return loaded_params

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -51,7 +50,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
@@ -492,9 +490,6 @@ class Lfm2MoeModel(nn.Module):
         hidden_states, _ = self.embedding_norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias", "_bias"])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Lfm2MoeForCausalLM(
@@ -663,6 +658,3 @@ class Lfm2MoeForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

@@ -17,7 +17,7 @@ kernel. Module names follow NeMo so the checkpoint loads by prefix.
 """
 
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -1075,31 +1075,3 @@ class Nemotron3_5TranscribeAudioTower(nn.Module):
             emb[:length] for emb, length in zip(embeddings, encoded_lengths.tolist())
         ]
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load NeMo `perception.*` tensors, named without the `perception.`."""
-        targets = dict(self.named_parameters())
-        targets.update(dict(self.named_buffers()))
-        targets.pop("encoder.diar_kernel", None)
-        loaded: set[str] = set()
-        for name, tensor in weights:
-            if name.endswith("._extra_state") or name.startswith(
-                _UNUSED_CHECKPOINT_PREFIXES
-            ):
-                continue
-            target = targets.get(name)
-            if target is None:
-                raise ValueError(f"Unexpected audio tower weight {name!r}.")
-            weight_loader = getattr(target, "weight_loader", None)
-            if weight_loader is not None:
-                # vLLM's linear layers: quantized parameters and scalar scales.
-                weight_loader(target, tensor)
-            elif target.shape != tensor.shape:
-                raise ValueError(
-                    f"Shape mismatch for {name!r}: {tuple(tensor.shape)} vs "
-                    f"{tuple(target.shape)}."
-                )
-            else:
-                with torch.no_grad():
-                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
-            loaded.add(name)
-        return loaded

@@ -8,7 +8,7 @@
 # https://github.com/vllm-project/vllm/blob/v0.10.2/vllm/model_executor/models/bart.py
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, cast
 
 import numpy as np
@@ -36,7 +36,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
@@ -302,44 +301,6 @@ class MBartDecoderNoPos(nn.Module):
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            # MergedColumnParallelLinear uses integer indices (0, 1)
-            (".encoder_attn.kv_proj", ".encoder_attn.k_proj", 0),
-            (".encoder_attn.kv_proj", ".encoder_attn.v_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if name.startswith("embed_positions"):
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class NemotronParsePixelInputs(TensorSchema):
@@ -600,22 +561,6 @@ class RadioWithNeck(nn.Module):
 
         return output
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        model_encoder_weights = []
-        adaptor_dict = {
-            name: param
-            for name, param in dict(self.named_parameters()).items()
-            if not name.startswith("model_encoder")
-        }
-        for name, w in weights:
-            if name.startswith("model_encoder"):
-                model_encoder_weights.append((".".join(name.split(".")[1:]), w))
-            else:
-                param = adaptor_dict[name]
-                with torch.no_grad():
-                    default_weight_loader(param, w)
-
-        self.model_encoder.load_weights(model_encoder_weights)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -748,36 +693,3 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        lm_head_dict = dict(self.lm_head.named_parameters())
-
-        def is_encoder(name: str) -> bool:
-            return name.startswith("encoder")
-
-        def is_decoder(name: str) -> bool:
-            return name.startswith("decoder")
-
-        def is_lm_head(name: str):
-            return name.startswith("lm_head")
-
-        # Separate weights by component
-        encoder_weights = []
-        decoder_weights = []
-
-        for name, w in weights:
-            if is_encoder(name):
-                encoder_weights.append((".".join(name.split(".")[1:]), w))
-            elif is_decoder(name):
-                decoder_weights.append((".".join(name.split(".")[1:]), w))
-            elif is_lm_head(name):
-                trimmed_name = ".".join(name.split(".")[1:])
-                param = lm_head_dict[trimmed_name]
-                with torch.no_grad():
-                    default_weight_loader(param, w)
-            else:
-                logger.info("Found unexpected weight: %s", name)
-
-        # Load encoder weights
-        self.encoder.load_weights(encoder_weights)
-        # Load decoder weights
-        self.decoder.load_weights(decoder_weights)

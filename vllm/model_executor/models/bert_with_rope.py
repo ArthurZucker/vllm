@@ -34,9 +34,7 @@ from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
@@ -492,47 +490,6 @@ class BertWithRope(nn.Module, SupportsQuant):
             )
         return self.encoder(positions, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-
-        if self.config.hidden_act in ["silu", "geglu"]:
-            stacked_params_mapping = [
-                # (param_name, shard_name, shard_id)
-                ("gate_up_proj", "gate_proj", 0),
-                ("gate_up_proj", "up_proj", 1),
-            ]
-        else:
-            stacked_params_mapping = []
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if not self.add_pooling_layer and "pooler" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if name.endswith((".w1", ".w2")):
-                    # Nomic-MoE has fused experts weights
-                    weight_loader(param, loaded_weight, name)
-                else:
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class NomicBertModel(BertWithRope):
@@ -592,10 +549,6 @@ class GteNewModel(BertWithRope):
                 continue
             yield name, weight
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.ignore_unnecessary_layers(weights)
-        weights = self.split_up_gate_proj(weights)
-        return super().load_weights(weights)
 
 
 class SnowflakeGteNewModel(GteNewModel):
@@ -672,9 +625,6 @@ class JinaRobertaModel(BertWithRope):
 
         return [(name, weight) for name, weight in weights_dict.items()]
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.jina_merge_lora_weights(weights)
-        return super().load_weights(weights)
 
 
 @default_pooling_type(seq_pooling_type="CLS")
@@ -708,10 +658,6 @@ class GteNewForSequenceClassification(nn.Module, SupportsCrossEncoding):
             classifier=self.classifier,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights)
-        return loaded_params
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.new.embed_input_ids(input_ids)

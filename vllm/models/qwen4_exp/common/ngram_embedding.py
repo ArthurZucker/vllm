@@ -895,17 +895,3 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._shared_ptrs.add(weight.data_ptr())
         return weight
 
-    def weight_loader(
-        self,
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        checkpoint_start: int | None = None,
-    ) -> None:
-        if param.data_ptr() not in self._shared_ptrs:
-            super().weight_loader(param, loaded_weight, checkpoint_start)
-            return
-        if self._shared_group.rank_in_group == 0:
-            super().weight_loader(param, loaded_weight, checkpoint_start)
-        # Read order may differ across ranks. Equal load counts ensure all shared
-        # tables are ready after the last weight-loader call returns.
-        torch.distributed.barrier(group=self._shared_group.cpu_group)

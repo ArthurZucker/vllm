@@ -51,7 +51,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsPP, SupportsQuant
 from .utils import (
-    AutoWeightsLoader,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -309,9 +308,6 @@ class BloomModel(nn.Module):
                 loaded_weight = loaded_weight.reshape(shape)
             yield name, loaded_weight
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(self._repack_qkv(weights))
 
 
 class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
@@ -359,10 +355,6 @@ class BloomForCausalLM(nn.Module, SupportsPP, SupportsQuant):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        weights = _add_transformer_prefix(weights)
-        return loader.load_weights(weights)
 
 
 def _add_transformer_prefix(

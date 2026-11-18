@@ -16,7 +16,6 @@
 # limitations under the License.
 """Transformers modeling backend mixin for Mixture of Experts (MoE) models."""
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -193,18 +192,7 @@ class TransformersRoutedExperts(RoutedExperts):
         mixtral_fused, mixtral_unfused = mixtral_map[:3], mixtral_map[3:]
         return common_fused + mixtral_fused + common_unfused + mixtral_unfused
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        return super().load_weights(self._detect_mixtral_format(weights))
 
-    def _detect_mixtral_format(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in weights:
-            uses_w123 = any(f".{w}." in f".{name}" for w in ("w1", "w2", "w3"))
-            self._is_mixtral_format = bool(self._is_mixtral_format) or uses_w123
-            yield name, weight
 
 
 class MoEMixin(MixtureOfExperts, Base):

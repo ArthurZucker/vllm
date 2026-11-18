@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -21,11 +20,9 @@ from vllm.model_executor.models.commandr import (
 )
 
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
 )
 
 logger = init_logger(__name__)
@@ -179,21 +176,3 @@ class EagleCohereForCausalLM(CohereForCausalLM):
             )
         return self.model(input_ids, positions, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        def _track_and_forward(inputs):
-            name, weight = inputs
-            process_eagle_weight(self, name)
-            return name, weight
-
-        loader = AutoWeightsLoader(self)
-
-        loaded_weight_names = loader.load_weights(
-            map(_track_and_forward, weights), mapper=self.hf_to_vllm_mapper
-        )
-
-        # Embed tokens are tied with the target model and therefore not
-        # present in the EAGLE checkpoint; mark them as loaded explicitly to
-        # avoid a spurious "weight not found" warning from the default
-        # weight loader.
-        loaded_weight_names.add("model.embed_tokens.weight")
-        return loaded_weight_names

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import cast
 
@@ -29,7 +29,6 @@ from vllm.model_executor.models import SupportsPP
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.whisper import (
     WhisperEncoder,
-    _create_fake_bias_for_k_proj,
 )
 from vllm.model_executor.models.whisper_causal import WhisperCausalEncoder
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -496,73 +495,6 @@ class VoxtralForConditionalGeneration(
             int(audio_duration_s * stt_config.sample_rate)
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        remapping_rules = [
-            (r"mm_streams_embeddings.embedding_module\.(.*)", r"\1"),
-            (r"mm_whisper_embeddings\.(.*)", r"\1"),
-            (r"audio_language_projection\.(.*)", r"audio_language_adapter.\1"),
-            (
-                r"audio_language_adapter\.0\.weight",
-                r"audio_language_adapter.w_in.weight",
-            ),
-            (
-                r"audio_language_adapter\.2\.weight",
-                r"audio_language_adapter.w_out.weight",
-            ),
-        ]
-
-        audio_params = dict(
-            nn.ModuleDict(
-                {
-                    "audio_language_adapter": self.audio_language_adapter,
-                }
-            ).named_parameters()
-        )
-        weights = _create_fake_bias_for_k_proj(weights, ".wk.weight")
-
-        loaded_weights = set()
-
-        def llm_weights_generator():
-            nonlocal loaded_weights
-            for name, w in weights:
-                is_encoder = False
-                for k in [
-                    "mm_whisper_embeddings",
-                    "mm_streams_embeddings.embedding_module",
-                ]:
-                    is_encoder |= (
-                        name.startswith(k)
-                        and not name.startswith(f"{k}.tok_embeddings")
-                        and not name.startswith(f"{k}.audio_language_projection")
-                    )
-
-                for pattern, repl in remapping_rules:
-                    if re.fullmatch(pattern, name):
-                        name = re.sub(pattern, repl, name)
-
-                if is_encoder:
-                    name = self.whisper_encoder.load_weight((name, w))
-                    loaded_weights.add(f"whisper_encoder.{name}")
-                    continue
-
-                if name in audio_params:
-                    param = audio_params[name]
-                    with torch.no_grad():
-                        default_weight_loader(param, w)
-                    loaded_weights.add(name)
-                else:
-                    yield (name, w)
-
-        for name in self.language_model.load_weights(llm_weights_generator()):
-            loaded_weights.add(f"language_model.{name}")
-
-        # potentially manually add position embeddings
-        sin_key = "whisper_encoder.whisper_encoder.embed_positions.weight"
-        if sin_key not in loaded_weights:
-            # make sure we don't hit an error here
-            loaded_weights.add(sin_key)
-
-        return loaded_weights
 
     def maybe_update_quant_config(
         self, quant_config: QuantizationConfig

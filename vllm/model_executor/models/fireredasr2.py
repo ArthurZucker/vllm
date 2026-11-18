@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, cast
 
 import torch
@@ -54,7 +54,6 @@ from .interfaces import (
 )
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
@@ -479,7 +478,3 @@ class FireRedASR2ForConditionalGeneration(
         logits = self.logits_processor(self.model.decoder.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

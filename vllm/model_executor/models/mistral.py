@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Mistral adaptation of the LLaMA architecture."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -26,7 +25,6 @@ from vllm.model_executor.models.llama import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
-from .utils import AutoWeightsLoader
 
 
 class MistralMLP(nn.Module):
@@ -282,12 +280,6 @@ class MistralForCausalLM(LlamaForCausalLM):
             vllm_config=vllm_config, prefix=prefix, layer_type=layer_type
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            self.maybe_remap_mistral(name, loaded_weight)
-            for name, loaded_weight in weights
-        )
 
     def maybe_remap_mistral(
         self,

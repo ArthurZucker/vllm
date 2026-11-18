@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -16,7 +15,7 @@ from vllm.v1.worker.gpu.spec_decode.xpress import kernels
 from vllm.v1.worker.gpu.spec_decode.xpress.config import XPressSpeculatorConfig
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
-from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
+from .utils import maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -331,47 +330,3 @@ class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        model_weights = {}
-        includes_embed_tokens = False
-        includes_lm_head = False
-        raw_mix_L = None
-        for name, loaded_weight in weights:
-            if "t2d" in name or "d2t" in name:
-                continue
-            if name.startswith("xpress_head."):
-                sub = name[len("xpress_head.") :]
-                if sub == "mix.L":
-                    raw_mix_L = loaded_weight
-                    continue
-                mapped = XPressRefinerHead.HYBRID_KEY_MAP.get(sub, sub)
-                name = "model.xpress_head." + mapped
-            elif "lm_head" not in name:
-                name = "model." + name
-            if "embed_tokens" in name:
-                includes_embed_tokens = True
-            if "lm_head" in name:
-                includes_lm_head = True
-            model_weights[name] = loaded_weight
-            process_eagle_weight(self, name)
-
-        # These are provided by the target (shared) or reconstructed below, so drop
-        # them before the loader sees them rather than asking it to skip: the
-        # mixer is stored raw in the checkpoint and folded after loading.
-        skip_substrs = ["mask_embedding", "xpress_head.mix_L"]
-        if not includes_embed_tokens:
-            skip_substrs.append("embed_tokens")
-        if not includes_lm_head:
-            skip_substrs.append("lm_head")
-        model_weights = {
-            k: v
-            for k, v in model_weights.items()
-            if not any(sub in k for sub in skip_substrs)
-        }
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(model_weights.items())
-        # A weight update may send the checkpoint over several calls; the fused
-        # buffers are rebuilt by the post-load hooks once all of it is in.
-        head = self.model.xpress_head
-        if raw_mix_L is not None:
-            head.fold_from_raw_(raw_mix_L.to(head.mix_L.dtype))

@@ -40,7 +40,6 @@ from ..common.primitives import (
     fma2,
     fp8_bits,
     load_bf16x8,
-    load_tma2,
     load_tmem,
     load_words,
     mma_bf16_block,
@@ -404,14 +403,6 @@ class IndexFrontMma:
             wait(bar_rr, 0)
         named_barrier(1, 128)
 
-    @cute.jit
-    def load_weights(self, wring, bars, w_map, kb, k_first, head):
-        """One lane: block kb's 128 x 64 weight box on its full barrier."""
-        slot = kb % self.stages
-        full = bars + slot
-        cute.arch.mbarrier_arrive_and_expect_tx(full, WEIGHT_BLOCK)
-        tile_w = wring + slot * WEIGHT_BLOCK
-        load_tma2(tile_w, w_map, full, k_first + kb * 64, head * 128)
 
     @cute.jit
     def epilogue(self, args, tmem, mailbox, amax_s, wv_s, bar_red, row0, valid):

@@ -89,9 +89,6 @@ class JinaForRanking(nn.Module, SupportsLateInteraction):
         )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class JinaForRankingPool(StepPool):
@@ -298,8 +295,6 @@ class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _setup_jina_v5_task_and_pooler(self, vllm_config)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_jina_v5_weights(self, weights)
 
 
 class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
@@ -325,8 +320,6 @@ class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _setup_jina_v5_task_and_pooler(self, vllm_config)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_jina_v5_weights(self, weights)
 
 
 class JinaEmbeddingsV5Model(JinaEmbeddingsV5DecoderModel):

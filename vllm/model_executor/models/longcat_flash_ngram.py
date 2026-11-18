@@ -10,7 +10,6 @@ embedding fuses the token embedding with hashed embeddings of the preceding
 `get_model_state_cls` makes the model MRV2-only.
 """
 
-from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -32,7 +31,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .longcat_flash import FlashModel
-from .utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
+from .utils import PPMissingLayer, WeightsMapper, maybe_prefix
 
 
 def uses_ngram_embedding(config: LongcatFlashConfig) -> bool:
@@ -178,22 +177,6 @@ class FlashNgramModel(FlashModel):
         else:
             self.ngram_embeddings = None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Names arrive with the ``model.`` prefix already stripped (routed here
-        # by AutoWeightsLoader). Split the concatenated/sharded ngram tables and
-        # stacked projections; delegate everything else to FlashModel.
-        loaded: set[str] = set()
-        rest: list[tuple[str, torch.Tensor]] = []
-        for name, w in weights:
-            if self.ngram_embeddings is not None and (
-                "ngram_embeddings.embedders." in name
-                or "ngram_embeddings.post_projs." in name
-            ):
-                loaded.add(self.ngram_embeddings.load_weight(name, w))
-            else:
-                rest.append((name, w))
-        loaded |= super().load_weights(rest)
-        return loaded
 
 
 class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
@@ -253,11 +236,6 @@ class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def get_expert_mapping(self):
         return self.model.get_expert_mapping()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # AutoWeightsLoader routes ``model.*`` to FlashNgramModel.load_weights
-        # (which handles the ngram split) and ``lm_head.*`` to the head.
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class LongcatNgramModelState(DefaultModelState):

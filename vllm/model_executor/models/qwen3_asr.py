@@ -22,7 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-ASR model."""
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import regex as re
@@ -58,7 +58,6 @@ from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
@@ -588,11 +587,6 @@ class Qwen3ASRForConditionalGeneration(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-        return loaded_weights
 
     def get_mrope_input_positions(
         self,

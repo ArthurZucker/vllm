@@ -575,42 +575,6 @@ class Nemotron3_5TranscribeForConditionalGeneration(
             tower_model=["audio_tower.preprocessor", "audio_tower.encoder"],
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        load_audio = isinstance(self.audio_tower, Nemotron3_5TranscribeAudioTower)
-        audio_weights: list[tuple[str, torch.Tensor]] = []
-
-        def decoder_source() -> Iterator[tuple[str, torch.Tensor]]:
-            for name, tensor in self.hf_to_vllm_mapper.apply(weights):
-                if name.endswith("._extra_state"):
-                    continue
-                if name.startswith("audio_tower."):
-                    if load_audio:
-                        # Copied so the tensor outlives a reusable read buffer.
-                        audio_weights.append(
-                            (name[len("audio_tower.") :], tensor.detach().clone())
-                        )
-                elif name.startswith("llm.mtp."):
-                    continue  # loaded by the multi-token-prediction drafter
-                elif name.startswith("ctc_timestamp."):
-                    continue  # the CTC timestamp head and its tokenizer
-                elif name.startswith("language_model."):
-                    yield name[len("language_model.") :], tensor
-                else:
-                    raise ValueError(f"Unexpected checkpoint weight {name!r}.")
-
-        decoder_weights = _decoder_weights(
-            decoder_source(), self.config.text_config.vocab_size
-        )
-        loaded = {
-            f"language_model.{name}"
-            for name in self.language_model.load_weights(decoder_weights)
-        }
-        if load_audio:
-            loaded |= {
-                f"audio_tower.{name}"
-                for name in self.audio_tower.load_weights(audio_weights)
-            }
-        return loaded
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
@@ -666,5 +630,3 @@ class Nemotron3_5TranscribeMTP(NemotronHMTP, SupportsMultiModalEmbeddings):
         # the mtp.* names that _mtp_weights produces.
         return super().is_unused_checkpoint_weight(name.removeprefix("llm."))
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_mtp_weights(weights))

@@ -39,7 +39,7 @@ class BasevLLMParameter(Parameter):
     def __new__(cls, data: torch.Tensor | None, **kwargs):
         return super().__new__(cls, data=data, requires_grad=False)
 
-    def __init__(self, data: torch.Tensor, weight_loader: Callable):
+    def __init__(self, data: torch.Tensor, weight_loader: Callable | None = None):
         """Initialize the BasevLLMParameter.
 
         Args:
@@ -95,28 +95,10 @@ class BasevLLMParameter(Parameter):
         )
         copy_weight_(self.data, loaded_weight)
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
-        self._assert_and_load(loaded_weight)
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        self._assert_and_load(loaded_weight)
 
-    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        self._assert_and_load(loaded_weight)
 
-    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        self._assert_and_load(loaded_weight)
 
-    def _shard_id_as_int(self, shard_id: str | int) -> int:
-        if isinstance(shard_id, int):
-            return shard_id
-
-        # if not int, assume shard_id for qkv
-        # map to int and return
-        qkv_idxs = {"q": 0, "k": 1, "v": 2}
-        assert isinstance(shard_id, str)
-        assert shard_id in qkv_idxs
-        return qkv_idxs[shard_id]
 
 
 class _ColumnvLLMParameter(BasevLLMParameter):
@@ -137,60 +119,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     def output_dim(self):
         return self._output_dim
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
-        shard_size = self.data.shape[self.output_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
-        )
-        assert self.data.shape == loaded_weight.shape
-        copy_weight_(self.data, loaded_weight)
 
-    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        shard_offset: int = kwargs["shard_offset"]
-        shard_size: int = kwargs["shard_size"]
 
-        # TODO: move these to PackedColumnParameter and PackedvLLMParameter
-        if (
-            isinstance(self, (PackedColumnParameter, PackedvLLMParameter))
-            and self.packed_dim == self.output_dim
-        ):
-            shard_size, shard_offset = self.adjust_shard_indexes_for_packing(
-                shard_offset=shard_offset, shard_size=shard_size
-            )
-
-        param_data = self.data
-
-        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
-        )
-        assert param_data.shape == loaded_weight.shape
-        copy_weight_(param_data, loaded_weight)
-
-    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        shard_offset: int = kwargs["shard_offset"]
-        shard_size: int = kwargs["shard_size"]
-        shard_id: str = kwargs["shard_id"]
-        num_heads: int = kwargs["num_heads"]
-
-        # TODO: move these to PackedColumnParameter and PackedvLLMParameter
-        if (
-            isinstance(self, (PackedColumnParameter, PackedvLLMParameter))
-            and self.output_dim == self.packed_dim
-        ):
-            shard_size, shard_offset = self.adjust_shard_indexes_for_packing(
-                shard_offset=shard_offset, shard_size=shard_size
-            )
-
-        param_data = self.data
-        shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
-        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, shard_id_int * shard_size, shard_size
-        )
-
-        assert param_data.shape == loaded_weight.shape
-        copy_weight_(param_data, loaded_weight)
 
 
 class RowvLLMParameter(BasevLLMParameter):
@@ -208,17 +138,6 @@ class RowvLLMParameter(BasevLLMParameter):
     def input_dim(self):
         return self._input_dim
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        shard_size = self.data.shape[self.input_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.input_dim, self.tp_rank * shard_size, shard_size
-        )
-
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-
-        assert self.data.shape == loaded_weight.shape
-        copy_weight_(self.data, loaded_weight)
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
@@ -263,36 +182,10 @@ class PerTensorScaleParameter(BasevLLMParameter):
 
     # For row parallel layers, no sharding needed
     # load weight into parameter as is
-    def load_row_parallel_weight(self, *args, **kwargs):
-        super().load_row_parallel_weight(*args, **kwargs)
 
-    def load_merged_column_weight(self, *args, **kwargs):
-        self._load_into_shard_id(*args, **kwargs)
 
-    def load_qkv_weight(self, *args, **kwargs):
-        self._load_into_shard_id(*args, **kwargs)
 
-    def load_column_parallel_weight(self, *args, **kwargs):
-        super().load_row_parallel_weight(*args, **kwargs)
 
-    def _load_into_shard_id(
-        self, loaded_weight: torch.Tensor, shard_id: str | int, **kwargs
-    ):
-        """Slice the parameter data based on the shard id for
-        loading.
-        """
-        param_data = self.data
-        shard_id = self._shard_id_as_int(shard_id)
-
-        # AutoFP8 scales do not have a shape
-        # compressed-tensors scales do have a shape
-        if len(loaded_weight.shape) != 0:
-            assert loaded_weight.shape[0] == 1
-            loaded_weight = loaded_weight[0]
-
-        param_data = param_data[shard_id]
-        assert param_data.shape == loaded_weight.shape
-        copy_weight_(param_data, loaded_weight)
 
 
 class PackedColumnParameter(_ColumnvLLMParameter):
@@ -325,13 +218,6 @@ class PackedColumnParameter(_ColumnvLLMParameter):
     def marlin_tile_size(self):
         return self._marlin_tile_size
 
-    def adjust_shard_indexes_for_packing(self, shard_size, shard_offset):
-        return _adjust_shard_indexes_for_packing(
-            shard_size=shard_size,
-            shard_offset=shard_offset,
-            packed_factor=self.packed_factor,
-            marlin_tile_size=self.marlin_tile_size,
-        )
 
 
 class PackedvLLMParameter(ModelWeightParameter):
@@ -368,13 +254,6 @@ class PackedvLLMParameter(ModelWeightParameter):
     def marlin_tile_size(self):
         return self._marlin_tile_size
 
-    def adjust_shard_indexes_for_packing(self, shard_size, shard_offset):
-        return _adjust_shard_indexes_for_packing(
-            shard_size=shard_size,
-            shard_offset=shard_offset,
-            packed_factor=self.packed_factor,
-            marlin_tile_size=self.marlin_tile_size,
-        )
 
 
 class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):
@@ -451,49 +330,9 @@ class SharedWeightParameter(BasevLLMParameter):
         # see https://github.com/pytorch/pytorch/issues/75932
         self.local_tensors.add(data)
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
-        assert len(self.partitions) == 1 and 0 in self.partitions
-        partition = self.partitions[0]
 
-        ModelWeightParameter.load_column_parallel_weight(partition, loaded_weight)
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        assert len(self.partitions) == 1 and 0 in self.partitions
-        partition = self.partitions[0]
 
-        ModelWeightParameter.load_row_parallel_weight(partition, loaded_weight)
-
-    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        partition_id = kwargs.pop("shard_id")
-        partition_id = self._shard_id_as_int(partition_id)
-        partition = self.partitions[partition_id]
-
-        input_dim = self.kwargs.get("input_dim")
-        shard_size = partition.data.size(input_dim) // self.tp_size
-        shard_offset = self.tp_rank * shard_size
-
-        ModelWeightParameter.load_merged_column_weight(
-            partition, loaded_weight, shard_offset=shard_offset, shard_size=shard_size
-        )
-
-    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        partition_id = self._shard_id_as_int(kwargs.pop("shard_id"))
-        partition = self.partitions[partition_id]
-
-        input_dim = self.kwargs.get("input_dim")
-        shard_size = partition.data.size(input_dim) // self.tp_size
-        shard_offset = self.tp_rank * shard_size
-        shard_id = "q"  # fake first partition
-        num_heads = kwargs.get("num_heads")
-
-        ModelWeightParameter.load_qkv_weight(
-            partition,
-            loaded_weight,
-            shard_offset=shard_offset,
-            shard_size=shard_size,
-            shard_id=shard_id,
-            num_heads=num_heads,
-        )
 
     def process_weights_after_loading(self):
         for key in self.partitions:
@@ -582,16 +421,3 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
     return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
 
 
-def _adjust_shard_indexes_for_packing(
-    shard_size, shard_offset, packed_factor, marlin_tile_size
-):
-    shard_size = round(shard_size // packed_factor)
-    shard_offset = round(shard_offset // packed_factor)
-    if marlin_tile_size is not None:
-        return _adjust_shard_indexes_for_marlin(
-            shard_size=shard_size,
-            shard_offset=shard_offset,
-            marlin_tile_size=marlin_tile_size,
-        )
-
-    return shard_size, shard_offset

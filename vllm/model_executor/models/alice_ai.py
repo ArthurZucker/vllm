@@ -53,12 +53,10 @@ from vllm.model_executor.models.qwen3_next import (
     _should_replicate_misaligned_shared_expert,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     extract_layer_index,
     get_fused_shared_expert_layers,
     make_layers,
-    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 from vllm.model_executor.offloader import (
@@ -565,16 +563,6 @@ class AliceAIModel(nn.Module):
         )
         return self.norm(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_fuse_shared_experts(
-            weights=weights,
-            fused_shared_expert_layers=self.fused_shared_expert_layers,
-            n_routed_experts=self.config.num_experts,
-            n_shared_experts=1,
-            ckpt_prefix="mlp.shared_expert",
-        )
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights=weights, mapper=self.hf_to_vllm_mapper)
 
 
 class AliceAIForCausalLM(
@@ -707,15 +695,3 @@ class AliceAIForCausalLM(
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        manually_loaded: set[str] = set()
-        weights = _load_split_kda_conv_weights(
-            weights=weights,
-            params=dict(self.named_parameters()),
-            loaded=manually_loaded,
-        )
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights=weights)
-        loaded.update(manually_loaded)
-        return loaded

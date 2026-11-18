@@ -38,7 +38,6 @@ from vllm.model_executor.models.glm4_1v import (
 )
 from vllm.model_executor.models.qwen2_vl import _create_qwen2vl_field_factory
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
 )
 from vllm.model_executor.models.vision import (
@@ -606,9 +605,6 @@ class Glm5NextVisionTransformer(nn.Module):
         x = self.merger(x)
         return x
 
-    def load_weights(self, weights) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Glm5NextProcessingInfo(Glm4vProcessingInfo):

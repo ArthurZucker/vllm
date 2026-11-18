@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -16,7 +15,6 @@ from vllm.config import (
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -48,7 +46,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     make_attention_sink,
-    maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
@@ -63,7 +60,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -875,129 +871,6 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             num_redundant_experts=self.num_redundant_experts,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping: list[tuple[str, str, str | int]] = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-        expert_params_mapping = self.get_expert_mapping()
-        # Pro-format fused qkv_proj arrives as two tensors (weight and
-        # weight_scale_inv). Store them per-layer so that they can be
-        # sharded together. The state must outlive this call: AutoWeightsLoader
-        # delegates per contiguous group of names, so a pair can straddle two
-        # calls and would otherwise be dropped silently.
-        pending_fp8_qkv_proj = getattr(self, "_pending_fp8_qkv_proj", None)
-        if pending_fp8_qkv_proj is None:
-            self._pending_fp8_qkv_proj = pending_fp8_qkv_proj = {}
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-            if "mtp" in name:
-                continue
-
-            expert_matched = False
-            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                name_rewritten = name.replace(weight_name, param_name)
-
-                if is_pp_missing_parameter(name_rewritten, self):
-                    continue
-
-                if (
-                    name_rewritten.endswith(".bias") or name_rewritten.endswith("_bias")
-                ) and name_rewritten not in params_dict:
-                    continue
-
-                if name_rewritten not in params_dict:
-                    continue
-
-                param = params_dict[name_rewritten]
-                weight_loader = param.weight_loader
-
-                weight_loader(
-                    param,
-                    loaded_weight,
-                    name_rewritten,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
-                loaded_params.add(name_rewritten)
-                expert_matched = True
-                break
-
-            if expert_matched:
-                continue
-            # Support fused qkv_proj checkpoint (Pro format)
-            if self._try_load_fp8_qkv_proj(
-                name,
-                loaded_weight,
-                pending_fp8_qkv_proj,
-                params_dict,
-                loaded_params,
-                tp_rank,
-                tp_size,
-            ):
-                continue
-            stacked_matched = False
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name_rewritten = name.replace(weight_name, param_name)
-
-                if (
-                    name_rewritten.endswith(".bias")
-                    and name_rewritten not in params_dict
-                ):
-                    continue
-
-                if is_pp_missing_parameter(name_rewritten, self):
-                    continue
-
-                if name_rewritten not in params_dict:
-                    continue
-
-                param = params_dict[name_rewritten]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(name_rewritten)
-
-                stacked_matched = True
-                break
-
-            if stacked_matched:
-                continue
-
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-
-            orig_name = name
-            mapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            name = mapped_name if mapped_name is not None else orig_name
-
-            if name not in params_dict:
-                continue
-
-            param = params_dict[name]
-
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
 
     def _try_load_fp8_qkv_proj(
         self,
@@ -1129,9 +1002,6 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
 
 class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):

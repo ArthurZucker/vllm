@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next MTP model."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -29,10 +28,8 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 
 from .utils import (
-    AutoWeightsLoader,
     get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
-    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 
@@ -159,16 +156,6 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             hidden_states = hidden_states[: positions.shape[-1]]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_fuse_shared_experts(
-            weights,
-            fused_shared_expert_layers=self.fused_shared_expert_layers,
-            n_routed_experts=self.config.num_experts,
-            n_shared_experts=1,
-            ckpt_prefix="mlp.shared_expert",
-        )
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @support_torch_compile(enable_if=should_torch_compile_mtp_drafter)
@@ -235,14 +222,3 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
             key in name for key in ["embed_tokens", "lm_head"]
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def remap_weight_names(weights):
-            for name, weight in weights:
-                if self.is_unused_checkpoint_weight(name):
-                    continue
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))

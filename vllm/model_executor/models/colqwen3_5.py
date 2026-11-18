@@ -17,7 +17,7 @@ Target models:
 - vultr/VultronRetrieverPrime-Qwen3.5-8B
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -25,7 +25,6 @@ from transformers.models.qwen3_vl import Qwen3VLProcessor
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .interfaces import SupportsLateInteraction
@@ -39,7 +38,7 @@ from .qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
     Qwen3VLMultiModalProcessor,
 )
-from .utils import AutoWeightsLoader, WeightsMapper
+from .utils import WeightsMapper
 
 
 class ColQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
@@ -216,30 +215,3 @@ class ColQwen3_5Model(
         """Check if a weight name belongs to the projection layer."""
         return any(proj_name in name for proj_name in self._PROJ_LAYER_NAMES)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with special handling for projection layer."""
-        weights_list = list(weights)
-        proj_weights: list[tuple[str, torch.Tensor]] = []
-        model_weights: list[tuple[str, torch.Tensor]] = []
-
-        for name, weight in weights_list:
-            if self._is_proj_weight(name):
-                proj_weights.append((name, weight))
-            else:
-                model_weights.append((name, weight))
-
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(model_weights, mapper=self.hf_to_vllm_mapper)
-
-        for name, weight in proj_weights:
-            param_name = name.split(".")[-1]
-            param = getattr(self.custom_text_proj, param_name, None)
-            if param is not None:
-                weight = weight.to(device=param.device, dtype=param.dtype)
-                default_weight_loader(param, weight)
-                loaded.add(f"custom_text_proj.{param_name}")
-                # Also mark as loaded under pooler path since custom_text_proj
-                # is assigned to pooler.head.projector
-                loaded.add(f"pooler.head.projector.{param_name}")
-
-        return loaded

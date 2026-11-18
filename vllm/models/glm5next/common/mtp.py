@@ -1,30 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
-from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import (
-    extract_layer_index,
     get_fused_shared_expert_layers,
     maybe_prefix,
 )
@@ -39,11 +29,7 @@ from .model import (
     Glm5NextDecoderLayer,
     Glm5NextMLAAttention,
     Glm5NextMoE,
-    _fused_shared_expert_name,
-    _mla_proj_checkpoint_tensor,
-    _num_fused_shared_experts,
     get_sparse_topk_buffer_width,
-    get_spec_layer_idx_from_weight_name,
 )
 
 if typing.TYPE_CHECKING:
@@ -335,128 +321,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            ("fused_qkv_a_proj", "q_a_proj", 0),
-            ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
-        ]
-        fused_shared_expert_layers = self.fused_shared_expert_layers
-        num_fused_shared = _num_fused_shared_experts(
-            self.config.n_shared_experts,
-            bool(fused_shared_expert_layers),
-        )
-        expert_params_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            # NOTE: global despite per-layer FSE; non-fused layers skip the extras.
-            num_experts=self.config.n_routed_experts + num_fused_shared,
-            num_redundant_experts=self.num_redundant_experts,
-            routed_experts_prefix="" if self.use_mega_moe else "routed_experts",
-        )
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
-        # ``kv_a_proj_with_mqa``; pad them with zeros for the model shape.
-        kv_a_pad_size = 0
-        if self.config.mla_use_nope and self.config.qk_rope_head_dim > 0:
-            kv_a_pad_size = self.config.qk_rope_head_dim
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            # Multimodal (Glm5NextForConditionalGeneration) checkpoints prefix
-            # the text-tower weights with "model.language_model."; the MTP head
-            # is built as a text-only model (model.layers.*), so strip the
-            # prefix to match.
-            if name.startswith("model.language_model."):
-                name = name.replace("model.language_model.", "model.", 1)
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is None:
-                continue
-            name = self._rewrite_spec_layer_name(spec_layer, name)
-            if self.use_mega_moe and ".shared_experts." in name:
-                mlp = self.get_submodule(name.partition(".shared_experts.")[0])
-                loaded_params.add(
-                    mlp.experts.load_shared_expert_weight(name, loaded_weight)
-                )
-                continue
-            # Only parse the layer index when FSE is enabled.
-            if (
-                "mlp.shared_experts." in name
-                and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
-                and extract_layer_index(name) in fused_shared_expert_layers
-            ):
-                name = _fused_shared_expert_name(name, self.config.n_routed_experts)
-
-            name, loaded_weight = _mla_proj_checkpoint_tensor(
-                name, loaded_weight, params_dict, self.config, kv_a_pad_size
-            )
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                if (
-                    param_name == "fused_qkv_a_proj"
-                ) and name_mapped not in params_dict:
-                    continue
-                else:
-                    name = name_mapped
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                is_expert_weight = False
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping  # type: ignore[assignment]
-                    if weight_name not in name:
-                        continue
-                    is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
-                    param = params_dict[name_mapped]
-                    weight_loader = typing.cast(
-                        Callable[..., bool], param.weight_loader
-                    )
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        name = name_mapped
-                        break
-                else:
-                    if is_expert_weight:
-                        continue
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    name = maybe_remap_kv_scale_name(name, params_dict)  # type: ignore[assignment]
-                    if name is None:
-                        continue
-                    if (
-                        spec_layer != self.model.mtp_start_layer_idx
-                        and ".layers" not in name
-                    ):
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
     def process_weights_after_loading(self) -> None:
         for mlp in self.moe_mlp_layers:

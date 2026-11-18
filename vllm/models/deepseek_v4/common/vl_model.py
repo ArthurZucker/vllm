@@ -17,7 +17,6 @@ Thin multimodal wrapper around the text-only `DeepseekV4ForCausalLM`:
   (`requires_raw_input_tokens`).
 """
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -31,7 +30,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -303,9 +301,6 @@ class DeepseekV4ForConditionalGeneration(
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefixes in the multimodal model."""

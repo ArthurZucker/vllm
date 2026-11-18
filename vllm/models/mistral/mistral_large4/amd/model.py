@@ -510,5 +510,3 @@ class MistralLarge4ForCausalLM(nn.Module, SupportsEagle3):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_weights(self, self.model, weights)

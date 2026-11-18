@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only EXAONE-4_5 MTP model."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -30,7 +29,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    AutoWeightsLoader,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -173,19 +171,3 @@ class Exaone4_5_MTP(ExaoneMoeMTP, SupportsMultiModal):
 
         return inputs_embeds
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        shared_weight_names = ["embed_tokens", "lm_head"]
-
-        def remap_weight_names(weights):
-            for name, weight in weights:
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif any(key in name for key in shared_weight_names):
-                    if "embed_tokens" in name:
-                        name = name.replace("language_model.", "")
-                else:
-                    continue
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))

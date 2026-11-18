@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -26,7 +25,7 @@ from .qwen2_vl import (
     Qwen2VLMultiModalProcessor,
     Qwen2VLProcessingInfo,
 )
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -166,6 +165,3 @@ class JinaVLForSequenceClassification(
         )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.weight_mapper)

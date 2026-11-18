@@ -15,7 +15,6 @@
 # limitations under the License.
 """Inference-only K-EXAONE-236B-A22B model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -52,7 +51,6 @@ from vllm.transformers_utils.config import set_default_rope_theta
 from .exaone4 import Exaone4GatedMLP as ExaoneMoeGatedMLP
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
@@ -548,21 +546,3 @@ class ExaoneMoeForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            # Skip loading extra parameters for GPTQ/modelopt models.
-            ignore_unexpected_suffixes=[
-                ".bias",
-                "_bias",
-                ".k_scale",
-                "_k_scale",
-                ".v_scale",
-                "_v_scale",
-                ".weight_scale",
-                "_weight_scale",
-                ".input_scale",
-                "_input_scale",
-            ],
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

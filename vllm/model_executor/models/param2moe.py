@@ -52,7 +52,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     make_empty_intermediate_tensors_factory,
@@ -536,14 +535,6 @@ class Param2MoEModel(nn.Module):
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _normalize_expert_bias(weights), mapper=self.hf_to_vllm_mapper
-        )
 
 
 class Param2MoEMixtureOfExperts(MixtureOfExperts):
@@ -698,9 +689,3 @@ class Param2MoEForCausalLM(
             return None
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

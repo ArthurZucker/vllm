@@ -12,7 +12,6 @@ step (decoder layers, candidate head and selector) in its own CUDA graphs, and
 the context K/V precompute runs eagerly as a few fused kernels.
 """
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -40,7 +39,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.qwen3_dflash2 import DFlashGroupedConv, _score_edges
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
@@ -532,9 +530,6 @@ class DFlash2BeamModel(nn.Module):
             )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class DFlash2BeamForCausalLM(nn.Module):
@@ -617,10 +612,6 @@ class DFlash2BeamForCausalLM(nn.Module):
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = {f"model.{name}" for name in self.model.load_weights(weights)}
-        # Aliased to the target's after loading.
-        return loaded | {"model.embed_tokens.weight", "lm_head.weight"}
 
     def process_weights_after_loading(self) -> None:
         self.model.build_context_kv_weights()

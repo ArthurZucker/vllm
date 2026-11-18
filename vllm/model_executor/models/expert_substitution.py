@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
 from functools import wraps
 from typing import Any, TypeVar
 
-import torch
 from torch import nn
 
 from vllm.model_executor.layers.fused_moe.expert_substitution import (
@@ -14,7 +12,6 @@ from vllm.model_executor.layers.fused_moe.expert_substitution import (
     decoder_layer_index,
     get_expert_substitution_spec,
 )
-from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
 
 _T = TypeVar("_T", bound=nn.Module)
 
@@ -66,36 +63,6 @@ def as_expert_substitution_model(model_cls: type[_T], model_config: Any) -> type
             super().__init__(*args, **kwargs)
             self._expert_substitutions = _collect_expert_substitutions(self)
 
-        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-            if any(s.values.is_meta for _, s in self._expert_substitutions.values()):
-                # Put the previous weights back so the model stays usable.
-                finalize_layerwise_processing(self, model_config)
-                raise NotImplementedError(
-                    "expert substitution does not support layerwise weight reload"
-                )
-            loaded_substitutions: set[str] = set()
-
-            def remaining_weights():
-                for name, loaded_weight in weights:
-                    targets = value_names.get(name)
-                    if targets is None:
-                        key = _parse_approx_value_name(name)
-                        if key is None or key[0] not in self._expert_substitutions:
-                            yield name, loaded_weight
-                            continue
-                        targets = (key,)
-                    for layer_idx, expert_id in targets:
-                        if layer_idx not in self._expert_substitutions:
-                            continue
-                        param_name, substitution = self._expert_substitutions[layer_idx]
-                        param = substitution.values
-                        param.weight_loader(param, loaded_weight, expert_id)
-                        loaded_substitutions.add(param_name)
-
-            loaded = super().load_weights(remaining_weights())
-            if loaded is not None:
-                loaded.update(loaded_substitutions)
-            return loaded
 
         def process_weights_after_loading(self) -> None:
             for param_name, substitution in self._expert_substitutions.values():

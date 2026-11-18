@@ -4,7 +4,6 @@
 
 import inspect
 import math
-from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
 from typing import TYPE_CHECKING, Any, cast
@@ -79,7 +78,6 @@ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
@@ -2159,27 +2157,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             )
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def interleaved_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            config = self.model.config
-            for name, weight in weights:
-                if name.startswith(
-                    ("model.language_model.layers.", "model.layers.", "layers.")
-                ) and name.endswith(
-                    (".self_attn.q_proj.weight", ".self_attn.k_proj.weight")
-                ):
-                    # HF stores Q/K rows as [even | odd] per head (NoPE too);
-                    # restore interleaved pairs before TP slicing.
-                    shape = weight.shape
-                    weight = (
-                        weight.reshape(-1, 2, config.head_dim // 2, shape[1])
-                        .transpose(1, 2)
-                        .reshape(shape)
-                    )
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(interleaved_weights(), mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         if self.specialized_decode is not None:

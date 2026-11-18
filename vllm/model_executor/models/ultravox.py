@@ -541,8 +541,6 @@ class UltravoxTransformerProjector(nn.Module):
         hidden_states, _ = self.linear_out(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_whisper_layer_weights(self, weights)
 
 
 class UltravoxWhisperEncoder(WhisperEncoder):
@@ -609,8 +607,6 @@ class UltravoxWhisperEncoder(WhisperEncoder):
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_whisper_layer_weights(self, weights)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -943,9 +939,6 @@ class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 def pad_and_concat_to_dim3(

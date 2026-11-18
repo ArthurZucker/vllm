@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ROCm MoE implementation for Muse Spark checkpoints."""
 
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 
@@ -824,30 +824,6 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
             quant_method.activation_quant_key,
         )
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        if isinstance(
-            self.quant_method, MuseSparkOnlineMXFP4FusedMoE
-        ) or not isinstance(
-            self.quant_method,
-            (MuseSparkQuarkW8A8Fp8FusedMoE, MuseSparkQuarkOCPMXFusedMoE),
-        ):
-            # Quark's unquantized layers (0 and 61) store per-expert tensors.
-            consolidated: list[tuple[str, torch.Tensor]] = []
-            per_expert: list[tuple[str, torch.Tensor]] = []
-            for name, tensor in weights:
-                if _quark_expert_weight_slot(name) is None:
-                    consolidated.append((name, tensor))
-                else:
-                    per_expert.append((name, tensor))
-            if consolidated:
-                yield from super().load_weights(consolidated)
-            if per_expert:
-                yield from RoutedExperts.load_weights(self, per_expert)
-            return
-
-        yield from RoutedExperts.load_weights(self, weights)
 
 
 class MuseMoERunner(MoERunner):

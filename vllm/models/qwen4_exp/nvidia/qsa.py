@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
 from typing import ClassVar, cast
 
 import torch
@@ -32,10 +31,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.model_executor.models.qwen3_vl import mrope_positions_factor
-from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
-)
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
@@ -80,51 +75,9 @@ class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
             prefix=qkv_proj.prefix,
         )
 
-    def _load_shard(
-        self,
-        loader: Callable[..., None],
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: int | tuple[int, ...] | None,
-    ) -> None:
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        if loaded_shard_id == 3:
-            shard_rank = 0
-        elif loaded_shard_id in (1, 2):
-            shard_rank = tp_rank // self.num_kv_head_replicas
-        else:
-            shard_rank = tp_rank
-        self.tp_rank = shard_rank
-        if param_tp_rank is not None:
-            param.tp_rank = shard_rank
-        try:
-            loader(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
 
-    def weight_loader(self, param, loaded_weight, loaded_shard_id=None) -> None:
-        self._load_shard(super().weight_loader, param, loaded_weight, loaded_shard_id)
 
-    def weight_loader_v2(self, param, loaded_weight, loaded_shard_id=None) -> None:
-        self._load_shard(
-            super().weight_loader_v2, param, loaded_weight, loaded_shard_id
-        )
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        def remap_shards():
-            for name, weight in weights:
-                shard_id = getattr(weight, "shard_id", None)
-                if isinstance(shard_id, str):
-                    weight = weight.detach()
-                    weight.shard_id = {"q": 0, "k": 1, "v": 2}[shard_id]
-                yield name, weight
-
-        return super().load_weights(remap_shards())
 
 
 class Qwen4ExpQSABackend(AttentionBackend):
@@ -474,15 +427,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        mapper = None
-        if self.fuse_indexer_projection:
-            mapper = WeightsMapper(
-                orig_to_new_stacked={
-                    "indexer.index_qk_proj.": ("qkv_proj.", 3),
-                }
-            )
-        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend

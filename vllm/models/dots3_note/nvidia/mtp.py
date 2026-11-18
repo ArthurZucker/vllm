@@ -187,5 +187,3 @@ class Dots3NoteMTP(DeepseekV32MTP):
                 ),
             )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(self._adapt_weights(weights))

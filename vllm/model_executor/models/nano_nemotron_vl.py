@@ -9,7 +9,7 @@
 
 import math
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from functools import cached_property
 from io import BytesIO
 from typing import Annotated, Literal, TypeAlias, TypedDict, cast
@@ -30,7 +30,6 @@ from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.fusion.mm_input_norm import FusedMMInputNorm
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
@@ -1678,100 +1677,6 @@ class NemotronH_Nano_VL_V2(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        mm_config = self.model_config.multimodal_config
-        assert mm_config is not None
-        load_multimodal_weights = not all(
-            mm_config.get_limit_per_prompt(modality) == 0
-            for modality in ("image", "video", "audio")
-        )
-        adapter_dict = dict(self.mlp1.named_parameters())
-        vision_norm_params = (
-            dict(self.vision_final_layernorm.named_parameters())
-            if load_multimodal_weights and self.vision_final_layernorm is not None
-            else {}
-        )
-
-        def is_llm(name: str) -> bool:
-            return name.startswith("language_model")
-
-        def is_adapter_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("mlp1")
-
-        def is_vision_weights(name: str) -> bool:
-            # The whole RADIO tower lives under ``vision_model.``: legacy
-            # remote-code checkpoints nest it as ``vision_model.radio_model.*``,
-            # native Transformers checkpoints as ``vision_model.embeddings.*`` /
-            # ``vision_model.encoder.*``. RadioModel.load_weights handles both.
-            return name.startswith("vision_model.")
-
-        def is_sound_weights(name: str) -> bool:
-            return name.startswith("sound")
-
-        vision_norm_prefix = "vision_projector.vision_final_layernorm."
-
-        def is_vision_norm_weights(name: str) -> bool:
-            return name.startswith(vision_norm_prefix)
-
-        # LLM weights (the bulk of the model) are streamed lazily through a
-        # generator so each tensor is copied into its parameter before the
-        # iterator advances, avoiding stale-reference corruption with
-        # reusable-buffer streamers. The smaller mm components (mlp1, vision,
-        # sound) are detach+cloned on append so they are independent of any
-        # reusable buffer the streamer may use, then loaded after the LLM.
-        adapter_weights: list[tuple[str, torch.Tensor]] = []
-        vision_weights: list[tuple[str, torch.Tensor]] = []
-        sound_weights: list[tuple[str, torch.Tensor]] = []
-
-        def llm_weights_gen():
-            for name, w in weights:
-                if is_llm(name):
-                    # Strip 'language_model.' prefix for LLM weights
-                    yield ".".join(name.split(".")[1:]), w
-                elif is_adapter_weights((name, w)):
-                    if not load_multimodal_weights:
-                        continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    adapter_weights.append((trimmed_name, w.detach().clone()))
-                elif is_vision_weights(name):
-                    if not load_multimodal_weights:
-                        continue
-                    # Strip the ``vision_model.`` prefix; the remainder is the
-                    # RADIO key (legacy ``radio_model.*`` or native
-                    # ``embeddings.*``/``encoder.*``).
-                    hf_key = name[len("vision_model.") :]
-                    vision_weights.append((hf_key, w.detach().clone()))
-                elif is_sound_weights(name):
-                    if not load_multimodal_weights:
-                        continue
-                    assert self.sound_encoder is not None
-                    sound_weights.append((name, w.detach().clone()))
-                elif is_vision_norm_weights(name):
-                    if not load_multimodal_weights:
-                        continue
-                    param_name = name.removeprefix(vision_norm_prefix)
-                    assert param_name in vision_norm_params, (
-                        f"Unexpected vision LayerNorm weight: {name}"
-                    )
-                    with torch.no_grad():
-                        default_weight_loader(vision_norm_params[param_name], w)
-
-        # Fully drain the generator so every mm tensor is buffered, even if
-        # the LLM loader stops iterating early.
-        llm_weights_iter = llm_weights_gen()
-        self.language_model.load_weights(llm_weights_iter)
-        for _ in llm_weights_iter:
-            pass
-
-        if load_multimodal_weights:
-            for trimmed_name, w in adapter_weights:
-                # Load vision-language adapter weights directly
-                param = adapter_dict[trimmed_name]
-                with torch.no_grad():
-                    default_weight_loader(param, w)
-            self.vision_model.load_weights(vision_weights)
-            if self.sound_encoder is not None and len(sound_weights) > 0:
-                self.sound_encoder.load_weights(sound_weights)
 
     def get_vit_model_from_radio_config(self, hf_config):
         hf_config_vision = hf_config.vision_config

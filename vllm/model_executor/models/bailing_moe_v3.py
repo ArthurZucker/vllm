@@ -9,7 +9,7 @@ vLLM's parallel linear layers, MLA kernel, KDA kernel and fused MoE loader.
 """
 
 import copy
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from math import lcm
 from typing import TypeGuard
 
@@ -80,8 +80,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -101,7 +99,6 @@ from .interfaces import HasInnerState, IsHybrid, SupportsPP
 from .utils import (
     PPMissingLayer,
     WeightsMapper,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
 )
@@ -1551,78 +1548,3 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        weights = _maybe_remap_ling_mxfp4_weight_names(weights, self.quant_config)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-        stacked_mappings = [
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-            (".qkv_proj", ".q_proj", 0),
-            (".qkv_proj", ".k_proj", 1),
-            (".qkv_proj", ".v_proj", 2),
-            (".qkvb_proj", ".q_proj", 0),
-            (".qkvb_proj", ".k_proj", 1),
-            (".qkvb_proj", ".v_proj", 2),
-            (".qkvb_proj", ".b_proj", 3),
-            (".fused_qkv_a_proj", ".q_a_proj", 0),
-            (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-        ]
-        expert_mappings = list(self.get_expert_mapping())
-
-        def load_param(name: str, tensor: torch.Tensor, shard_id=None) -> bool:
-            if name not in params_dict or is_pp_missing_parameter(name, self):
-                return False
-            param = params_dict[name]
-            weight_loader: Callable[..., None] = getattr(
-                param, "weight_loader", default_weight_loader
-            )
-            if shard_id is None:
-                weight_loader(param, tensor)
-            elif isinstance(shard_id, int):
-                weight_loader(param, tensor, shard_id)
-            else:
-                weight_loader(
-                    param, tensor, name, expert_id=shard_id[0], shard_id=shard_id[1]
-                )
-            loaded_params.add(name)
-            return True
-
-        def normalize_name(name: str) -> str | None:
-            if name.startswith("model.layers."):
-                layer_idx = int(name.split("model.layers.")[1].split(".")[0])
-                if layer_idx >= self.config.num_hidden_layers:
-                    return None
-            return maybe_remap_kv_scale_name(name, params_dict)
-
-        for orig_name, weight in weights:
-            name = normalize_name(orig_name)
-            if name is None:
-                continue
-            weight = _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
-                self.quant_config,
-                self.config,
-                name,
-                weight,
-            )
-            loaded = False
-            for param_suf, weight_suf, stacked_shard_id in stacked_mappings:
-                if weight_suf in name:
-                    mapped = name.replace(weight_suf, param_suf)
-                    if load_param(mapped, weight, stacked_shard_id):
-                        loaded = True
-                        break
-            if loaded:
-                continue
-
-            if ".mlp.experts." in name:
-                for param_name, weight_name, expert_id, shard_id in expert_mappings:
-                    if weight_name in name:
-                        mapped = name.replace(weight_name, param_name)
-                        load_param(mapped, weight, (expert_id, shard_id))
-                        break
-                continue
-
-            load_param(name, weight)
-        return loaded_params

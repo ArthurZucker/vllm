@@ -24,7 +24,7 @@
 # limitations under the License.
 """Inference-only Qwen3VL model compatible with HuggingFace weights."""
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import lru_cache, partial
 from itertools import islice
 from typing import Any, Literal
@@ -151,7 +151,6 @@ from .qwen2_vl import (
 )
 from .qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     StageMissingLayer,
     WeightsMapper,
@@ -903,9 +902,6 @@ class Qwen3_VisionTransformer(nn.Module):
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Qwen3VLMultiModalDataParser(Qwen2VLMultiModalDataParser):
@@ -2888,9 +2884,6 @@ class Qwen3VLForConditionalGeneration(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

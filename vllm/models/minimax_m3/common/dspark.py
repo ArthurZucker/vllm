@@ -445,5 +445,3 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             name = name.replace(".weight_scale_inv", ".weight_scale")
             yield name, tensor
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        return super().load_weights(self._rename_checkpoint_weights(weights))

@@ -654,8 +654,6 @@ class Dots3NoteModel(DeepseekV32Model):
                         continue
             yield name, _pad_dense_mlp_weight(name, weight, self._weight_block_size)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(self._adapt_weights(weights))
 
 
 class Dots3NoteLanguageModelForCausalLM(DeepseekV32ForCausalLM):

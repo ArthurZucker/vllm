@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -21,11 +20,9 @@ from vllm.model_executor.models.llama import (
 from vllm.model_executor.models.llama import LlamaForCausalLM
 
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
 )
 
 logger = init_logger(__name__)
@@ -138,9 +135,6 @@ class LlamaModel(nn.Module):
         hidden_states = hidden_states + residual
         return hidden_states, hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
@@ -182,13 +176,3 @@ class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
             )
         return self.model(input_ids, positions, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        def transform(inputs):
-            name, loaded_weight = inputs
-            if "lm_head" not in name:
-                name = "model." + name
-            process_eagle_weight(self, name)
-            return name, loaded_weight
-
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(map(transform, weights))

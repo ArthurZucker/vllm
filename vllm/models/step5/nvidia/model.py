@@ -58,23 +58,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.reload import weight_update_active
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     SupportsLoRA,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
-    skip_spec_layers,
 )
-from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
+from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -570,7 +566,7 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=self.weight_loader_v2,
+            weight_loader=None,
         )
         self.register_parameter("weight", weight)
         self.update_param_tp_status()
@@ -616,25 +612,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             return offset
         raise ValueError(f"Unsupported sparse indexer shard: {shard_id}.")
 
-    def weight_loader_v2(
-        self,
-        param: BasevLLMParameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: str | None = None,
-    ) -> None:
-        if loaded_shard_id is None:
-            raise NotImplementedError(
-                "Step5 expects separate q/k/v/sparse_indexer_*/g_proj checkpoint "
-                "tensors; a pre-fused qkv_indexer_proj weight is not supported."
-            )
-        if loaded_shard_id in self.INDEXER_SHARD_IDS:
-            self.validate_shard_id(loaded_shard_id, param)
-            src_offset, shard_size = self._indexer_source_offset(loaded_shard_id)
-            dst_offset = self._indexer_dest_offset(loaded_shard_id)
-            shard = loaded_weight.narrow(0, src_offset, shard_size)
-            param.data.narrow(0, dst_offset, shard_size).copy_(shard)
-        else:
-            super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
 
     def assert_fully_loaded(self, prefix: str) -> None:
         """Fail unless this load covered every shard, then forget the record.
@@ -732,12 +709,7 @@ class Step5SparseIndexerIndexTPLinear(ColumnParallelLinear):
         self.output_size_per_group = output_size // index_tp_size
         self.weight.data.zero_()
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
-        start = self.index_group_start * self.output_size_per_group
-        shard = loaded_weight.narrow(0, start, self.output_size_per_partition)
-        param.data.copy_(shard)
 
-    weight_loader_v2 = weight_loader
 
     def forward(
         self,
@@ -2181,175 +2153,6 @@ class Step5Model(nn.Module):
 
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm.model_executor.model_loader.weight_utils import (
-            default_weight_loader,
-            maybe_remap_kv_scale_name,
-        )
-
-        config = self.config
-        if config.num_attention_groups <= 1:
-            raise ValueError(
-                "Step5 weight loading currently supports only GQA "
-                "(num_attention_groups > 1)."
-            )
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        # Quantized expert wrappers insert base_layer into parameter names.
-        base_layer = (
-            "base_layer." if any(".base_layer." in name for name in params_dict) else ""
-        )
-        # Packed 3D format: .moe.gate_proj.weight [num_experts, out, in]. Each
-        # entry is a substring of its scale names (weight_scale_inv, ...), so
-        # it maps those too.
-        expert_params_mapping = [
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_weight",
-                ".moe.gate_proj.weight",
-                "w1",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_weight",
-                ".moe.up_proj.weight",
-                "w3",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w2_weight",
-                ".moe.down_proj.weight",
-                "w2",
-            ),
-        ]
-
-        expert_params_mapping += [
-            (
-                param.replace("_weight", "_input_scale"),
-                weight.replace(".weight", ".input_scale"),
-                shard,
-            )
-            for param, weight, shard in expert_params_mapping
-        ]
-
-        disable_moe_stacked_params = [data[1] for data in expert_params_mapping]
-
-        def _load_weight(name: str, loaded_weight: torch.Tensor) -> set[str]:
-            loaded_params: set[str] = set()
-            if name.startswith("model."):
-                local_name = name[len("model.") :]
-                full_name = name
-            else:
-                local_name = name
-                full_name = f"model.{name}" if name else "model"
-
-            if full_name.startswith("model.layers."):
-                layer_prefix = ".".join(full_name.split(".", 3)[:3])
-                layer_idx = extract_layer_index(layer_prefix)
-                if layer_idx >= config.num_hidden_layers:
-                    return loaded_params
-
-            remapped_name = maybe_remap_kv_scale_name(local_name, params_dict)
-            if remapped_name is None:
-                return loaded_params
-            local_name = remapped_name
-
-            if ".moe.experts." in local_name:
-                if is_pp_missing_parameter(local_name, self):
-                    return loaded_params
-                if local_name not in params_dict:
-                    raise NotImplementedError(
-                        f"Unsupported Step5 MoE checkpoint tensor {name!r}: only "
-                        "the packed 3D expert format is supported."
-                    )
-                param = params_dict[local_name]
-                getattr(param, "weight_loader", default_weight_loader)(
-                    param, loaded_weight
-                )
-                loaded_params.add(local_name)
-                return loaded_params
-            for param_name, weight_name, stacked_shard_id in _STEP5_WEIGHT_SHARDS:
-                if weight_name not in local_name:
-                    continue
-                if any(
-                    disable_moe_stacked_param in local_name
-                    for disable_moe_stacked_param in disable_moe_stacked_params
-                ):
-                    continue
-                replaced_name = local_name.replace(weight_name, param_name)
-                if is_pp_missing_parameter(replaced_name, self):
-                    continue
-                if replaced_name not in params_dict:
-                    continue
-                param = params_dict[replaced_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(replaced_name)
-                break
-            else:
-                for param_name, weight_name, shard_id in expert_params_mapping:
-                    if weight_name not in local_name:
-                        continue
-                    replaced_name = local_name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(replaced_name, self):
-                        continue
-                    if (
-                        replaced_name.endswith(".bias")
-                        or replaced_name.endswith("_bias")
-                    ) and replaced_name not in params_dict:
-                        continue
-                    if replaced_name not in params_dict:
-                        continue
-                    param = params_dict[replaced_name]
-                    weight_loader = param.weight_loader
-                    moe_expert_num = self.moe_num_experts
-                    if (
-                        loaded_weight.ndim == 0
-                        or loaded_weight.shape[0] != moe_expert_num
-                    ):
-                        raise ValueError(
-                            "Step5 expert tensor has an unexpected leading "
-                            f"dimension: expected {moe_expert_num}, got "
-                            f"{tuple(loaded_weight.shape)} for {replaced_name}."
-                        )
-                    for expert_id in range(moe_expert_num):
-                        weight_loader(
-                            param,
-                            loaded_weight[expert_id],
-                            replaced_name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
-                    loaded_params.add(replaced_name)
-                    break
-                else:
-                    if is_pp_missing_parameter(local_name, self):
-                        return loaded_params
-                    if "expert_bias" in local_name:
-                        logger.warning_once("Ignoring unsupported expert_bias weight.")
-                        return loaded_params
-                    if local_name not in params_dict:
-                        return loaded_params
-                    param = params_dict[local_name]
-                    fallback_weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    try:
-                        fallback_weight_loader(param, loaded_weight)
-                    except Exception:
-                        logger.error(
-                            "Failed to load %s: checkpoint shape=%s, "
-                            "parameter shape=%s",
-                            local_name,
-                            tuple(loaded_weight.shape),
-                            tuple(param.shape),
-                        )
-                        raise
-
-                    loaded_params.add(local_name)
-            return loaded_params
-
-        for name, loaded_weight in skip_spec_layers(weights, config):
-            loaded_params.update(_load_weight(name, loaded_weight))
-        return loaded_params
 
 
 class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoRA):
@@ -2466,21 +2269,3 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoRA):
             moe.n_redundant_experts = self.num_redundant_experts
             moe.experts.update_expert_map()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        validate_completeness = not weight_update_active()
-        if validate_completeness:
-            _reset_fused_qkv_indexer_load_state(self.model)
-        skip_prefixes = ["vision_model."]
-        if self.config.tie_word_embeddings:
-            skip_prefixes.append("lm_head.")
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_prefix={prefix: None for prefix in skip_prefixes}
-        )
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights, mapper=mapper)
-        if validate_completeness:
-            loaded_params.update(
-                f"model.{name}"
-                for name in _validate_fused_qkv_indexer_weights(self.model)
-            )
-        return loaded_params

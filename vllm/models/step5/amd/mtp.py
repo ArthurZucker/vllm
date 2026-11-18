@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Step5 MTP on ROCm."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -22,7 +21,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     _merge_multimodal_embeddings,
     get_draft_quant_config,
-    get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
@@ -30,7 +28,6 @@ from vllm.sequence import IntermediateTensors
 from .model import (
     Step5DecoderLayer,
     Step5ForCausalLM,
-    load_step5_weights,
     use_fp32_norm_weights,
 )
 
@@ -194,31 +191,3 @@ class Step5MTP(nn.Module, SupportsMultiModal):
     ) -> torch.Tensor:
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def mtp_weights():
-            for name, weight in weights:
-                if name.startswith("model.embed_tokens."):
-                    yield "model." + name.split(".", 1)[1], weight
-                    continue
-                layer = get_spec_layer_idx_from_weight_name(self.config, name)
-                if layer is None:
-                    continue
-                name = name.replace(".transformer.", ".").replace(
-                    "shared_head.output", "shared_head.head"
-                )
-                if not any(w in name for w in _MTP_LAYER_WEIGHTS):
-                    name = name.replace(
-                        f"model.layers.{layer}.", f"model.layers.{layer}.mtp_block."
-                    )
-                yield name, weight
-
-        return {
-            f"model.{name}"
-            for name in load_step5_weights(
-                self.model,
-                (
-                    (name.removeprefix("model."), weight)
-                    for name, weight in mtp_weights()
-                ),
-            )
-        }

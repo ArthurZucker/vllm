@@ -3,7 +3,6 @@
 """Implementation of Siglip2VisionModel intended to be only used
 within a vision language model."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -25,7 +24,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 from .vision import (
     is_vit_use_data_parallel,
     resolve_visual_encoder_outputs,
@@ -519,19 +518,3 @@ class Siglip2Model(torch.nn.Module):
             select_layers=select_layers,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        # Drop layers omitted by num_hidden_layers_override.
-        layer_count = len(self.vision_model.encoder.layers)
-
-        def _filter(ws):
-            for n, w in ws:
-                if (
-                    n.startswith("vision_model.encoder.layers.")
-                    and int(n.split(".")[3]) >= layer_count
-                ):
-                    continue
-                yield n, w
-
-        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)

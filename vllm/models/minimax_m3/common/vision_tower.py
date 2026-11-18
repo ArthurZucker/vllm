@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -26,7 +25,6 @@ from vllm.model_executor.layers.rotary_embedding.mrope_vit_setup import (
     VitMropeSetup,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
@@ -690,6 +688,3 @@ class MiniMaxVLVisionModel(nn.Module):
         hidden = self.patch_merge_mlp(hidden)
         return hidden
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

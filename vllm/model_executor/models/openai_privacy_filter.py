@@ -22,7 +22,7 @@ from vllm.sequence import IntermediateTensors
 
 from .gpt_oss import GptOssForCausalLM, GptOssModel, OAIAttention, TransformerBlock
 from .interfaces_base import attn_type, default_pooling_type
-from .utils import AutoWeightsLoader, maybe_prefix
+from .utils import maybe_prefix
 
 
 class OpenAIPrivacyFilterAttention(OAIAttention):
@@ -119,9 +119,3 @@ class OpenAIPrivacyFilterForTokenClassification(nn.Module):
         hidden_states = hidden_states.to(self.head_dtype)
         return self.score(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _interleave_gate_up_concat_to_pairs(weights),
-            mapper=self.hf_to_vllm_mapper,
-        )

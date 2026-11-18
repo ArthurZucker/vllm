@@ -312,13 +312,6 @@ class MoERunner(MoERunnerInterface):
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        # routed_experts reports names relative to itself, but callers such as
-        # AutoWeightsLoader qualify what this returns with the runner's prefix.
-        for name in self.routed_experts.load_weights(weights):
-            yield f"routed_experts.{name}"
 
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu():

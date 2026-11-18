@@ -26,7 +26,7 @@
 
 import math
 from collections import defaultdict
-from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence, Set
+from collections.abc import Callable, Hashable, Mapping, Sequence, Set
 from functools import cached_property, partial
 from itertools import chain
 from typing import Annotated, Any, ClassVar, Literal, TypeAlias, cast
@@ -116,7 +116,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     flatten_bn,
     init_vllm_registered_model,
@@ -1424,11 +1423,6 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
     ) -> torch.Tensor | None:
         return self.llm.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights)
-        self._ensure_resampler_device()
-        return loaded
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
@@ -2241,11 +2235,6 @@ class MiniCPMV2_6(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
 
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._ensure_resampler_device()
-        return loaded
 
 
 class MiniCPMV4_0(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
@@ -2340,11 +2329,6 @@ class MiniCPMV4_0(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
 
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._ensure_resampler_device()
-        return loaded
 
 
 class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
@@ -2444,11 +2428,6 @@ class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
 
         return self.resampler(vision_embedding, tgt_sizes, all_temporal_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._ensure_resampler_device()
-        return loaded
 
 
 _SUPPORT_VERSION = {

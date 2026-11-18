@@ -3,7 +3,6 @@
 """Implementation of SiglipVisionModel intended to be only used
 within a vision language model."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -28,7 +27,7 @@ from vllm.model_executor.layers.rotary_embedding.common import (
 )
 from vllm.platforms import current_platform
 
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 from .vision import is_vit_use_data_parallel
 
 
@@ -617,6 +616,3 @@ class Siglip2NavitModel(torch.nn.Module):
             grid_thws=grid_thws,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

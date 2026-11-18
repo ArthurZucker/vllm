@@ -16,7 +16,6 @@ Thin multimodal wrapper around the text-only `DeepseekV41LLMForCausalLM`:
   (`requires_raw_input_tokens`).
 """
 
-from collections.abc import Iterable
 from typing import Annotated
 
 import torch
@@ -31,7 +30,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
@@ -339,6 +337,3 @@ class DeepseekV41ForCausalLM(
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))

@@ -52,7 +52,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsCrossEncoding, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -259,11 +258,6 @@ class GPT2Model(nn.Module):
                 loaded_weight = loaded_weight.t()
             yield name, loaded_weight
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            self._transpose_conv1d(weights), mapper=self.hf_to_vllm_mapper
-        )
 
 
 class GPT2LMHeadModel(nn.Module, SupportsPP):
@@ -312,10 +306,6 @@ class GPT2LMHeadModel(nn.Module, SupportsPP):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        weights = _add_transformer_prefix(weights)
-        return loader.load_weights(weights)
 
 
 class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
@@ -354,10 +344,6 @@ class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.transformer.embed_input_ids(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        weights = _add_transformer_prefix(weights)
-        return loader.load_weights(weights)
 
     def forward(
         self,

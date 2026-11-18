@@ -16,7 +16,7 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -58,7 +58,6 @@ from vllm.model_executor.models.gemma4_mm import (
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
@@ -356,12 +355,6 @@ class DiffusionGemmaForConditionalGeneration(
                 logits = torch.tanh(logits.float() / cap) * cap
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Some checkpoints carry a vestigial Gemma3n-style embedding table.
-        loader = AutoWeightsLoader(
-            self, ignore_unexpected_prefixes=["embed_vision.embedding."]
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

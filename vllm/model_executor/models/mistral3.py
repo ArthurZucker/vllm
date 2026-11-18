@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias, cast
 
 import torch
@@ -55,7 +55,6 @@ from .pixtral import (
     _merge_patches_by_index,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_layer_index,
     init_vllm_registered_model,
@@ -663,9 +662,6 @@ class Mistral3ForConditionalGeneration(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

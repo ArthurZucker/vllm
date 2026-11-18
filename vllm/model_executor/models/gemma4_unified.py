@@ -16,7 +16,7 @@ embedding/forward path, and LoRA support are all inherited unchanged.
 """
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -54,7 +54,6 @@ from vllm.multimodal.processing.processor import PromptUpdateDetails
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -539,21 +538,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     # Weight loading
     # ------------------------------------------------------------------ #
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        ignore_prefixes = [
-            # Vestigial Gemma3n-style embedding tables not used by
-            # Gemma4MultimodalEmbedder (which has only projection + norm).
-            "embed_vision.embedding.",
-            "embed_audio.embedding.",
-        ]
-        if self.embed_audio is None:
-            ignore_prefixes.append("embed_audio.")
-
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=ignore_prefixes,
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping

@@ -42,7 +42,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
@@ -53,7 +52,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .configs import FlintConfig
-from .gguf_nvfp4 import find_gguf_file, gguf_nvfp4_weights_iterator
+from .gguf_nvfp4 import find_gguf_file
 from .ops import linear as flint_linear
 from .ops.moe import (
     BF16_DECODE_MAX_TOKENS,
@@ -672,16 +671,6 @@ class FlintForCausalLM(nn.Module, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if self.gguf_path is not None:
-            device = next(self.parameters()).device
-            weights = self._apply_dequantized_scales(
-                gguf_nvfp4_weights_iterator(self.gguf_path, device, _GGUF_DEQUANTIZED),
-            )
-            if self.flint_dense:
-                weights = flint_linear.check_merged_global_scales(weights)
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def _apply_dequantized_scales(
         self, weights: Iterable[tuple[str, torch.Tensor]]

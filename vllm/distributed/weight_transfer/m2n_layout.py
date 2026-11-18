@@ -21,11 +21,9 @@ Correctness never depends on a parameter resolving — the fallback is always
 available and is the same path the existing backend uses.
 """
 
-import inspect
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import partial
 from typing import cast
 
 import torch
@@ -78,23 +76,14 @@ class M2NDestination:
 
 def _base_loader_shard_dim(
     param: torch.nn.Parameter,
+    owner: torch.nn.Module | None,
     shard_axis_size: int,
 ) -> int | None:
-    """Return a known-safe loader's declared shard dim, or reject it.
+    """Return the shard dim the ops loader uses for `param`, or reject it.
 
-    Loader identity is deliberately fail-closed. A missing loader is not
-    treated as `default_weight_loader` because a model-level `load_weights`
-    implementation may transform the tensor before it reaches that default.
-    Wrappers and partials are also rejected: recognizing their wrapped callable
-    would ignore behavior added by the wrapper.
+    Fail-closed: only a plain column/row parallel or replicated linear qualifies.
+    A fused (stacked) linear is several checkpoint tensors, not one placement.
     """
-    loader = getattr(param, "weight_loader", None)
-    if loader is None or isinstance(loader, partial):
-        return None
-
-    owner = loader.__self__ if inspect.ismethod(loader) else None
-    loader_fn = loader.__func__ if inspect.ismethod(loader) else loader
-
     # Lazy imports avoid making the weight-transfer registry import all model
     # executor layers during normal vLLM startup.
     from vllm.model_executor.layers.linear import (
@@ -102,25 +91,9 @@ def _base_loader_shard_dim(
         ReplicatedLinear,
         RowParallelLinear,
     )
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-    replicated_loaders = {
-        default_weight_loader,
-        ReplicatedLinear.weight_loader,
-    }
-    column_loaders = {
-        ColumnParallelLinear.weight_loader,
-        ColumnParallelLinear.weight_loader_v2,
-    }
-    row_loaders = {
-        RowParallelLinear.weight_loader,
-        RowParallelLinear.weight_loader_v2,
-    }
 
     # These attributes signal packing, a transform, or pre-sharded checkpoint
     # storage. Such semantics cannot be reproduced by a plain M2N placement.
-    # Check them before accepting replicated loaders too: model-level loading
-    # may transform a tensor before handing it to an otherwise plain copier.
     metadata_attrs = ("packed_dim", "packed_factor", "marlin_tile_size")
     flag_attrs = ("needs_scalar_to_array", "is_sharded_weight", "is_transposed")
     if any(getattr(param, attr, None) is not None for attr in metadata_attrs):
@@ -128,15 +101,14 @@ def _base_loader_shard_dim(
     if any(bool(getattr(param, attr, False)) for attr in flag_attrs):
         return None
 
-    if loader_fn in replicated_loaders:
+    if type(owner) is ReplicatedLinear:
         return REPLICATE
-    if loader_fn not in column_loaders | row_loaders:
+    if type(owner) not in (ColumnParallelLinear, RowParallelLinear):
+        return None
+    if getattr(owner, "tp_size", None) != shard_axis_size:
         return None
 
-    if owner is None or getattr(owner, "tp_size", None) != shard_axis_size:
-        return None
-
-    attr = "output_dim" if loader_fn in column_loaders else "input_dim"
+    attr = "output_dim" if type(owner) is ColumnParallelLinear else "input_dim"
     dim = getattr(param, attr, None)
     return dim if isinstance(dim, int) and dim >= 0 else None
 
@@ -190,6 +162,11 @@ def resolve_parameter_destinations(
         for param in module.parameters()
     }
 
+    owners = {
+        id(param): module
+        for module in model.modules()
+        for param in module.parameters(recurse=False)
+    }
     destinations: list[M2NDestination] = []
     for name, dtype, shape in zip(names, dtypes, shapes):
         param = params.get(name)
@@ -201,7 +178,9 @@ def resolve_parameter_destinations(
             and param.data.is_contiguous()
             and num_workers % shard_axis_size == 0
         ):
-            declared_dim = _base_loader_shard_dim(param, shard_axis_size)
+            declared_dim = _base_loader_shard_dim(
+                param, owners.get(id(param)), shard_axis_size
+            )
             if declared_dim is not None:
                 dim = _validated_shard_dim(
                     shape, param.shape, declared_dim, shard_axis_size

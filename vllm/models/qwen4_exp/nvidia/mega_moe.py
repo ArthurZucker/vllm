@@ -11,7 +11,6 @@ take the default format. The sigmoid-gated shared expert stays unfused and runs
 on an aux stream next to the router.
 """
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -230,43 +229,6 @@ class Qwen4ExpMegaMoEExperts(DeepGemmMegaMoEExperts):
         # chunked weight update may split the two across load_weights calls.
         self.pending_shards: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load `{expert}.{gate,up,down}_proj.{weight,<scale>}` or the fused
-        `gate_up_proj` / `down_proj` BF16 tensors of every expert."""
-        loaded: set[str] = set()
-        for name, tensor in weights:
-            if (
-                name in ("gate_up_proj", "down_proj")
-                and self.checkpoint_format == "bf16"
-            ):
-                # Fused [E, N, K] BF16 experts; gate rows precede up rows.
-                for expert_id in range(self.num_logical_experts):
-                    if not self._map_global_expert_id(expert_id):
-                        continue
-                    if name == "down_proj":
-                        shards = [("w2", tensor[expert_id])]
-                    else:
-                        shards = list(zip(("w1", "w3"), tensor[expert_id].chunk(2)))
-                    for shard_id, shard in shards:
-                        loaded |= self._load_shard(expert_id, shard_id, "weight", shard)
-                continue
-            parts = name.split(".")
-            if (
-                len(parts) != 3
-                or parts[1] not in _CHECKPOINT_SHARDS
-                or parts[2] not in self._shard_tensors
-            ):
-                raise ValueError(
-                    f"{self.prefix}: unexpected {self.checkpoint_format} expert "
-                    f"tensor {name!r}; expected {{expert}}.{{gate,up,down}}_proj."
-                    f"{{{','.join(self._shard_tensors)}}}."
-                )
-            expert, proj, kind = parts
-            if self._map_global_expert_id(int(expert)):
-                loaded |= self._load_shard(
-                    int(expert), _CHECKPOINT_SHARDS[proj], kind, tensor
-                )
-        return loaded
 
     def _load_shard(
         self, expert_id: int, shard_id: str, kind: str, tensor: torch.Tensor

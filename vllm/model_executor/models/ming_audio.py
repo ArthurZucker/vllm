@@ -19,7 +19,6 @@
 # limitations under the License.
 """Reusable Ming audio tower and checkpoint-compatible projector."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -28,8 +27,8 @@ from transformers import WhisperConfig
 from vllm.config import VllmConfig
 from vllm.transformers_utils.configs.ming_v3_asr import MingAudioConfig
 
-from .utils import AutoWeightsLoader, WeightsMapper
-from .whisper import WhisperEncoder, _create_fake_bias_for_k_proj
+from .utils import WeightsMapper
+from .whisper import WhisperEncoder
 
 
 def _get_audio_projector_params(config: MingAudioConfig) -> list[tuple[int, int, int]]:
@@ -116,14 +115,6 @@ class MingAudioEncoder(nn.Module):
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.encoder([features.transpose(0, 1)])[0]
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = _create_fake_bias_for_k_proj(
-            weights, ".attn.key.weight", out_features=self.encoder.conv1.out_channels
-        )
-        loaded = AutoWeightsLoader(self.encoder).load_weights(
-            weights, mapper=self.hf_to_vllm_mapper
-        )
-        return {f"encoder.{name}" for name in loaded}
 
 
 class Transpose(nn.Module):

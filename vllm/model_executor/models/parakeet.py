@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Modules below used for the audio encoder component in: models/nano_nemotron_vl.py."""
 
-from collections.abc import Iterable
 from functools import cache
 from typing import Any
 
@@ -16,7 +15,6 @@ from transformers.audio_utils import mel_filter_bank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.parakeet import ExtractorConfig, ParakeetConfig
 
@@ -73,40 +71,6 @@ class ProjectedParakeet(nn.Module):
         outputs = self.projection(outputs)
         return outputs
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded_params: set[str] = set()
-        params_dict = dict(self.named_parameters())
-        buffers_dict = dict(self.named_buffers())
-
-        if isinstance(weights, dict):
-            weights_list = list(weights.items())
-        else:
-            weights_list = list(weights)
-
-        for name, weight in weights_list:
-            if name.startswith("sound_encoder.encoder.feature_extractor."):
-                # Feature extractor buffers are handled outside the encoder.
-                continue
-            if name.startswith("sound_encoder."):
-                target_name = name[len("sound_encoder.") :]
-            elif name.startswith("sound_projection."):
-                target_name = f"projection.{name[len('sound_projection.') :]}"
-            else:
-                continue
-
-            target = params_dict.get(target_name)
-            if target is None:
-                target = buffers_dict.get(target_name)
-            if target is None:
-                if self._can_skip_missing_named_param(target_name):
-                    continue
-                raise ValueError(f"Unknown weight: {name}")
-            weight_loader = getattr(target, "weight_loader", default_weight_loader)
-            with torch.no_grad():
-                weight_loader(target, weight)
-            loaded_params.add(target_name)
-
-        return loaded_params
 
     def _can_skip_missing_named_param(self, target_name: str) -> bool:
         if self.config.convolution_bias:

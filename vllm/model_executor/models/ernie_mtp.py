@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only Ernie-MTP model."""
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -38,7 +37,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from .llama import LlamaDecoderLayer
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 
 
 class ErnieMultiTokenPredictorLayer(nn.Module):
@@ -204,15 +203,3 @@ class ErnieMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, self.lm_head, spec_step_idx)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Checkpoint bundles the full base model; only MTP, embed_tokens and
-        # lm_head weights belong to this module.
-        def _filter(
-            weights: Iterable[tuple[str, torch.Tensor]],
-        ) -> Iterable[tuple[str, torch.Tensor]]:
-            for name, weight in weights:
-                if any(k in name for k in ("mtp", "embed_tokens", "lm_head")):
-                    yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)

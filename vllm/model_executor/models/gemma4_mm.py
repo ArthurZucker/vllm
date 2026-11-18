@@ -16,7 +16,7 @@ reason about temporal order.
 
 import itertools
 import math
-from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
 import numpy as np
@@ -89,7 +89,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -2434,28 +2433,6 @@ class Gemma4ForConditionalGeneration(
     # Weight loading
     # ------------------------------------------------------------------ #
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Some checkpoints have vestigial embed_vision.embedding and
-        # embed_audio.embedding weights from the Gemma3n architecture
-        # that are not used by Gemma4's MultimodalEmbedder (which only
-        # has embedding_projection + embedding_post_projection_norm).
-        ignore_prefixes = [
-            "embed_vision.embedding.",
-            "embed_audio.embedding.",
-        ]
-        # Models without audio tower should skip audio weights entirely.
-        if self.audio_tower is None:
-            ignore_prefixes.extend(
-                [
-                    "audio_tower.",
-                    "embed_audio.",
-                ]
-            )
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=ignore_prefixes,
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -41,11 +40,9 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    AutoWeightsLoader,
     _merge_multimodal_embeddings,
     get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
-    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 
@@ -180,16 +177,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = hidden_states[: positions.shape[-1]]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_fuse_shared_experts(
-            weights,
-            fused_shared_expert_layers=self.fused_shared_expert_layers,
-            n_routed_experts=getattr(self.config, "num_experts", 0),
-            n_shared_experts=1,
-            ckpt_prefix="mlp.shared_expert",
-        )
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @support_torch_compile(
@@ -305,19 +292,6 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             key in name for key in ["embed_tokens", "lm_head"]
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def remap_weight_names(weights):
-            for name, weight in weights:
-                if self.is_unused_checkpoint_weight(name):
-                    continue
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif "embed_tokens" in name:
-                    name = name.replace("language_model.", "")
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

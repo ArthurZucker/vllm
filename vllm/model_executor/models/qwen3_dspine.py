@@ -286,19 +286,6 @@ class DSpineQwen3Model(DFlashQwen3Model):
         hidden_states = self.norm(hidden_states)
         return hidden_states, final_pre_injection
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = list(weights)
-        if not any(name.startswith("selected_prefix_bridge.") for name, _ in weights):
-            return super().load_weights(weights)
-        self._validate_bridge_metadata(dict(weights))
-        mapped = list(self._map_bridge_weights(weights))
-        loaded = super().load_weights(mapped)
-        required = {"transfer_codebook"} | {
-            f"injection.{name}" for name, _ in self.injection.named_parameters()
-        }
-        if missing := required - loaded:
-            raise ValueError(f"Missing DSpine bridge weights: {sorted(missing)}")
-        return loaded
 
     def _validate_bridge_metadata(self, weights: dict[str, torch.Tensor]) -> None:
         if missing := set(_BRIDGE_METADATA[2:]) - weights.keys():

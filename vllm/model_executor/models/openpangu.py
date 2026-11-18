@@ -70,9 +70,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -1055,35 +1053,6 @@ class OpenPanguModel(nn.Module):
                     continue
             yield name, loaded_weight
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-        stacked: dict[str, tuple[str, int | str]] = {
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        }
-        # The attention layout is config-dependent: MLA with a fused low-rank
-        # projection, MLA without it, or standard qkv. Only add the stacked
-        # entries whose fused target actually exists as a parameter.
-        param_names = list(dict(self.named_parameters()))
-        if any(".fused_qkv_a_proj." in n for n in param_names):
-            stacked[".q_a_proj"] = (".fused_qkv_a_proj", 0)
-            stacked[".kv_a_proj_with_mqa"] = (".fused_qkv_a_proj", 1)
-        if any(".qkv_proj." in n for n in param_names):
-            stacked[".q_proj"] = (".qkv_proj", "q")
-            stacked[".k_proj"] = (".qkv_proj", "k")
-            stacked[".v_proj"] = (".qkv_proj", "v")
-        mapper = WeightsMapper(
-            orig_to_new_substr={
-                "e_score_correction_bias": "gate.e_score_correction_bias",
-            },
-            orig_to_new_stacked=stacked,
-        )
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(self._filter_spec_layers(weights), mapper=mapper)
-        self.post_weight_load()
-        return loaded
 
     def post_weight_load(self) -> None:
         for _, module in self.named_modules():
@@ -1156,9 +1125,6 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
 
 class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):

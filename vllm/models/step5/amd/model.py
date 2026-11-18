@@ -38,14 +38,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
-    skip_spec_layers,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import get_cdna_version, on_gfx1250
@@ -695,8 +693,6 @@ class Step5Model(nn.Module):
             return IntermediateTensors({"hidden_states": hidden_states})
         return hidden_states.to(self.act_dtype)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return load_step5_weights(self, skip_spec_layers(weights, self.config))
 
 
 class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
@@ -779,6 +775,3 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
                 layer.moe.n_redundant_experts = self.num_redundant_experts
                 layer.moe.experts.update_expert_map()
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

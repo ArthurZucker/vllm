@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: SIM117
+from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
 import copy
 from collections.abc import Generator
 
@@ -88,7 +89,7 @@ class TensorizerLoader(BaseModelLoader):
             tensorizer_config = self._patch_tensorizer_config(model_config)
             deserialize_tensorizer_model(model, tensorizer_config)
         else:
-            model.load_weights(self._get_weights_iterator())
+            load_model_weights(model, self._get_weights_iterator())
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""

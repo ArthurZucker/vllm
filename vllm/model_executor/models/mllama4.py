@@ -52,7 +52,6 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.utils import initialize_model
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
-    maybe_remap_moe_expert_param_name,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -84,7 +83,7 @@ from .interfaces import (
     SupportsPP,
 )
 from .llama4 import Llama4ForCausalLM
-from .utils import AutoWeightsLoader, StageMissingLayer, maybe_prefix
+from .utils import maybe_prefix
 from .vision import is_vit_use_data_parallel, run_dp_sharded_vision_model
 
 
@@ -1120,96 +1119,6 @@ class Llama4ForConditionalGeneration(
             num_redundant_experts=self.num_redundant_experts,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            # Shared expert gate_up_proj stacking
-            (".shared_expert.gate_up_proj", ".shared_expert.gate_proj", 0),
-            (".shared_expert.gate_up_proj", ".shared_expert.up_proj", 1),
-            # Feed forward gate_up_proj stacking (for non-MoE layers if any)
-            (".feed_forward.gate_up_proj", ".feed_forward.gate_proj", 0),
-            (".feed_forward.gate_up_proj", ".feed_forward.up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        updated_params: set[str] = set()
-
-        # Stream thelanguage-model weights straight into
-        # AutoWeightsLoader so each tensor is loaded and released as we iterate,
-        # instead of materializing the whole checkpoint in host memory first.
-        # Only the small vision/projector and scalar expert-scale groups are
-        # buffered.
-        other_weights: list[tuple[str, torch.Tensor]] = []
-        expert_scale_weights: list[tuple[str, torch.Tensor]] = []
-
-        def regular_language_model_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            """Rename weights and separate them into language_model and other
-            weights.
-
-            Yields the (large) language_model weights for streaming; the small
-            groups (vision/projector and scalar expert scales) are buffered into
-            the lists above.
-            """
-            for name, weight in weights:
-                renamed = self._rename_weight_for_modelopt_checkpoint(name)
-
-                attr = renamed.split(".", 1)[0]
-                if isinstance(getattr(self, attr), StageMissingLayer):
-                    continue
-
-                if not renamed.startswith("language_model."):
-                    other_weights.append((renamed, weight))
-                    continue
-
-                # Handle expert scale parameters that need broadcasting.
-                # ModelOpt checkpoints use a single value tensor scalar for BMM
-                # style experts, vLLM expects the scale to be broadcasted across
-                # all experts.
-                if (
-                    "feed_forward.experts." in renamed
-                    and "scale" in renamed
-                    and ".shared_expert" not in renamed
-                ):
-                    renamed = maybe_remap_moe_expert_param_name(renamed, params_dict)
-                    if renamed in params_dict:
-                        param = params_dict[renamed]
-                        if (
-                            hasattr(param, "data")
-                            and param.data.numel() > 1
-                            and weight.numel() == 1
-                        ):
-                            # Broadcast single value to all experts
-                            param.data.fill_(weight.item())
-                            updated_params.add(renamed)
-                            continue
-
-                    expert_scale_weights.append((renamed, weight))
-                    continue
-
-                yield renamed, weight
-
-        loader = AutoWeightsLoader(self)
-        # AutoWeightsLoader consumes its input lazily and runs to exhaustion,
-        # so other_weights / expert_scale_weights are fully populated as a side
-        # effect by the time this returns.
-        loaded_language_model_params = loader.load_weights(
-            regular_language_model_weights()
-        )
-        assert loaded_language_model_params is not None
-        updated_params.update(loaded_language_model_params)
-
-        if expert_scale_weights:
-            loaded_expert_scale_params = loader.load_weights(expert_scale_weights)
-            if loaded_expert_scale_params:
-                updated_params.update(loaded_expert_scale_params)
-
-        updated_params.update(
-            self._load_other_weights(other_weights, params_dict, stacked_params_mapping)
-        )
-
-        return updated_params
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

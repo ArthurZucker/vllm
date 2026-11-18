@@ -89,43 +89,7 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
             output_sizes[sid] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
 
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        if loaded_shard_id in self.replicated_shard_ids:
-            self.tp_rank = 0
-            if param_tp_rank is not None:
-                param.tp_rank = 0
-        try:
-            super().weight_loader(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
 
-    def weight_loader_v2(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        if loaded_shard_id in self.replicated_shard_ids:
-            self.tp_rank = 0
-            if param_tp_rank is not None:
-                param.tp_rank = 0
-        try:
-            super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
 
 
 @torch.compile(

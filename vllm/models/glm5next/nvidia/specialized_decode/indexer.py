@@ -29,7 +29,6 @@ from .cutedsl.host import (
 from .cutedsl.primitives import (
     alloc,
     asm,
-    load_vector,
     load_words,
     mma_into,
     push_float,
@@ -160,17 +159,6 @@ class _ProjectionKernel:
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
-    @cute.jit
-    def load_weights(self, w, b, cta, rank, warp, lane):
-        """Lane (g, q)'s weight fragments of row g, loaded before the PDL wait."""
-        first = (rank * self.warps + warp) * self.span + lane % 4 * 8
-        for p in cutlass.range_constexpr(self.span // 32):
-            got = load_vector(
-                w.iterator + Int64(cta * ROWS + lane // 4) * self.k + first + p * 32,
-                cache="weight",
-            )
-            for i in cutlass.range_constexpr(4):
-                b[p * 4 + i] = got[i]
 
     @cute.jit
     def gemv(self, x, b, partial, rank, warp, lane):

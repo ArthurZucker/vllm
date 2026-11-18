@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
 import regex as re
@@ -68,7 +68,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
@@ -681,13 +680,3 @@ class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant)
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        autoloaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-        # The HF config doesn't specify whether these are tied,
-        # so we detect it this way
-        if "embed_tokens.weight" not in autoloaded_weights:
-            self.embed_tokens = self.language_model.model.embed_tokens
-            autoloaded_weights.add("embed_tokens.weight")
-        return autoloaded_weights

@@ -85,7 +85,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
@@ -867,9 +866,6 @@ class Molmo2VisionBackbone(nn.Module, SupportsQuant):
             valid_token.flatten()
         ]
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Molmo2Attention(nn.Module):
@@ -1238,8 +1234,6 @@ class Molmo2TextModel(nn.Module, SupportsQuant):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
 
 
 def get_patches_grid_size(
@@ -2649,10 +2643,6 @@ class Molmo2ForConditionalGeneration(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        weights = _get_weights_with_merged_embedding(weights)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

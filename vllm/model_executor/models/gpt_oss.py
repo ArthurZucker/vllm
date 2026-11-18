@@ -12,7 +12,6 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_dp_group,
-    get_ep_group,
     get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -61,7 +60,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -281,79 +279,8 @@ class GptOssRoutedExperts(RoutedExperts):
 
         self._copy_to_expert(expert_data, loaded_weight)
 
-    @typing.overload
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: typing.Literal[False],
-    ) -> None: ...
 
-    @typing.overload
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: typing.Literal[True],
-    ) -> bool: ...
 
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> bool | None:
-        if shard_id not in ("gpt_oss_w13", "gpt_oss_w2"):
-            if return_success:
-                return super().weight_loader(
-                    param,
-                    loaded_weight,
-                    weight_name,
-                    shard_id,
-                    expert_id,
-                    True,
-                )
-            super().weight_loader(
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-                False,
-            )
-            return None
-
-        expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-        if expert_id == -1:
-            return False if return_success else None
-
-        expert_data = param.data[expert_id]
-        weight_dtype = getattr(self.quant_method, "weight_dtype", "")
-        quant_method_name = self.quant_method.__class__.__name__
-
-        if weight_name.endswith("_bias"):
-            self._load_expert_bias(expert_data, loaded_weight, shard_id)
-        elif weight_dtype in (
-            "gpt_oss_mxfp4",
-            "mxfp4",
-        ) or quant_method_name in (
-            "CompressedTensorsW4A4Nvfp4MoEMethod",
-            "Nvfp4OnlineMoEMethod",
-            "CompressedTensorsWNA16MoEMethod",
-        ):
-            self._load_packed_expert(expert_data, loaded_weight, weight_name, shard_id)
-        else:
-            self._load_unquantized_expert(expert_data, loaded_weight, shard_id)
-        return True if return_success else None
 
 
 class MLPBlock(torch.nn.Module):
@@ -1321,62 +1248,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
             loaded_params.add(fused_name)
         return True
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-        ]
-
-        ep_size = get_ep_group().world_size
-        ep_rank = get_ep_group().rank_in_group
-        num_experts = self.config.num_local_experts
-        experts_per_rank = num_experts // ep_size
-        ep_rank_start = ep_rank * experts_per_rank
-        ep_rank_end = (ep_rank + 1) * experts_per_rank
-
-        quant_method = (
-            self.config.quantization_config["quant_method"]
-            if hasattr(self.config, "quantization_config")
-            else None
-        )
-        # Normalize the checkpoint's quant_method to the internal name.
-        # Note: there are three places where "mxfp4" -> "gpt_oss_mxfp4"
-        # normalization occurs, each serving a different data path:
-        #   1. GptOssMxfp4Config.override_quantization_method() — sets
-        #      ModelConfig.quantization (used to select the QuantizationConfig
-        #      class at model init time), reading from model_arch_config which
-        #      is a snapshot taken before verify_and_update_model_config runs.
-        #   2. GptOssForCausalLMConfig.verify_and_update_model_config() —
-        #      patches hf_config.quantization_config in-place (a separate copy
-        #      of the dict from model_arch_config) for later hf_config lookups.
-        #   3. Here — reads directly from self.config (the raw HF config) which
-        #      may still carry the original "mxfp4" string from the checkpoint.
-        if quant_method == "mxfp4":
-            quant_method = "gpt_oss_mxfp4"
-
-        if quant_method == "gpt_oss_mxfp4":
-            return self._load_weights_mxfp4(
-                ep_rank_end,
-                ep_rank_start,
-                weights,
-                stacked_params_mapping,
-            )
-        elif quant_method == "quark":
-            return self._load_weights_quark(
-                ep_rank_end,
-                ep_rank_start,
-                weights,
-                stacked_params_mapping,
-            )
-        else:
-            return self._load_weights_other(
-                ep_rank_end,
-                ep_rank_start,
-                weights,
-                stacked_params_mapping,
-            )
 
 
 class GptOssForCausalLM(
@@ -1456,6 +1327,3 @@ class GptOssForCausalLM(
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

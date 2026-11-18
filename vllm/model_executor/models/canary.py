@@ -7,7 +7,7 @@ whose `config.json` has `model_type == "canary"`.
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar
 
 import regex as re
@@ -26,7 +26,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import (
@@ -611,32 +610,3 @@ class CanaryForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.proj_out, hidden_states, self.proj_out.bias)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            (".encoder_attn.kv_proj", ".encoder_attn.k_proj", "k"),
-            (".encoder_attn.kv_proj", ".encoder_attn.v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        params_dict.update(self.named_buffers())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in self.hf_to_vllm_mapper.apply(weights):
-            # The encoder is the Transformers module and keeps unfused q/k/v.
-            is_decoder = name.startswith("model.decoder.")
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if not is_decoder or shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params

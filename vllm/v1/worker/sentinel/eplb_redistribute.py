@@ -248,7 +248,8 @@ def reload_experts_from_disk(
 
     logger.info("[FT] Reloading %d (layer, expert) pair(s) from disk.", len(reload_set))
 
-    loaded = model.load_weights(filtered_iter())
+    from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
+    loaded = load_model_weights(model, filtered_iter())
 
     unmatched = set(layer_indices) - matched
     if unmatched:

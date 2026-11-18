@@ -19,7 +19,6 @@ sliding-window context-KV insert, and the checkpoint `mtp.*` weight remap — is
 pure torch / Triton and shared with the nvidia implementation unchanged.
 """
 
-from collections.abc import Iterable
 
 import regex as re
 import torch
@@ -27,14 +26,10 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import HCHeadOp
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -365,106 +360,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     # --- Weight loading ----------------------------------------------------
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load the `mtp.{0,1,2}.*` draft weights from the target checkpoint.
-
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. `embed_tokens`/`lm_head` are aliased from the target.
-        """
-        expert_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-            routed_experts_prefix=(
-                "" if self.model.layers[0].ffn.use_mega_moe else "routed_experts"
-            ),
-        )
-        expert_scale_suffix = (
-            ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
-            else ".weight_scale_inv"
-        )
-
-        # (param_name, ckpt_shard_name, shard_id) for non-expert stacked params.
-        stacked_params_mapping = [
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            mapped = self._remap_dspark_name(name)
-            if mapped is None:
-                continue
-            name = mapped
-            # ``.scale`` -> per-method scale suffix.
-            if name.endswith(".scale"):
-                suffix = (
-                    expert_scale_suffix
-                    if _EXPERT_SCALE_RE.search(name)
-                    else ".weight_scale_inv"
-                )
-                name = name.removesuffix(".scale") + suffix
-
-            # E8M0 expert scales: keep raw exponent bytes.
-            if ".experts." in name:
-                if (
-                    "weight_scale" in name
-                    and loaded_weight.dtype == torch.float8_e8m0fnu
-                ):
-                    loaded_weight = loaded_weight.view(torch.uint8)
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
-                    if weight_name not in name:
-                        continue
-                    name_mapped = name.replace(weight_name, param_name)
-                    param = params_dict[name_mapped]
-                    success = param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        loaded_params.add(name_mapped)
-                        break
-                continue
-
-            # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/hc_head/markov_head/confidence_head) load directly —
-            # otherwise e.g. "markov_w1" would collide with the "w1" shard rule.
-            is_layer_param = name.startswith("model.layers.")
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if not is_layer_param or weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if ".shared_experts.w2" in name:
-                    name = name.replace(
-                        ".shared_experts.w2", ".shared_experts.down_proj"
-                    )
-                if name.endswith(".ffn.gate.bias"):
-                    name = name.replace(
-                        ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
-                    )
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
-        return loaded_params
 
     def process_weights_after_loading(self) -> None:
         finalize_mega_moe_weights(self)

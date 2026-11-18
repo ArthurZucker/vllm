@@ -20,7 +20,6 @@
 # limitations under the License.
 """Inference-only MiMo-MTP model."""
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -37,7 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from .qwen3 import Qwen3DecoderLayer, use_qwen2_attention
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
@@ -211,13 +210,3 @@ class MiMoMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, self.lm_head, spec_step_idx)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The checkpoint carries the full model; keep only the MTP layers and
-        # the shared embedding/head.
-        def mtp_weights():
-            for name, weight in weights:
-                if "mtp_layers" in name or "embed_tokens" in name or "lm_head" in name:
-                    yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(mtp_weights(), mapper=self.hf_to_vllm_mapper)

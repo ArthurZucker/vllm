@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -28,12 +27,11 @@ from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_classify
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsCrossEncoding, SupportsLoRA
 from .interfaces_base import attn_type, default_pooling_type
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 
 
 class ModernBertEmbeddings(nn.Module):
@@ -278,20 +276,6 @@ class ModernBertModel(nn.Module, SupportsLoRA):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embeddings.embed_input_ids(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
     def forward(
         self,
@@ -387,29 +371,6 @@ class ModernBertForSequenceClassification(nn.Module, SupportsCrossEncoding):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        self_weights = []
-
-        def weight_filter():
-            for name, weight in weights:
-                if name.startswith("model."):
-                    yield name[len("model.") :], weight
-                else:
-                    self_weights.append((name, weight))
-
-        self.model.load_weights(weight_filter())
-
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in self_weights:
-            if name.startswith("classifier"):
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            if name.startswith("head"):
-                param = params_dict["pooling." + name[len("head") + 1 :]]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
 
     def forward(
         self,
@@ -471,10 +432,6 @@ class ModernBertForTokenClassification(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        return loaded_params
 
     def forward(
         self,

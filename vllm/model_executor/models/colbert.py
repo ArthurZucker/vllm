@@ -24,7 +24,6 @@ from torch import nn
 from vllm.config import PoolerConfig, VllmConfig
 from vllm.model_executor.layers.pooler import Pooler
 from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from .bert import BertEmbeddingModel, BertModel
 from .interfaces import HasInnerState, IsHybrid, SupportsLateInteraction
@@ -218,13 +217,6 @@ class ColBERTModel(ColBERTMixin, BertEmbeddingModel):
     def _build_pooler(self, pooler_config: PoolerConfig) -> Pooler:
         return self._build_colbert_pooler(pooler_config)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        other_weights, colbert_loaded = self._load_colbert_weights(weights)
-        # Force "bert." to become "model."
-        mapper = WeightsMapper(orig_to_new_prefix={"bert.": "model."})
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(other_weights, mapper=mapper)
-        return loaded | colbert_loaded
 
 
 # -----------------------------------------------------------------------
@@ -282,25 +274,6 @@ class ColBERTModernBertModel(ColBERTMixin, nn.Module):
             intermediate_tensors=intermediate_tensors,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        other_weights, colbert_loaded = self._load_colbert_weights(weights)
-
-        loaded_model = self.model.load_weights(other_weights)
-        loaded = {f"model.{name}" for name in loaded_model} | colbert_loaded
-
-        # When the ST projector is loaded via `_build_colbert_pooler`, the weights
-        # might come from `colbert_loaded` or the pooler automatically falls back to
-        # load from `/1_Dense` etc.
-        # We need to mark its params as loaded so the weight validator doesn't complain
-        # when they are loaded via fallback.
-        if hasattr(self.pooler, "head"):
-            head = self.pooler.head
-            projector = getattr(head, "projector", None)
-            if projector is not None and isinstance(projector, nn.Module):
-                for name, _ in projector.named_parameters():
-                    loaded.add(f"pooler.head.projector.{name}")
-
-        return loaded
 
 
 # -----------------------------------------------------------------------
@@ -356,17 +329,6 @@ class ColBERTJinaRobertaModel(ColBERTMixin, nn.Module):
             intermediate_tensors=intermediate_tensors,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        other_weights, colbert_loaded = self._load_colbert_weights(weights)
-
-        # HF pooler weights are not used in ColBERT
-        mapper = WeightsMapper(
-            orig_to_new_prefix={"roberta.": "model.", "model.pooler.": None}
-        )
-
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(other_weights, mapper=mapper)
-        return loaded | colbert_loaded
 
 
 # -----------------------------------------------------------------------
@@ -440,23 +402,3 @@ class ColBERTLfm2Model(ColBERTMixin, nn.Module, HasInnerState, IsHybrid):
             intermediate_tensors=intermediate_tensors,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        other_weights, colbert_loaded = self._load_colbert_weights(weights)
-
-        loaded_model = self.model.load_weights(other_weights)
-
-        loaded = {f"model.{name}" for name in loaded_model} | colbert_loaded
-
-        # When the ST projector is loaded via `_build_colbert_pooler`, the weights
-        # might come from `colbert_loaded` or the pooler automatically falls back to
-        # load from `/1_Dense` etc.
-        # We need to mark its params as loaded so the weight validator doesn't complain
-        # when they are loaded via fallback.
-        if hasattr(self.pooler, "head"):
-            head = self.pooler.head
-            projector = getattr(head, "projector", None)
-            if projector is not None and isinstance(projector, nn.Module):
-                for name, _ in projector.named_parameters():
-                    loaded.add(f"pooler.head.projector.{name}")
-
-        return loaded

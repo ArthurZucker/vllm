@@ -3,7 +3,6 @@
 
 """Eagle3 speculative decoding model for DeepseekV2/V3 with MLP (no MoE)."""
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -27,11 +26,9 @@ from vllm.multimodal.inputs import NestedTensors
 
 from .interfaces import LocalArgmaxMixin
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
 )
 
 
@@ -266,9 +263,6 @@ class DeepseekV2Eagle3Model(nn.Module):
         },
     )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
@@ -367,35 +361,6 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
             )
         return self.model.fc(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        model_weights = {}
-        includes_draft_id_mapping = False
-        includes_embed_tokens = False
-
-        for name, loaded_weight in weights:
-            if "t2d" in name:
-                continue
-            if "d2t" in name:
-                name = name.replace("d2t", "draft_id_to_target_id")
-                includes_draft_id_mapping = True
-            elif "lm_head" not in name:
-                name = "model." + name
-            if "embed_tokens" in name:
-                includes_embed_tokens = True
-            model_weights[name] = loaded_weight
-            process_eagle_weight(self, name)
-
-        orig_to_new_substr: dict[str, str | None] = {}
-        if not includes_draft_id_mapping:
-            orig_to_new_substr["draft_id_to_target_id"] = None
-        if not includes_embed_tokens:
-            orig_to_new_substr["embed_tokens"] = None
-
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(
-            model_weights.items(),
-            mapper=WeightsMapper(orig_to_new_substr=orig_to_new_substr),
-        )
 
 
 # Aliases for compatibility

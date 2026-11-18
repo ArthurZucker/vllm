@@ -25,7 +25,6 @@
 """Inference-only InternS1Pro model compatible with HuggingFace weights."""
 
 import functools
-from collections.abc import Iterable
 from typing import Any, ClassVar
 
 import torch
@@ -74,7 +73,6 @@ from .qwen3_vl import (
 )
 from .qwen3_vl_moe import Qwen3MoeLLMModel
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     extract_layer_index,
     maybe_prefix,
@@ -606,20 +604,3 @@ class InternS1ProForConditionalGeneration(
                 )
         return mapper
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        """Load weights"""
-        orig_to_new_prefix: dict[str, str | None] = {
-            "model.visual.": "visual.",
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-            "model.time_series.": None,
-        }
-        if self.visual is None:
-            orig_to_new_prefix["visual."] = None
-        # FIXME(Isotr0py): See if we can avoid tighing FoPE to PP layers
-        weights_mapper = WeightsMapper(
-            orig_to_new_prefix=orig_to_new_prefix,
-            orig_to_new_suffix=self.get_frope_params_map(),
-        )
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=weights_mapper)

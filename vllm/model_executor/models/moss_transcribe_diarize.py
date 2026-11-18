@@ -11,7 +11,7 @@ The checkpoint layout is:
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
 import regex as re
@@ -32,7 +32,6 @@ from vllm.model_executor.models.interfaces import (
     _require_is_multimodal,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
@@ -42,7 +41,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.models.whisper import (
     WhisperEncoder,
-    _create_fake_bias_for_k_proj,
 )
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -291,10 +289,6 @@ class MossTranscribeDiarizeWhisperEncoder(WhisperEncoder):
         self.audio_merge_size = int(vllm_config.model_config.hf_config.audio_merge_size)
         self.max_encoder_batch: int | None = None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = _create_fake_bias_for_k_proj(weights, ".k_proj.weight")
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def forward(
         self,
@@ -860,9 +854,3 @@ class MossTranscribeDiarizeForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            weights,
-            mapper=self.hf_to_vllm_mapper,
-        )

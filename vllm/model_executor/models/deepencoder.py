@@ -10,7 +10,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from functools import partial
 
 import torch
@@ -26,7 +26,6 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import LOG2E, tl, triton
 
 from .clip import CLIPEncoder, CLIPVisionEmbeddings
-from .utils import AutoWeightsLoader
 
 LOG2E = tl.constexpr(LOG2E)
 
@@ -856,6 +855,3 @@ class DeepCLIPVisionTransformer(nn.Module):
         )
         return encoder_outputs
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

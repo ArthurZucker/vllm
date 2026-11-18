@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM composition layer for Dots3Note image and audio encoders."""
 
-from collections.abc import Iterable
 from contextlib import contextmanager
 
 import torch
@@ -16,7 +15,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     IntermediateTensors,
     WeightsMapper,
     maybe_prefix,
@@ -312,11 +310,6 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(
-            weights,
-            mapper=self.hf_to_vllm_mapper,
-        )
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal
 
 import torch
@@ -54,7 +54,7 @@ from vllm.transformers_utils.processors.openvla import (
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .module_mapping import MultiModelKeys
-from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
+from .utils import init_vllm_registered_model, maybe_prefix
 
 # openvla/openvla-7b uses 224x224 images with ViT patch size 14, yielding a
 # 16x16 image-token grid.
@@ -499,27 +499,3 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
         del modality, mm_kwargs
         return num_mm_embeds, num_mm_embeds
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def maybe_rename_vision_weights(
-            weights: Iterable[tuple[str, torch.Tensor]],
-        ) -> Iterable[tuple[str, torch.Tensor]]:
-            for name, weight in weights:
-                if name.startswith("vision_backbone.featurizer."):
-                    name = name.replace(
-                        "vision_backbone.featurizer.",
-                        "vision_backbone.dinov2_featurizer.",
-                        1,
-                    )
-                elif name.startswith("vision_backbone.fused_featurizer."):
-                    name = name.replace(
-                        "vision_backbone.fused_featurizer.",
-                        "vision_backbone.siglip_featurizer.",
-                        1,
-                    )
-                # HF uses .scale_factor, timm uses .gamma
-                if ".ls1.scale_factor" in name or ".ls2.scale_factor" in name:
-                    name = name.replace(".scale_factor", ".gamma")
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(maybe_rename_vision_weights(weights))

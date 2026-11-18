@@ -8,7 +8,7 @@ shuffle connector and ColBERT-style 128-dim per-token embeddings.
 Reference: https://huggingface.co/ModernVBERT/colmodernvbert-merged
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 from torch import nn
@@ -43,7 +43,7 @@ from .interfaces import (
 from .interfaces_base import default_pooling_type
 from .modernbert import ModernBertEmbeddings, ModernBertLayer
 from .siglip import SiglipVisionModel
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 
 # ---------------------------------------------------------------------------
 # Connector: pixel shuffle + simple linear projection
@@ -368,23 +368,3 @@ class ColModernVBertForRetrieval(
         },
     )
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(
-            weights,
-            mapper=self.hf_to_vllm_mapper,
-        )
-
-        # The pooler wraps ``custom_text_proj`` as its head projector.
-        # Mark those params as loaded under the pooler path too.
-        if hasattr(self, "pooler") and hasattr(self.pooler, "head"):
-            head = self.pooler.head
-            projector = getattr(head, "projector", None)
-            if projector is not None and isinstance(projector, nn.Module):
-                for pname, _ in projector.named_parameters():
-                    loaded_params.add(f"pooler.head.projector.{pname}")
-
-        return loaded_params

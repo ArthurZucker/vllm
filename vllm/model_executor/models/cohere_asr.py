@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 import torch
@@ -30,7 +30,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -72,7 +71,7 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsTranscription,
 )
-from .utils import AutoWeightsLoader, WeightsMapper, make_layers, maybe_prefix
+from .utils import WeightsMapper, make_layers, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -1810,44 +1809,6 @@ class CohereASRModel(nn.Module):
         else:
             raise NotImplementedError("List input_features not supported")
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".first_sub_layer.qkv_proj", ".first_sub_layer.query_net", "q"),
-            (".first_sub_layer.qkv_proj", ".first_sub_layer.key_net", "k"),
-            (".first_sub_layer.qkv_proj", ".first_sub_layer.value_net", "v"),
-            (".second_sub_layer.kv_proj", ".second_sub_layer.key_net", "k"),
-            (".second_sub_layer.kv_proj", ".second_sub_layer.value_net", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        buffers_dict = dict(self.named_buffers())
-        params_dict.update(buffers_dict)
-
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                # if name.endswith(".bias") and name not in params_dict:
-                #     continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class CohereASRProcessingInfo(BaseProcessingInfo):
@@ -2297,28 +2258,3 @@ class CohereAsrForConditionalGeneration(
         logits = self.logits_processor(self.proj_out, hidden_states, self.proj_out.bias)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def transform(inputs):
-            name, loaded_weight = inputs
-
-            if name.startswith("transf_decoder._decoder"):
-                name = name.replace("transf_decoder._decoder", "decoder")
-            if name.startswith("transf_decoder._embedding"):
-                name = name.replace("transf_decoder._embedding", "decoder.embedding")
-            if "second_sub_layer.query_net" in name:
-                name = name.replace(
-                    "second_sub_layer.query_net", "second_sub_layer.q_proj"
-                )
-
-            if name in ["log_softmax.mlp.layer0.weight", "log_softmax.mlp.layer0.bias"]:
-                name = name.replace("log_softmax.mlp.layer0", "proj_out")
-            else:
-                name = "model." + name
-
-            return name, loaded_weight
-
-        loader = AutoWeightsLoader(self)
-
-        return loader.load_weights(
-            map(transform, weights), mapper=self.hf_to_vllm_mapper
-        )

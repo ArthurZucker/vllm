@@ -20,9 +20,6 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.reload import (
-    support_quantized_model_reload_from_hp_weights,
-)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import supports_any_eagle
 from vllm.multimodal import NestedTensors
@@ -460,33 +457,6 @@ class AutoWeightsLoader:
                 )
                 raise ValueError(msg)
 
-    @support_quantized_model_reload_from_hp_weights
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-        *,
-        mapper: WeightsMapper | None = None,
-    ) -> set[str]:
-        # Ignore unexpected biases (typically from GPTQ models)
-        self.ignore_unexpected_suffixes.append(".bias")
-
-        mapper = mapper or WeightsMapper()
-        # Many models store quant_config in the base model instead of the causal model.
-        # We look at the causal model's direct children for this reason.
-        modules = (self.module, *self.module.children())
-        iterator = (m.quant_config for m in modules if hasattr(m, "quant_config"))
-        if quant_config := next(iterator, None):
-            # Apply mappings for quantization-specific checkpoint tensors.
-            mapper |= quant_config.get_cache_scale_mapper()
-            mapper |= quant_config.get_checkpoint_weight_mapper()
-            ignore_unexpected_suffixes = quant_config._ignore_unexpected_suffixes
-            self.ignore_unexpected_suffixes.extend(ignore_unexpected_suffixes)
-        mapper |= self.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
-
-        weights = mapper.apply(weights)
-        weights = self._filter_skipped(weights)
-
-        return set(self._load_module("", self.module, weights))
 
     def _filter_skipped(
         self, weights: Iterable[tuple[str, torch.Tensor]]

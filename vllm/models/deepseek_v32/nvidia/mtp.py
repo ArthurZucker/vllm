@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import typing
-from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
@@ -14,15 +12,8 @@ from vllm.model_executor.layers.fused_embed_norm import (
     has_full_vocab_on_rank,
     make_input_embedding,
 )
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MixtureOfExperts,
@@ -356,104 +347,3 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
             and "embed_tokens" not in name
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            ("fused_qkv_a_proj", "q_a_proj", 0),
-            ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
-        ]
-        expert_params_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-        )
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or self.is_unused_checkpoint_weight(name):
-                continue
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is None:
-                # A tied top-level embed_tokens has no spec layer to rewrite
-                # from; the draft needs its own copy under PP.
-                param = params_dict.get(name) if "embed_tokens" in name else None
-                if param is not None:
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-                continue
-            name = self._rewrite_spec_layer_name(spec_layer, name)
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                if (
-                    param_name == "fused_qkv_a_proj"
-                ) and name_mapped not in params_dict:
-                    continue
-                else:
-                    name = name_mapped
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                num_chunks = 1
-
-                for _ in range(num_chunks):
-                    chunk_name = name
-                    weight_to_load = loaded_weight
-
-                    is_expert_weight = False
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping  # type: ignore[assignment]
-                        if weight_name not in chunk_name:
-                            continue
-                        is_expert_weight = True
-                        name_mapped = chunk_name.replace(weight_name, param_name)
-                        param = params_dict[name_mapped]
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
-                        success = weight_loader(
-                            param,
-                            weight_to_load,
-                            name_mapped,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    else:
-                        if is_expert_weight:
-                            continue
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        name = maybe_remap_kv_scale_name(name, params_dict)  # type: ignore[assignment]
-                        if name is None:
-                            continue
-                        if (
-                            spec_layer != self.model.mtp_start_layer_idx
-                            and ".layers" not in name
-                        ):
-                            continue
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params

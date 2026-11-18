@@ -18,7 +18,6 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
-from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
 from typing import ClassVar
@@ -76,7 +75,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     ShardIds,
     WeightsMapper,
@@ -1457,9 +1455,6 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Gemma4ForCausalLM(
@@ -1570,6 +1565,3 @@ class Gemma4ForCausalLM(
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

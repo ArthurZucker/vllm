@@ -3,7 +3,6 @@
 """Inference-only Beam model for AMD GPUs."""
 
 import math
-from collections.abc import Iterable
 from typing import cast
 
 import torch
@@ -25,7 +24,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsQuant,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
@@ -244,9 +242,6 @@ class BeamModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class BeamForCausalLM(
@@ -366,6 +361,3 @@ class BeamForCausalLM(
             logits = beam_softcap_logits(logits, self.final_logit_softcapping)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

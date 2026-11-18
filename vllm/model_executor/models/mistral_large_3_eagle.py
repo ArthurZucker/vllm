@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
-from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -191,10 +190,3 @@ class EagleMistralLarge3ForCausalLM(
         hidden_states = self.model(input_ids, positions, hidden_states, inputs_embeds)
         return hidden_states, hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Pretend we've loaded the embedding and lm_head weights
-        # (later copied from target model)
-        return super().load_weights(weights) | {
-            "model.embed_tokens.weight",
-            "lm_head.weight",
-        }

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from functools import cached_property, partial
 from typing import Annotated, Literal
 
@@ -63,7 +63,7 @@ from ..layers.fusion.mm_input_norm import IdentityInputNorm
 from .clip import dual_encoder_has_text_tokens, merge_dual_encoder_text_and_vision
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsQuant
 from .interfaces_base import default_pooling_type
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import WeightsMapper, maybe_prefix
 from .vision import (
     VisionEncoderInfo,
     VisionFeatureSelectStrategy,
@@ -597,9 +597,6 @@ class SiglipTextTransformer(nn.Module):
 
         return last_hidden_state
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class SiglipMultiheadAttentionPoolingHead(nn.Module):
@@ -790,21 +787,6 @@ class SiglipVisionTransformer(nn.Module):
             encoder_outputs = self.head(encoder_outputs)
         return encoder_outputs
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        layer_count = len(self.encoder.layers)
-
-        def _filter(ws):
-            for name, w in ws:
-                # omit layers when num_hidden_layers_override is set
-                if name.startswith("encoder.layers.") and (
-                    int(name.split(".")[2]) >= layer_count
-                ):
-                    continue
-                yield name, w
-
-        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)
 
 
 class SiglipVisionModel(nn.Module):
@@ -1155,10 +1137,3 @@ class SiglipEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
             text_features, vision_embeds, self._mm_token_mask
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=["logit_scale.", "logit_bias."],
-        )
-
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

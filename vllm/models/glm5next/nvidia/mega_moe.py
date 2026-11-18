@@ -94,41 +94,6 @@ class Glm5NextMegaMoEExperts(DeepGemmMegaMoEExperts):
     def _shared_shard_id(name: str) -> str:
         return "w1" if ".gate_proj." in name else "w3" if ".up_proj." in name else "w2"
 
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> bool | None:
-        local_expert_ids = self._map_global_expert_id(expert_id)
-        if weight_name.endswith("weight_scale_inv"):
-            param_prefix = "w2_" if shard_id == "w2" else "w13_"
-            loaded = bool(local_expert_ids) and param_prefix in weight_name
-            for local_expert_id in local_expert_ids if loaded else ():
-                self._shard_rows(param.data[local_expert_id], shard_id).copy_(
-                    loaded_weight
-                )
-            new = self._new_scales
-        else:
-            loaded = bool(
-                super().weight_loader(
-                    param,
-                    loaded_weight,
-                    weight_name,
-                    shard_id,
-                    expert_id,
-                    return_success=True,
-                )
-            )
-            new = self._new_weights
-        if loaded:
-            new.update(
-                (local_expert_id, shard_id) for local_expert_id in local_expert_ids
-            )
-        return loaded if return_success else None
 
     def load_shared_expert_weight(self, name: str, loaded_weight: torch.Tensor) -> str:
         """Load one shared-expert checkpoint tensor; return the parameter name."""

@@ -18,7 +18,6 @@
 # limitations under the License.
 """PyTorch Idefics2 model."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -40,7 +39,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 
-from .utils import AutoWeightsLoader, WeightsMapper
+from .utils import WeightsMapper
 from .vision import is_vit_use_data_parallel, run_dp_sharded_vision_model
 
 
@@ -493,19 +492,3 @@ class Idefics2VisionTransformer(nn.Module):
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        layer_count = len(self.encoder.layers)
-
-        def _filter(ws: Iterable[tuple[str, torch.Tensor]]):
-            # Drop layers beyond num_hidden_layers_override.
-            for name, w in ws:
-                if (
-                    name.startswith("encoder.layers.")
-                    and int(name.split(".")[2]) >= layer_count
-                ):
-                    continue
-                yield name, w
-
-        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)
