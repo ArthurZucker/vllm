@@ -32,6 +32,7 @@ from transformers.core_model_loading import (
 from vllm.model_executor.model_loader.weight_ops import (
     OutputConcatenate,
     RepeatLastSource,
+    SwapHalves,
     ZeroMissingSource,
 )
 
@@ -142,6 +143,10 @@ MISTRAL_FORMAT = [
     rename(r"\.qscale_weight$", ".weight_scale"),
 ]
 
+# ColBERT: the projection (`linear` / `colbert_linear`), then the encoder's checkpoint
+# names under `model.`
+COLBERT_LINEAR = rename(r"^(.*\.)?(colbert_)?linear\.weight$", "colbert_linear.weight")
+
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
@@ -250,6 +255,21 @@ def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "Gemma4Model": _gemma4,
+    "ColBERTModel": [COLBERT_LINEAR, rename(r"^bert\.", "model.")],
+    "ColBERTJinaRobertaModel": [
+        COLBERT_LINEAR,
+        rename(r"^roberta\.", "model."),
+        drop(r"^model\.pooler\."),
+    ],
+    # Sentence-Transformers checkpoints: the encoder without its prefix
+    "ColBERTLfm2Model": [
+        COLBERT_LINEAR,
+        rename(r"^(?!model\.|colbert_linear\.)", "model."),
+    ],
+    "ColBERTModernBertModel": [
+        COLBERT_LINEAR,
+        rename(r"^(?!model\.|colbert_linear\.)", "model."),
+    ],
     # their mapper is built per instance by a helper (TODO: return transforms)
     "BeamModel": _own_mapper,
     "DFlashQwen3Model": _own_mapper,
@@ -486,6 +506,11 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         ),
     ],
     "CohereAsrForConditionalGeneration": [
+        rename(r"^transf_decoder\._decoder", "decoder"),
+        rename(r"^transf_decoder\._embedding", "decoder.embedding"),
+        rename(r"second_sub_layer\.query_net", "second_sub_layer.q_proj"),
+        rename(r"^log_softmax\.mlp\.layer0\.", "proj_out."),
+        rename(r"^(?!proj_out\.)", "model."),
         rename("\\.fc1\\.", ".mlp.fc1."),
         rename("\\.fc2\\.", ".mlp.fc2."),
         drop("model\\.conv\\.batch_norm\\.num_batches_tracked"),
@@ -1037,6 +1062,11 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("layer", "layers"),
         rename("attention\\.qkv_proj", "attn.qkv_proj"),
         rename("attention\\.o_proj", "attn.out_proj"),
+        drop(r"^classifier"),
+        # stored [up, gate], the param is [gate, up]
+        WeightConverter(
+            ".mlp.up_gate_proj", ".mlp.gate_up_proj", operations=[SwapHalves()]
+        ),
     ],
     "HCXVisionV2ForCausalLM": [
         drop("discrete_vision_model"),

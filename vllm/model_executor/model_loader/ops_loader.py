@@ -272,7 +272,8 @@ def load_with_ops(
         param = params.get(target)
         param = model.get_parameter(target) if param is None else param  # tied
         if isinstance(converter, WeightConverter):
-            if len(converter.target_patterns) > 1:  # split: each output sharded after
+            full = any(getattr(op, "needs_full", False) for op in converter.operations)
+            if len(converter.target_patterns) > 1 or full:  # each output sharded after
                 if not any(isinstance(op, ShardOutputs) for op in converter.operations):
                     converter.operations = [*converter.operations, ShardOutputs(model)]
                 return None
@@ -309,4 +310,13 @@ def load_with_ops(
             sorted(info.mismatched_keys)[:4],
             list(info.conversion_errors.items())[:4],
         )
-    return {name for name, _ in model.named_parameters()} - info.missing_keys
+    # a param the checkpoint lacks, tied to another (an MLM decoder to the embeddings)
+    for name, param in params.items():
+        if name in info.missing_keys and (source := getattr(param, "tied_to", None)):
+            param.data.copy_(params[source].data[: param.shape[0]])
+            info.missing_keys.discard(name)
+    # params loaded as they were built (e.g. a pooler's Sentence-Transformers projector)
+    at_init = {
+        n for n, p in model.named_parameters() if getattr(p, "loaded_at_init", 0)
+    }
+    return {name for name, _ in model.named_parameters()} - info.missing_keys | at_init

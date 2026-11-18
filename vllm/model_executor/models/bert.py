@@ -867,6 +867,8 @@ class BertForMaskedLM(nn.Module):
             vocab_size=config.vocab_size,
             layer_norm_eps=getattr(config, "layer_norm_eps", 1e-12),
         )
+        # checkpoints without a decoder: the word embeddings (`ops_loader`)
+        self.mlm_head.decoder.weight.tied_to = "bert.embeddings.word_embeddings.weight"
 
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None

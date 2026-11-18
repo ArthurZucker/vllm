@@ -101,3 +101,21 @@ class Gather(ConversionOps):
             index = self.index.to(t.device)
             out[key] = raw.index_select(self.dim, index).view(t.dtype)
         return out
+
+
+class SwapHalves(ConversionOps):
+    """The two halves of `dim` swapped: a fused projection stored `[up, gate]` where
+    the param is `[gate, up]` (GTE's `up_gate_proj`). Needs the whole tensor: the
+    loader shards after it"""
+
+    needs_full = True
+
+    def __init__(self, dim: int = 0):
+        self.dim = dim
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        tensor = next(iter(input_dict.values()))
+        tensor = tensor[0] if isinstance(tensor, list) else tensor
+        first, second = tensor.chunk(2, dim=self.dim)
+        return {target_patterns[0]: torch.cat([second, first], dim=self.dim)}
