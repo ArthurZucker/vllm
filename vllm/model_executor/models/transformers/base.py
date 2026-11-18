@@ -70,6 +70,7 @@ from vllm.model_executor.models.transformers.fusers.attention import (
     VLLM_ATTN_IMPL,
     VLLM_MLA_ATTN_IMPL,
 )
+from vllm.model_executor.models.transformers.loader import load_with_ops
 from vllm.model_executor.models.transformers.utils import (
     attrsetter,
     can_enable_torch_compile,
@@ -937,7 +938,19 @@ class Base(
             hf_quantizer,
             checkpoint_keys,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        weights = self.hf_to_vllm_mapper.apply(weights)
+        loaded: set[str] = set()
+        # ponytail: env switch back to the layers' `weight_loader`s, for A/B checks
+        if os.environ.get("VLLM_TRANSFORMERS_WEIGHT_LOADERS") != "1":
+            weights = load_with_ops(self, weights, loaded)
+        rest = loader.load_weights(weights)
+        logger.info(
+            "Loaded %d params with Transformers' ops, %d with weight_loaders: %s",
+            len(loaded),
+            len(rest),
+            sorted(rest)[:8],
+        )
+        return loaded | rest
 
     @staticmethod
     def check_version(min_version: str, feature: str):
