@@ -18,7 +18,6 @@
 # limitations under the License.
 """PyTorch Idefics2 model."""
 
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -39,7 +38,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 
-from .utils import WeightsMapper
 from .vision import is_vit_use_data_parallel, run_dp_sharded_vision_model
 
 
@@ -381,14 +379,6 @@ class Idefics2Encoder(nn.Module):
 
 
 class Idefics2VisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: Idefics2VisionConfig,
@@ -428,13 +418,6 @@ class Idefics2VisionTransformer(nn.Module):
             )
             if require_post_norm
             else nn.Identity()
-        )
-        # head is a pooling header absent from this model.
-        orig_to_new_prefix: dict[str, str | None] = {"head.": None}
-        if not require_post_norm:
-            orig_to_new_prefix["post_layernorm."] = None
-        self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_prefix=orig_to_new_prefix
         )
 
     def get_input_embeddings(self):
@@ -491,4 +474,3 @@ class Idefics2VisionTransformer(nn.Module):
             encoder_outputs = self.encoder(hidden_states, attention_mask=attention_mask)
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
-

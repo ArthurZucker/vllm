@@ -20,7 +20,6 @@
 # limitations under the License.
 """Inference-only MiMo-MTP model."""
 
-
 import torch
 import torch.nn as nn
 from transformers import PreTrainedConfig
@@ -36,7 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from .qwen3 import Qwen3DecoderLayer, use_qwen2_attention
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
@@ -162,28 +161,6 @@ class MiMoMTP(nn.Module):
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
-        # Checkpoint stores MTP layers 0-indexed and without the `mtp_block`
-        # wrapper around the transformer block; remap onto the offset index.
-        start = self.config.num_hidden_layers
-        self.hf_to_vllm_mapper = WeightsMapper(
-            orig_to_new_substr={
-                ".self_attn.": ".mtp_block.self_attn.",
-                ".mlp.": ".mtp_block.mlp.",
-                ".input_layernorm.": ".mtp_block.input_layernorm.",
-                ".post_attention_layernorm.": ".mtp_block.post_attention_layernorm.",
-            },
-            orig_to_new_stacked={
-                ".q_proj": (".qkv_proj", "q"),
-                ".k_proj": (".qkv_proj", "k"),
-                ".v_proj": (".qkv_proj", "v"),
-                ".gate_proj": (".gate_up_proj", 0),
-                ".up_proj": (".gate_up_proj", 1),
-            },
-            orig_to_new_prefix={
-                f"model.mtp_layers.{i}.": f"model.mtp_layers.{i + start}."
-                for i in range(self.config.num_nextn_predict_layers)
-            },
-        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -209,4 +186,3 @@ class MiMoMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, self.lm_head, spec_step_idx)
-

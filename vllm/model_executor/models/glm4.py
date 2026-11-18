@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only GLM-4-0414 model compatible with HuggingFace weights."""
 
-
 import torch
 from torch import nn
 from transformers import Glm4Config
@@ -44,7 +43,7 @@ from vllm.v1.attention.backend import AttentionType
 from .interfaces import SupportsLoRA, SupportsPP
 from .llama import LlamaMLP as Glm4MLP
 from .llama import LlamaModel
-from .utils import PPMissingLayer, WeightsMapper, maybe_prefix
+from .utils import PPMissingLayer, maybe_prefix
 
 
 class Glm4Attention(nn.Module):
@@ -264,16 +263,6 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
-        # Drop the speculative (MTP) layers, which are loaded by the draft
-        # model instead. They are appended after the main decoder layers.
-        num_nextn_layers = getattr(config, "num_nextn_predict_layers", 0)
-        self.hf_to_vllm_mapper = WeightsMapper(
-            orig_to_new_prefix={
-                f"model.layers.{config.num_hidden_layers + i}.": None
-                for i in range(num_nextn_layers)
-            }
-        )
-
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -295,4 +284,3 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

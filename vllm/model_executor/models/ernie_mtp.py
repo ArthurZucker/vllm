@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only Ernie-MTP model."""
 
-
 import torch
 import torch.nn as nn
 
@@ -37,7 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from .llama import LlamaDecoderLayer
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class ErnieMultiTokenPredictorLayer(nn.Module):
@@ -144,28 +143,6 @@ class ErnieMTP(nn.Module):
         super().__init__()
 
         self.config = vllm_config.model_config.hf_config
-        # MTP weights are stored under a flat `mtp_*.0.` block in the
-        # checkpoint; rewrite them into `model.layers.{spec_layer}.*`.
-        spec_layer = self.config.num_hidden_layers
-        self.hf_to_vllm_mapper = WeightsMapper(
-            orig_to_new_substr={
-                "model.mtp_emb_norm.0.": f"model.layers.{spec_layer}.mtp_emb_norm.",
-                "model.mtp_hidden_norm.0.": (
-                    f"model.layers.{spec_layer}.mtp_hidden_norm."
-                ),
-                "model.mtp_linear_proj.0.": (
-                    f"model.layers.{spec_layer}.mtp_linear_proj."
-                ),
-                "model.mtp_block.0.": f"model.layers.{spec_layer}.mtp_block.",
-            },
-            orig_to_new_stacked={
-                ".q_proj": (".qkv_proj", "q"),
-                ".k_proj": (".qkv_proj", "k"),
-                ".v_proj": (".qkv_proj", "v"),
-                ".gate_proj": (".gate_up_proj", 0),
-                ".up_proj": (".gate_up_proj", 1),
-            },
-        )
         self.model = ErnieMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -202,4 +179,3 @@ class ErnieMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, self.lm_head, spec_step_idx)
-

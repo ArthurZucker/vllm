@@ -48,7 +48,6 @@ from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
 from .interfaces import SupportsQuant
 from .utils import (
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -799,28 +798,6 @@ class Gemma3nCrossDecoder(nn.Module):
         return hidden_states
 
 
-def _kv_sharing_weights_mapper(config: Gemma3nTextConfig) -> WeightsMapper:
-    """KV-shared layers only have q_proj, so qkv_proj packing applies to the
-    other layers. Original checkpoints still ship K/V tensors for the shared
-    layers (fine-tuned ones omit them); those are dropped."""
-    first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
-    return WeightsMapper(
-        orig_to_new_substr={
-            f"layers.{i}.self_attn.{name}.": None
-            for i in range(first_kv_shared_layer_idx, config.num_hidden_layers)
-            for name in ("k_proj", "v_proj", "k_norm")
-        },
-        orig_to_new_stacked={
-            f"layers.{i}.self_attn.{shard}_proj.": (
-                f"layers.{i}.self_attn.qkv_proj.",
-                shard,
-            )
-            for i in range(first_kv_shared_layer_idx)
-            for shard in ("q", "k", "v")
-        },
-    )
-
-
 # This disables torch.compile if --kv-sharing-fast-prefill passed
 @support_torch_compile(
     enable_if=lambda vllm_config: not vllm_config.cache_config.kv_sharing_fast_prefill
@@ -828,19 +805,6 @@ def _kv_sharing_weights_mapper(config: Gemma3nTextConfig) -> WeightsMapper:
 class Gemma3nTextModel(nn.Module, SupportsQuant):
     # Decoder layers, altup_unembed_projections and norm live on the text
     # model; every other submodule lives under self_decoder.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "embed_tokens.": "self_decoder.embed_tokens.",
-            "embed_tokens_per_layer.": "self_decoder.embed_tokens_per_layer.",
-            "per_layer_model_projection.": "self_decoder.per_layer_model_projection.",
-            "per_layer_projection_norm.": "self_decoder.per_layer_projection_norm.",
-            "altup_projections.": "self_decoder.altup_projections.",
-        },
-        orig_to_new_stacked={
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -849,9 +813,6 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | _kv_sharing_weights_mapper(
-            config
-        )
 
         self.altup_unembed_projections = nn.ModuleList(
             [

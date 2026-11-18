@@ -63,7 +63,7 @@ from ..layers.fusion.mm_input_norm import IdentityInputNorm
 from .clip import dual_encoder_has_text_tokens, merge_dual_encoder_text_and_vision
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsQuant
 from .interfaces_base import default_pooling_type
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 from .vision import (
     VisionEncoderInfo,
     VisionFeatureSelectStrategy,
@@ -631,14 +631,6 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
 
 
 class SiglipVisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: SiglipVisionConfig,
@@ -705,16 +697,6 @@ class SiglipVisionTransformer(nn.Module):
             else None
         )
         self.last_hs_proc = partial(self.maybe_layer_norm_and_apply_head)
-
-        drops = dict[str, None]()
-        if self.post_layernorm is None:
-            drops["post_layernorm."] = None
-        if self.head is None:
-            drops["head."] = None
-        if drops:
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix=drops
-            )
 
         self.input_norm = input_norm if input_norm is not None else IdentityInputNorm()
 

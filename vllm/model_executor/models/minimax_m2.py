@@ -58,7 +58,6 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -319,15 +318,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
 class MiniMaxM2Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -368,14 +358,6 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
-
-        # Drop spec-decode (MTP) layers; they are appended after the main
-        # decoder layers and have no destination in the main model.
-        if num_mtp := getattr(config, "num_mtp_modules", 0):
-            base = config.num_hidden_layers
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={f"layers.{base + i}.": None for i in range(num_mtp)}
-            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

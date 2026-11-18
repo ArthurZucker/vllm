@@ -20,7 +20,6 @@ from vllm.model_executor.models.commandr import (
 )
 
 from .utils import (
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -144,10 +143,6 @@ class EagleCohereForCausalLM(CohereForCausalLM):
         nn.Module.__init__(self)
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-        if self.config.tie_word_embeddings:
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={"model.embed_tokens.": None}
-            )
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = CohereEagleModel(
             vllm_config=vllm_config,
@@ -175,4 +170,3 @@ class EagleCohereForCausalLM(CohereForCausalLM):
                 f"{type(self).__name__} does not support multimodal inputs yet."
             )
         return self.model(input_ids, positions, hidden_states)
-

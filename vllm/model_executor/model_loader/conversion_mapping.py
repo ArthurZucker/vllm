@@ -15,6 +15,7 @@ To add a model: copy the closest entry, load it, read the "matching no param" wa
 
 import os
 import re
+from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
@@ -98,7 +99,44 @@ def transformers_experts(model_type: str) -> list[WeightTransform]:
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
-_CONVERSION_MAPPING: dict[str, list[WeightTransform]] = {
+
+def _mimo_mtp(module: nn.Module) -> list[WeightTransform]:
+    """MTP layers stored 0-indexed without the `mtp_block` wrapper, after the decoder's"""
+    start, layers = (
+        module.config.num_hidden_layers,
+        module.config.num_nextn_predict_layers,
+    )
+    blocks = ("self_attn", "mlp", "input_layernorm", "post_attention_layernorm")
+    return [
+        *(rename(rf"\.{block}\.", f".mtp_block.{block}.") for block in blocks),
+        *(
+            rename(rf"^model\.mtp_layers\.{i}\.", f"model.mtp_layers.{i + start}.")
+            for i in range(layers)
+        ),
+        QKV,
+        GATE_UP,
+    ]
+
+
+def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
+    """MTP weights stored as a flat `mtp_*.0.` block, onto the layer after the decoder's"""
+    layer = module.config.num_hidden_layers
+    parts = ("mtp_emb_norm", "mtp_hidden_norm", "mtp_linear_proj", "mtp_block")
+    return [
+        *(
+            rename(rf"model\.{part}\.0\.", f"model.layers.{layer}.{part}.")
+            for part in parts
+        ),
+        QKV,
+        GATE_UP,
+    ]
+
+
+# A class's entry: its transforms, or a function of one of its modules returning them
+# (when they depend on the config, e.g. an MTP layer's index)
+_CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
+    "MiMoMTP": _mimo_mtp,
+    "ErnieMTP": _ernie_mtp,
     "AIMv2Model": [
         fused(".fc13", ".fc1", ".fc3"),
     ],
@@ -851,6 +889,9 @@ _CONVERSION_MAPPING: dict[str, list[WeightTransform]] = {
         rename("^model", "language_model.model"),
     ],
     "Gemma3nTextModel": [
+        # KV-shared layers only have `q_proj`: their q keeps its name (the converter's
+        # target is not a param there), their K/V tensors load nowhere
+        QKV,
         rename("^embed_tokens\\.", "self_decoder.embed_tokens."),
         rename("^embed_tokens_per_layer\\.", "self_decoder.embed_tokens_per_layer."),
         rename(
@@ -2599,9 +2640,11 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
     (e.g. a vision tower's to `visual`), outermost first: its renamings see the
     checkpoint's names, its converters the model's"""
     instances: dict[str, list[str]] = {}
+    first: dict[str, nn.Module] = {}
     for name, module in model.named_modules():
-        if type(module).__name__ in _CONVERSION_MAPPING:
-            instances.setdefault(type(module).__name__, []).append(name)
+        if (cls := type(module).__name__) in _CONVERSION_MAPPING:
+            instances.setdefault(cls, []).append(name)
+            first.setdefault(cls, module)
     model_types = {
         module.config.model_type
         for module in model.modules()
@@ -2611,7 +2654,8 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
     for cls, names in sorted(instances.items(), key=lambda kv: min(map(len, kv[1]))):
         parts = os.path.commonprefix([name.split(".") for name in names])
         scope = ".".join(p for p in parts if not p.isdigit())
-        for transform in _CONVERSION_MAPPING[cls]:
+        entry = _CONVERSION_MAPPING[cls]  # a list, or a function of the module (config)
+        for transform in entry(first[cls]) if callable(entry) else entry:
             transform = deepcopy(transform)
             if scope:
                 transform.scope_prefix, transform.base_model_prefix = scope, ""
@@ -2628,7 +2672,8 @@ def rename_mapper(model) -> "WeightsMapper | None":
     if isinstance(model, nn.Module):
         transforms = get_conversion_mapping(model)
     else:
-        transforms = _CONVERSION_MAPPING.get(model.__name__, [])
+        entry = _CONVERSION_MAPPING.get(model.__name__, [])
+        transforms = [] if callable(entry) else entry
     renamings = [
         t
         for t in transforms

@@ -55,7 +55,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal
 from .interfaces_base import default_pooling_type
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 from .vision import (
     VisionEncoderInfo,
     VisionFeatureSelectStrategy,
@@ -609,14 +609,6 @@ class CLIPTextTransformer(nn.Module):
 
 
 class CLIPVisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -660,9 +652,6 @@ class CLIPVisionTransformer(nn.Module):
             self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         else:
             self.post_layernorm = None
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={"post_layernorm.": None}
-            )
 
     @property
     def dtype(self):
