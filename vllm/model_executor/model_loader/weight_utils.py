@@ -1085,6 +1085,23 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+class LazySlice:
+    """A checkpoint tensor read on demand: only the slice indexed, e.g. this rank's
+    shard (`ops_loader`). Like safetensors' own slice, it keeps its file open."""
+
+    def __init__(self, handle, name: str):
+        self.handle, self.name = handle, name
+
+    def get_shape(self) -> list[int]:
+        return self.handle.get_slice(self.name).get_shape()
+
+    def get_dtype(self) -> str:
+        return self.handle.get_slice(self.name).get_dtype()
+
+    def __getitem__(self, index) -> torch.Tensor:
+        return self.handle.get_slice(self.name)[index]
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1217,6 +1234,11 @@ def safetensors_weights_iterator(
                     unflatten_tensor_state_dict(state_dict, metadata)
                 )
             yield from unflattened_state_dict.items()
+        elif safetensors_load_strategy == "slices":
+            handle = safe_open(st_file, framework="pt")  # kept open by its slices
+            for name in handle.keys():  # noqa: SIM118
+                if not should_skip_weight(name, local_expert_ids):
+                    yield name, LazySlice(handle, name)
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
@@ -1617,7 +1639,8 @@ def make_attention_sink(
     sink = torch.nn.Parameter(
         torch.full((num_heads,), -float("inf"), dtype=dtype), requires_grad=False
     )
-    sink.weight_loader = load_attention_sink
+    # this rank's heads of the global sink, padded heads -inf (see `ops_loader`)
+    sink.shard_dim, sink.shard_even, sink.pad_value = 0, True, -float("inf")
     return sink
 
 

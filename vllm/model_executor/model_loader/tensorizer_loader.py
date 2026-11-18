@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: SIM117
-from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
+)
 import copy
 from collections.abc import Generator
 

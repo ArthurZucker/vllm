@@ -19,6 +19,7 @@
 import os
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import cached_property
 from itertools import chain
 from operator import attrgetter
@@ -36,6 +37,7 @@ from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
     get_model_conversion_mapping,
 )
+from transformers.core_model_loading import WeightConverter
 
 from vllm.compilation.decorators import DynamicArgDims, support_torch_compile
 from vllm.config.utils import getattr_iter
@@ -50,6 +52,8 @@ from vllm.model_executor.layers.attention import (
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import MoERunner
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
+from vllm.model_executor.model_loader.weight_ops import OutputConcatenate
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     SupportsEagle,
@@ -59,18 +63,13 @@ from vllm.model_executor.models.interfaces import (
     SupportsQuant,
 )
 from vllm.model_executor.models.interfaces_base import VllmModel
-from vllm.model_executor.models.transformers.conversion import (
-    convert_weights,
-    quantization_plan,
-    streamable_converters,
-)
+from vllm.model_executor.models.transformers.conversion import quantization_plan
 from vllm.model_executor.models.transformers.fuser import BaseFuser, Fusers
 from vllm.model_executor.models.transformers.fusers import AttentionFuser, MLAFuser
 from vllm.model_executor.models.transformers.fusers.attention import (
     VLLM_ATTN_IMPL,
     VLLM_MLA_ATTN_IMPL,
 )
-from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.models.transformers.utils import (
     attrsetter,
     can_enable_torch_compile,
@@ -95,7 +94,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.offloader import BaseOffloader, NoopOffloader, get_offloader
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.config import get_safetensors_params_metadata
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -917,22 +915,29 @@ class Base(
             getattr(self.config, "quantization_config", None),
             serialized=self.quant_config is not None,
         )
-        conversions = self._weight_conversions()
+        conversions = [*self._weight_conversions(), *self._fused_conversions()]
         if hf_quantizer is not None:
             conversions = hf_quantizer.update_weight_conversions(
                 conversions, self.model
             )
-        checkpoint_keys = get_safetensors_params_metadata(
-            self.model_config.model, revision=self.model_config.revision
-        )
-        weights = convert_weights(
-            weights,
-            streamable_converters(conversions),
-            self.config,
-            hf_quantizer,
-            checkpoint_keys,
-        )
-        return load_with_ops(self, weights)
+        # The checkpoint's prefixes onto `self`'s; fused layers are conversions above
+        mapper = replace(self.hf_to_vllm_mapper, orig_to_new_stacked={})
+        return load_with_ops(self, mapper.apply(weights), conversions, hf_quantizer)
+
+    def _fused_conversions(self) -> list[WeightConverter]:
+        """Each projection vLLM fused (q, k, v -> qkv_proj) as a Transformers converter"""
+        conversions = {}
+        for prefix, fusers in self.fusers.items():
+            module = prefix.rpartition(".")[2]
+            for fuser in fusers:
+                if not (shards := getattr(fuser, "shards", None)):
+                    continue
+                sources = [f"{module}.{name}" for name, _ in shards]
+                target = f"{module}.{fuser.merged_name}"
+                conversions[(tuple(sources), target)] = WeightConverter(
+                    sources, target, operations=[OutputConcatenate()]
+                )
+        return list(conversions.values())
 
     @staticmethod
     def check_version(min_version: str, feature: str):

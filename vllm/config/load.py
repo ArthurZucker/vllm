@@ -10,7 +10,9 @@ from vllm.logger import init_logger
 
 DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS = 8
 DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024
-SafetensorsLoadStrategy: TypeAlias = Literal["lazy", "eager", "prefetch", "torchao"]
+SafetensorsLoadStrategy: TypeAlias = Literal[
+    "lazy", "eager", "prefetch", "torchao", "slices"
+]
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader import LoadFormats

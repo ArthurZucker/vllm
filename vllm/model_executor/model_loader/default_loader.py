@@ -44,7 +44,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
-from vllm.model_executor.model_loader.ops_loader import load_weights as load_model_weights
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -374,7 +376,8 @@ class DefaultModelLoader(BaseModelLoader):
                     weights_iterator = safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
-                        self.load_config.safetensors_load_strategy,
+                        # slices: each rank reads its shard only (`ops_loader`)
+                        self.load_config.safetensors_load_strategy or "slices",
                         local_expert_ids=self.local_expert_ids,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
@@ -564,7 +567,9 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model, model_config)
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
-        loaded_weights = load_model_weights(model, self.get_all_weights(model_config, model))
+        loaded_weights = load_model_weights(
+            model, self.get_all_weights(model_config, model)
+        )
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
