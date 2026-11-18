@@ -25,7 +25,7 @@ from .qwen2_vl import (
     Qwen2VLMultiModalProcessor,
     Qwen2VLProcessingInfo,
 )
-from .utils import WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -107,18 +107,6 @@ class JinaVLForSequenceClassification(
     SupportsScoreTemplate,
 ):
     is_pooling_model = True
-    weight_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "score.0.": "score.dense.",
-            "score.2.": "score.out_proj.",
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "visual.": "visual.",
-            # mapping for original checkpoint
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(
@@ -164,4 +152,3 @@ class JinaVLForSequenceClassification(
             **kwargs,
         )
         return hidden_states
-

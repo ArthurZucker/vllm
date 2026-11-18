@@ -1121,6 +1121,26 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename(".up_proj.", ".w3."),
         rename(".down_proj.", ".w2."),
     ],
+    "ModernBertForSequenceClassification": [rename("^head.", "pooling.")],
+    "JinaVLForSequenceClassification": [
+        rename("^score.0.", "score.dense."),
+        rename("^score.2.", "score.out_proj."),
+        rename("^model.language_model.", "language_model.model."),
+        rename("^lm_head.", "language_model.lm_head."),
+        rename("^model.", "language_model.model."),
+    ],
+    "RadioMBartPrefixForCausalLM": [drop("^decoder.extra_(heads|proj).")],
+    # Jina's reranker checkpoints (flash-attn BERT names) onto RoBERTa's
+    "RobertaForSequenceClassification": [
+        rename("emb_ln", "embeddings.LayerNorm"),
+        rename("layers", "layer"),
+        rename("mixer.Wqkv", "attention.self.qkv_proj"),
+        rename("mixer.out_proj", "attention.output.dense"),
+        rename("norm1", "attention.output.LayerNorm"),
+        rename("mlp.fc1", "intermediate.dense"),
+        rename("mlp.fc2", "output.dense"),
+        rename("norm2", "output.LayerNorm"),
+    ],
     "ModernBertForTokenClassification": [
         drop("^drop"),
     ],

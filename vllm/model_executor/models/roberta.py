@@ -31,7 +31,6 @@ from vllm.model_executor.models.bert import (
     _encode_token_type_ids,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
@@ -228,19 +227,6 @@ class RobertaForSequenceClassification(nn.Module, SupportsCrossEncoding, Support
 
     is_pooling_model = True
     packed_modules_mapping = {"qkv_proj": ["query", "key", "value"]}
-    jina_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "emb_ln": "embeddings.LayerNorm",
-            "layers": "layer",
-            "mixer.Wqkv": "attention.self.qkv_proj",
-            "mixer.out_proj": "attention.output.dense",
-            "norm1": "attention.output.LayerNorm",
-            "mlp.fc1": "intermediate.dense",
-            "mlp.fc2": "output.dense",
-            "norm2": "output.LayerNorm",
-        }
-    )
-
     embedding_class: type[nn.Module] = RobertaEmbedding
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
