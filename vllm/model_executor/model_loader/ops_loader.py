@@ -50,17 +50,10 @@ from vllm.model_executor.model_loader.conversion_mapping import (
     from_mapper,
     get_conversion_mapping,
 )
-from vllm.model_executor.model_loader.weight_ops import (
-    Deinterleave,
-    PadToParam,
-    SwapHalves,
-)
+from vllm.model_executor.model_loader.weight_ops import PadToParam
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import storage_view
 from vllm.platforms import current_platform
-
-# ops reordering a whole tensor: the loader shards their output, not their input
-NEEDS_FULL = (Transpose, SwapHalves, Deinterleave)
 
 logger = init_logger(__name__)
 
@@ -417,13 +410,11 @@ def load_with_ops(
     weights: Iterable[tuple[str, torch.Tensor]],
     conversions: list[WeightTransform] | None = None,
     hf_quantizer=None,
-    load_into: LoadInto | None = None,
 ) -> set[str]:
     """Load `weights` (tensors, or lazy safetensors slices: then each rank reads its
     bytes only) into `model` with `conversions` (default: the model's entries in
-    `conversion_mapping`). Each final value is written by `load_into(name, param,
-    value)` (default: `current_load_into()`). Returns the params
-    loaded."""
+    `conversion_mapping`). Each final value is written by `current_load_into()`.
+    Returns the params loaded."""
     # functions of the whole stream, run first: a model's (Jina v5's task LoRA merged,
     # MiniMax M3's ROCm redirect), then the quant config's (pair scales, repack)
     stream = list(getattr(model, "checkpoint_transforms", []))
@@ -443,7 +434,7 @@ def load_with_ops(
     conversions = [*deepcopy(conversions), *_padded_converters(model)]
     # the live params: `state_dict()` (what Transformers passes) drops their attributes
     params = dict(model.named_parameters()) | dict(model.named_buffers())
-    write = load_into or current_load_into()
+    write = current_load_into()
     names = {id(p): (n, p) for n, p in params.items()}
 
     def write_in_place(param: torch.Tensor, value: torch.Tensor) -> None:
@@ -458,8 +449,9 @@ def load_with_ops(
         param = params.get(target)
         param = model.get_parameter(target) if param is None else param  # tied
         if isinstance(converter, WeightConverter):
+            # an op reordering the whole tensor: its output is sharded, not its input
             full = any(
-                isinstance(op, NEEDS_FULL) or getattr(op, "needs_full", False)
+                isinstance(op, Transpose) or getattr(op, "needs_full", False)
                 for op in converter.operations
             )
             if len(converter.target_patterns) > 1 or full:  # each output sharded after

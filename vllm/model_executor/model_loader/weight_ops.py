@@ -121,6 +121,8 @@ class SwapHalves(ConversionOps):
     """The two halves of `dim` swapped: a fused projection stored `[up, gate]` where
     the param is `[gate, up]` (GTE's `up_gate_proj`)"""
 
+    needs_full = True  # the halves are the whole tensor's
+
     def __init__(self, dim: int = 0):
         self.dim = dim
 
@@ -134,6 +136,8 @@ class SwapHalves(ConversionOps):
 class Deinterleave(ConversionOps):
     """A fused projection stored per head (`[heads, parts, head_dim]`, Bloom's
     `query_key_value`) as its parts one after the other (`[parts, heads, head_dim]`)"""
+
+    needs_full = True  # the heads are the whole tensor's
 
     def __init__(self, parts: int, heads_attr: str = "num_attention_heads"):
         self.parts, self.heads_attr = parts, heads_attr
