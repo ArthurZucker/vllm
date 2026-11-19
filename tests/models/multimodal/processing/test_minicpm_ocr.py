@@ -652,20 +652,14 @@ def test_vision_last_layer_is_kept():
     assert model._drop_vision_last_layer() is False
 
 
-def test_weight_mapper_and_loader_are_inherited_from_4_6():
-    """The converter emits 4.6-shaped keys, so the mapper must be reused."""
+def test_weight_mapping_is_inherited_from_4_6():
+    """The converter emits 4.6-shaped keys, so the 4.6 mapping must be reused."""
+    from vllm.model_executor.model_loader.conversion_mapping import _entry_name
     from vllm.model_executor.models.minicpm_ocr import (
         MiniCPMOcrForConditionalGeneration,
     )
-    from vllm.model_executor.models.minicpmv4_6 import (
-        MiniCPMV4_6ForConditionalGeneration,
-    )
 
     assert (
-        MiniCPMOcrForConditionalGeneration.hf_to_vllm_mapper
-        is MiniCPMV4_6ForConditionalGeneration.hf_to_vllm_mapper
-    )
-    assert (
-        MiniCPMOcrForConditionalGeneration.load_weights
-        is MiniCPMV4_6ForConditionalGeneration.load_weights
+        _entry_name(MiniCPMOcrForConditionalGeneration)
+        == "MiniCPMV4_6ForConditionalGeneration"
     )

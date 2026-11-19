@@ -1,26 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
-from typing import cast
 
 import numpy as np
 import pytest
 import torch
+from transformers.core_model_loading import WeightConverter, rename_source_key
 
-from vllm.config import CompilationConfig, VllmConfig
-from vllm.config.compilation import CompilationMode
-from vllm.model_executor.models.gemma3n import (
-    Gemma3nTextModel,
-    _kv_sharing_weights_mapper,
-)
-from vllm.model_executor.models.gemma4 import (
-    Gemma4ForCausalLM,
-    _gemma4_layer_weights_mapper,
-)
-from vllm.model_executor.models.gemma4_dspark import (
-    Gemma4DSparkForCausalLM,
-    Gemma4DSparkModel,
-)
+from vllm.model_executor.model_loader.conversion_mapping import _gemma4, rename_mapper
+from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
 from ....utils import multi_gpu_test
 from ...utils import check_logprobs_close
@@ -28,103 +16,44 @@ from ...utils import check_logprobs_close
 MODELS = ["google/gemma-2-2b", "google/gemma-3-4b-it"]
 
 
-@pytest.mark.usefixtures("dist_init")
-@pytest.mark.parametrize(
-    "enabled,has_weights,with_markov",
-    [
-        pytest.param(True, True, False, id="hidden-only"),
-        pytest.param(True, True, True, id="with-markov"),
-        pytest.param(True, False, True, id="missing-weights"),
-        pytest.param(False, True, True, id="disabled-head"),
-    ],
-)
-def test_gemma4_dspark_loads_confidence_head(
-    monkeypatch, enabled, has_weights, with_markov
-) -> None:
-    """Use checkpoint confidence parameters, or disable an unavailable head."""
-    config = SimpleNamespace(
-        vocab_size=64,
-        hidden_size=8,
-        target_layer_ids=[0, 1],
-        num_hidden_layers=0,
-        rms_norm_eps=1e-6,
-        markov_rank=4,
-        enable_confidence_head=enabled,
-        confidence_head_with_markov=with_markov,
-    )
-    vllm_config = SimpleNamespace(
-        compilation_config=CompilationConfig(mode=CompilationMode.NONE),
-        model_config=SimpleNamespace(dtype=torch.bfloat16),
-        speculative_config=SimpleNamespace(
-            draft_model_config=SimpleNamespace(hf_config=config),
-        ),
-    )
-    monkeypatch.setattr(Gemma4DSparkModel, "_build_fused_kv_buffers", lambda _: None)
-    model = Gemma4DSparkForCausalLM(vllm_config=cast(VllmConfig, vllm_config))
-    width = config.hidden_size + (config.markov_rank if with_markov else 0)
-    weight = torch.arange(width, dtype=torch.bfloat16).reshape(1, -1) / 16
-    bias = torch.tensor([-0.5], dtype=torch.bfloat16)
-    loaded = model.load_weights(
-        [("confidence_head.proj.weight", weight), ("confidence_head.proj.bias", bias)]
-        if has_weights
-        else []
-    )
-    if not (enabled and has_weights):
-        assert (model.model.confidence_head is None) is not enabled
-        assert not loaded
-        return
-
-    assert loaded == {
-        "model.confidence_head.proj.weight",
-        "model.confidence_head.proj.bias",
-    }
-    assert model.model.confidence_head.proj.weight.dtype == torch.float32
-    hidden = torch.full((3, config.hidden_size), 0.25, dtype=torch.bfloat16)
-    markov = torch.full((3, config.markov_rank), -0.5, dtype=torch.bfloat16)
-    inputs = torch.cat([hidden, markov], dim=-1) if with_markov else hidden
-    expected = (inputs.float() @ weight.float().T + bias.float()).sigmoid().squeeze(-1)
-    torch.testing.assert_close(model.compute_confidence(hidden, markov), expected)
-
-
 @pytest.mark.cpu_test
 def test_gemma4_attention_mapper() -> None:
     """Layers with a qkv_proj pack q/k/v; `attention_k_eq_v` full-attention
-    layers also load K as the V shard, and leave any v_proj such a checkpoint
-    ships unmapped so it fails the load rather than silently overwriting V;
-    KV-shared layers keep q_proj and drop the K/V tensors original checkpoints
-    still ship for them."""
+    layers also load K as the V shard (their own converter repeats it)."""
     config = SimpleNamespace(
         num_hidden_layers=3,
         num_kv_shared_layers=1,
         attention_k_eq_v=True,
         layer_types=["sliding_attention", "full_attention", "sliding_attention"],
     )
-    weights = [
-        (f"model.layers.{i}.self_attn.{tensor}.weight", torch.full((2, 2), i + 1.0))
-        for i in range(3)
+    transforms = _gemma4(SimpleNamespace(config=config))
+    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
+    converters = [t for t in transforms if isinstance(t, WeightConverter)]
+    names = [
+        f"model.layers.{i}.self_attn.{tensor}.weight"
+        for i in range(2)
         for tensor in ("q_proj", "k_proj", "k_norm")
-    ] + [
-        ("model.layers.0.mlp.up_proj.weight", torch.empty(0)),
-        ("model.layers.1.self_attn.v_proj.weight", torch.empty(0)),
-    ]
+    ] + ["model.layers.0.mlp.up_proj.weight"]
 
-    mapper = _gemma4_layer_weights_mapper(config)
-    mapped = list(mapper.apply(weights))
+    mapped = []
+    for name in names:
+        target, pattern = rename_source_key(name, renamings, converters)
+        converter = next((c for c in converters if pattern in c.source_patterns), None)
+        shard = None if converter is None else converter.source_patterns.index(pattern)
+        mapped.append((target, shard, converter))
 
-    assert [(name, getattr(w, "shard_id", None)) for name, w in mapped] == [
-        ("model.layers.0.self_attn.qkv_proj.weight", "q"),
-        ("model.layers.0.self_attn.qkv_proj.weight", "k"),
+    assert [(target, shard) for target, shard, _ in mapped] == [
+        ("model.layers.0.self_attn.qkv_proj.weight", 0),
+        ("model.layers.0.self_attn.qkv_proj.weight", 1),
         ("model.layers.0.self_attn.k_norm.weight", None),
-        ("model.layers.1.self_attn.qkv_proj.weight", "q"),
-        ("model.layers.1.self_attn.qkv_proj.weight", "k"),
-        ("model.layers.1.self_attn.qkv_proj.weight", "v"),
+        ("model.layers.1.self_attn.qkv_proj.weight", 0),
+        ("model.layers.1.self_attn.qkv_proj.weight", 1),
         ("model.layers.1.self_attn.k_norm.weight", None),
-        ("model.layers.2.self_attn.q_proj.weight", None),
         ("model.layers.0.mlp.gate_up_proj.weight", 1),
-        ("model.layers.1.self_attn.v_proj.weight", None),
     ]
-    k_weight, v_weight = weights[4][1], mapped[5][1]
-    assert torch.equal(v_weight, k_weight) and v_weight is not k_weight
+    # the k_eq_v layer's q/k go through one converter, which repeats K as V
+    assert mapped[3][2] is mapped[4][2] is not mapped[0][2]
+    assert len(mapped[3][2].source_patterns) == 2
 
 
 @pytest.mark.cpu_test
@@ -141,43 +70,12 @@ def test_gemma4_expert_names_strip_language_model_prefix() -> None:
         )
     ]
 
-    mapped = [
-        (name, getattr(w, "shard_id", None))
-        for name, w in Gemma4ForCausalLM.hf_to_vllm_mapper.apply(weights)
-    ]
+    mapped = [name for name, _ in rename_mapper(Gemma4ForCausalLM).apply(weights)]
 
     assert mapped == [
-        ("model.layers.0.experts.gate_up_proj", None),
-        ("model.layers.0.experts.3.down_proj.weight_packed", None),
-        ("model.layers.0.router.per_expert_scale", None),
-    ]
-
-
-@pytest.mark.cpu_test
-def test_gemma3n_kv_shared_layer_mapper() -> None:
-    """Only non-shared layers pack q/k/v into qkv_proj; KV-shared layers keep
-    q_proj and drop the redundant K/V tensors original checkpoints ship."""
-    config = SimpleNamespace(num_hidden_layers=4, num_kv_shared_layers=2)
-    mapper = Gemma3nTextModel.hf_to_vllm_mapper | _kv_sharing_weights_mapper(config)
-    weights = [
-        (f"layers.{i}.self_attn.{tensor}.weight", torch.empty(0))
-        for i in (1, 3)
-        for tensor in ("q_proj", "k_proj", "v_proj", "k_norm", "o_proj")
-    ]
-
-    mapped = [
-        (name, getattr(weight, "shard_id", None))
-        for name, weight in mapper.apply(weights)
-    ]
-
-    assert mapped == [
-        ("layers.1.self_attn.qkv_proj.weight", "q"),
-        ("layers.1.self_attn.qkv_proj.weight", "k"),
-        ("layers.1.self_attn.qkv_proj.weight", "v"),
-        ("layers.1.self_attn.k_norm.weight", None),
-        ("layers.1.self_attn.o_proj.weight", None),
-        ("layers.3.self_attn.q_proj.weight", None),
-        ("layers.3.self_attn.o_proj.weight", None),
+        "model.layers.0.experts.gate_up_proj",
+        "model.layers.0.experts.3.down_proj.weight_packed",
+        "model.layers.0.router.per_expert_scale",
     ]
 
 

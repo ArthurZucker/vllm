@@ -13,6 +13,8 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.model_loader.conversion_mapping import fused
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -30,8 +32,15 @@ def _checkpoint_weights(seed: int) -> list[torch.Tensor]:
 
 
 def _load(conv1d: nn.Module, weights: list[torch.Tensor]) -> None:
-    for shard_id, weight in enumerate(weights):
-        conv1d.weight.weight_loader(conv1d.weight, weight, shard_id)
+    """The checkpoint's `q/k/v_conv1d` through Glm5NextModel's conversion"""
+    model = nn.Module()
+    model.layer = nn.Module()
+    model.layer.conv1d = conv1d
+    conversions = [fused(".conv1d", ".q_conv1d", ".k_conv1d", ".v_conv1d")]
+    checkpoint = [
+        (f"layer.{name}_conv1d.weight", weight) for name, weight in zip("qkv", weights)
+    ]
+    load_with_ops(model, iter(checkpoint), conversions)
 
 
 def _kernel_view(conv1d: nn.Module) -> torch.Tensor:

@@ -1163,7 +1163,9 @@ def test_merged_column_fuser_supports_any_number_of_linears(
     from vllm.model_executor.layers import linear
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.layers.utils import default_unquantized_gemm
-    from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+    from vllm.model_executor.model_loader.conversion_mapping import from_mapper
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
+    from vllm.model_executor.models.utils import WeightsMapper
 
     monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -1192,8 +1194,10 @@ def test_merged_column_fuser_supports_any_number_of_linears(
     root = nn.Module()
     root.parallel = fused
     mapper = WeightsMapper(orig_to_new_stacked=fuser.orig_to_new_stacked("parallel"))
-    AutoWeightsLoader(root).load_weights(
-        ((f"parallel.{name}", weight) for name, weight in weights), mapper=mapper
+    load_with_ops(
+        root,
+        ((f"parallel.{name}", weight) for name, weight in weights),
+        from_mapper(mapper),
     )
 
     merged = getattr(fused, fuser.merged_name)

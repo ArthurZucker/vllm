@@ -5,15 +5,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.core_model_loading import WeightConverter, rename_source_key
 
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.model_executor.model_loader.conversion_mapping import (
+    _CONVERSION_MAPPING,
+    QKV,
+)
 from vllm.model_executor.models import alice_ai as alice_ai_module
 from vllm.model_executor.models.alice_ai import (
     AliceAIDecoderBlock,
     AliceAIForCausalLM,
     AliceAIModel,
     _AttentionResidualFinal,
-    _load_split_kda_conv_weights,
 )
 from vllm.model_executor.offloader import PrefetchOffloader, UVAOffloader
 
@@ -49,49 +53,23 @@ def test_unsupported_offloading_is_rejected(monkeypatch, backend, error):
         ("linear_attn.v_proj.weight", "linear_attn.in_proj_qkvgfab.weight", 2),
         ("linear_attn.b_proj.weight", "linear_attn.in_proj_qkvgfab.weight", 3),
         ("linear_attn.f_a_proj.weight", "linear_attn.in_proj_qkvgfab.weight", 4),
-        ("self_attn.q_proj.weight", "self_attn.qkv_proj.weight", "q"),
+        ("self_attn.q_proj.weight", "self_attn.qkv_proj.weight", 0),
         ("linear_attn.a_log_bias", "linear_attn.A_log", None),
     ],
 )
 def test_weight_mapping_preserves_shard_ids(source, target, shard_id):
-    tensor = torch.empty(1)
-    [(mapped, mapped_tensor)] = list(
-        AliceAIModel.hf_to_vllm_mapper.apply([(f"model.layers.0.{source}", tensor)])
+    transforms = [*_CONVERSION_MAPPING["AliceAIModel"], QKV]
+    converters = [t for t in transforms if isinstance(t, WeightConverter)]
+    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
+    mapped, pattern = rename_source_key(
+        f"model.layers.0.{source}", renamings, converters
     )
     assert mapped == f"model.layers.0.{target}"
-    assert getattr(mapped_tensor, "shard_id", None) == shard_id
-
-
-def test_split_kda_conv_weights_use_fused_loader_shard_ids() -> None:
-    calls: list[tuple[torch.Tensor, int]] = []
-    param = torch.nn.Parameter(torch.empty(3, 1, 1))
-
-    def weight_loader(
-        target: torch.Tensor,
-        weight: torch.Tensor,
-        shard_id: int,
-    ) -> None:
-        assert target is param
-        calls.append((weight, shard_id))
-
-    param.weight_loader = weight_loader
-    target_name = "model.layers.0.linear_attn.conv1d.weight"
-    weights = [
-        ("model.layers.0.linear_attn.q_conv1d.weight", torch.full((1, 1), 1.0)),
-        ("model.layers.0.linear_attn.k_conv1d.weight", torch.full((1, 1), 2.0)),
-        ("model.layers.0.linear_attn.v_conv1d.weight", torch.full((1, 1), 3.0)),
-        ("model.embed_tokens.weight", torch.full((1, 1), 4.0)),
-    ]
-    loaded: set[str] = set()
-
-    remaining = list(
-        _load_split_kda_conv_weights(weights, {target_name: param}, loaded)
-    )
-
-    assert loaded == {target_name}
-    assert [shard_id for _, shard_id in calls] == [0, 1, 2]
-    assert [weight.item() for weight, _ in calls] == [1.0, 2.0, 3.0]
-    assert remaining == [weights[-1]]
+    shard = None
+    if pattern is not None:
+        [converter] = [c for c in converters if pattern in c.source_patterns]
+        shard = converter.source_patterns.index(pattern)
+    assert shard == shard_id
 
 
 def test_kda_cache_contract_is_fp32_recurrent() -> None:

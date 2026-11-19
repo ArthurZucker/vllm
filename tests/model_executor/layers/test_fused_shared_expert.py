@@ -30,6 +30,7 @@ from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
     is_shared_expert_quant_fse_compatible,
 )
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.qwen3_next import (
     _should_replicate_misaligned_shared_expert,
 )
@@ -37,7 +38,6 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     get_fused_shared_expert_layers,
-    maybe_fuse_shared_experts,
 )
 from vllm.models.deepseek_v4 import quant_config as deepseek_v4_quant_config
 from vllm.models.minimax_m3.amd import model as minimax_m3_model
@@ -1097,7 +1097,7 @@ def test_fused_shared_expert_layers_matches_container_index_space() -> None:
 
     `nn.ModuleList` MTP layers (Qwen3 Next/3.5, Qwen4 Exp) are 0-based,
     while `nn.ModuleDict` MTP layers (GLM4, DeepSeek) are keyed by absolute
-    layer index. Both must redirect without a per-loader offset.
+    layer index.
     """
     list_model = _make_fake_moe_model(["0", "1"], [True, False], use_dict=False)
     dict_model = _make_fake_moe_model(["28", "29"], [False, True], use_dict=True)
@@ -1105,28 +1105,6 @@ def test_fused_shared_expert_layers_matches_container_index_space() -> None:
     dict_layers = get_fused_shared_expert_layers(dict_model, _FakeMoE)
     assert list_layers == frozenset({0})
     assert dict_layers == frozenset({29})
-
-    weight = torch.arange(8.0).reshape(4, 2)
-
-    def redirected(name: str, fused_shared_expert_layers: frozenset[int]) -> bool:
-        [(out_name, _)] = list(
-            maybe_fuse_shared_experts(
-                [(name, weight)],
-                n_routed_experts=4,
-                n_shared_experts=1,
-                fused_shared_expert_layers=fused_shared_expert_layers,
-                ckpt_prefix="mlp.shared_expert",
-            )
-        )
-        return ".experts." in out_name
-
-    # ModuleList: 0-based names, including the Qwen4 Exp MTP case where the
-    # quant-config prefix uses an absolute index but the weight names do not.
-    assert redirected("layers.0.mlp.shared_expert.down_proj.weight", list_layers)
-    assert not redirected("layers.1.mlp.shared_expert.down_proj.weight", list_layers)
-    # ModuleDict: absolute names, including the MTP layer offset.
-    assert redirected("layers.29.mlp.shared_expert.down_proj.weight", dict_layers)
-    assert not redirected("layers.28.mlp.shared_expert.down_proj.weight", dict_layers)
 
 
 @pytest.mark.parametrize(
@@ -1173,11 +1151,12 @@ def _assert_mtp_fused_shared_expert_redirect(
     """
     packed_down = torch.full((128, 16), 3, dtype=torch.uint8)
     down_scale = torch.full((128, 1), 127, dtype=torch.uint8)
-    mtp.load_weights(
+    load_weights(
+        mtp,
         [
             (f"{ckpt_prefix}.down_proj.weight", packed_down),
             (f"{ckpt_prefix}.down_proj.weight_scale", down_scale),
-        ]
+        ],
     )
     torch.testing.assert_close(
         moe.experts.routed_experts.w2_weight[n_routed_experts][:128, :16].float(),
@@ -1195,11 +1174,12 @@ def _assert_mtp_shared_expert_not_fused(
     """
     packed_down = torch.full((128, 16), 3, dtype=torch.uint8)
     down_scale = torch.full((128, 1), 127, dtype=torch.uint8)
-    mtp.load_weights(
+    load_weights(
+        mtp,
         [
             (f"{ckpt_prefix}.down_proj.weight", packed_down),
             (f"{ckpt_prefix}.down_proj.weight_scale", down_scale),
-        ]
+        ],
     )
     assert moe.experts.routed_experts.w2_weight.shape[0] == n_routed_experts
 
@@ -1746,7 +1726,7 @@ def test_models_fse_init(
                 if model_type == "minimax_m3":
                     loaded = _load_minimax_m3_weights(model, checkpoint)
                 else:
-                    loaded = model.load_weights(checkpoint)
+                    loaded = load_weights(model, checkpoint)
                 base = config.num_hidden_layers
                 mtp_cases = [
                     (

@@ -15,6 +15,7 @@ from transformers import PreTrainedConfig
 from vllm.config.load import LoadConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.nemotron_parse3_5 import MBartDecoderNoPos
 from vllm.model_executor.models.nemotron_parse3_5_mtp import (
     ParseAuxMTPModel,
@@ -55,8 +56,8 @@ def test_parse_mtp_loads_auxiliary_weights_from_model_file(tmp_path: Path) -> No
 
     with safe_open(model_file, framework="pt", device="cpu") as source:
         tensor_names = source.keys()
-        loaded = draft.load_weights(
-            (name, source.get_tensor(name)) for name in tensor_names
+        loaded = load_weights(
+            draft, ((name, source.get_tensor(name)) for name in tensor_names)
         )
 
     assert loaded == {
@@ -97,7 +98,7 @@ def test_parse_mtp_default_loader_detects_missing_weights(
         "decoder.extra_proj.0.bias": torch.zeros(3),
     }
     del weights[missing_source]
-    loaded = draft.load_weights(weights.items())
+    loaded = load_weights(draft, iter(weights.items()))
 
     loader = DefaultModelLoader(LoadConfig())
     with pytest.raises(ValueError, match="not initialized from checkpoint") as exc:

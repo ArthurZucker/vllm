@@ -8,6 +8,7 @@ import pytest
 import torch
 from transformers import Qwen3Config
 
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.interfaces import SupportsLoRA, supports_lora
 from vllm.model_executor.models.moss_audio import (
     MOSS_AUDIO_BOS_TOKEN,
@@ -28,7 +29,6 @@ from vllm.model_executor.models.moss_audio import (
     MossQwen3ForCausalLM,
     MossQwen3Model,
 )
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.multimodal.cache import MultiModalProcessorOnlyCache
 from vllm.multimodal.inputs import batched_tensors_equal
 from vllm.sequence import IntermediateTensors
@@ -682,7 +682,7 @@ def test_moss_audio_encoder_loads_realistic_attention_weight_names(monkeypatch):
         for i, name in enumerate(weight_names)
     }
 
-    loaded = AutoWeightsLoader(encoder).load_weights(weights.items())
+    loaded = load_weights(encoder, iter(weights.items()))
 
     assert "load_weights" not in MossAudioEncoder.__dict__
     assert loaded == set(weight_names)

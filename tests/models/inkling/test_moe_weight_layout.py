@@ -8,6 +8,7 @@ import torch
 
 from vllm.lora.utils import get_supported_lora_modules
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
 from vllm.models.inkling.amd import moe as amd_moe
 from vllm.models.inkling.nvidia import moe
 from vllm.models.inkling.nvidia.model import _TmlForCausalLMBase
@@ -104,9 +105,7 @@ def test_inkling_mapper_maps_modelopt_exclusions() -> None:
         }
     )
 
-    quant_config.apply_vllm_mapper(
-        _TmlForCausalLMBase.hf_to_vllm_mapper.get_rename_mapper()
-    )
+    quant_config.apply_vllm_mapper(rename_mapper(_TmlForCausalLMBase))
 
     assert quant_config.is_layer_excluded("model.layers.2.mlp.experts")
     assert quant_config.is_layer_excluded("model.layers.2.mlp.shared_experts")
@@ -132,9 +131,11 @@ def test_inkling_mapper_maps_compressed_tensors_expert_params(
     )
     source = f"model.llm.layers.2.mlp.experts.{projection_param}"
 
-    mapped = _TmlForCausalLMBase.hf_to_vllm_mapper.apply_list([source])
+    [mapped] = rename_mapper(_TmlForCausalLMBase).apply_list([source])
 
-    assert mapped == [f"model.layers.2.mlp.experts.{projection}_{suffix}"]
+    # Inkling's expert loader drops the `routed_experts.` the nested form maps to
+    mapped = mapped.replace("routed_experts.", "")
+    assert mapped == f"model.layers.2.mlp.experts.{projection}_{suffix}"
 
 
 @pytest.mark.parametrize(("projection", "amax"), [("w13", 4.375), ("w2", 2960.0)])

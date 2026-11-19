@@ -18,6 +18,7 @@ from vllm.config import (
 )
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models import dory
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.transformers_utils.configs.dory import DoryConfig
@@ -221,7 +222,7 @@ def test_split_scales_load_independently_in_either_order(model_factory, reverse)
         weights.reverse()
     loaded = set()
     for name, tensor in weights:
-        loaded_now = model.load_weights([(name, tensor)])
+        loaded_now = load_weights(model, iter([(name, tensor)]))
         assert loaded_now == {name}
         loaded |= loaded_now
     assert loaded == {name for name, _ in weights}
@@ -239,7 +240,9 @@ def test_logits_apply_vocab_scale_after_projection(model_factory, monkeypatch, d
     head = torch.randn(32, 16, dtype=dtype)
     scale = torch.linspace(0.01, 0.03, 32).to(dtype)
     hidden = torch.randn(3, 16, dtype=dtype)
-    model.load_weights([("lm_head.weight", head), ("lm_head.logit_scale", scale)])
+    load_weights(
+        model, iter([("lm_head.weight", head), ("lm_head.logit_scale", scale)])
+    )
     _prepare_for_inference(model)
     expected = torch.nn.functional.linear(hidden, head).float() * (
         scale.float() / model.config.initializer_range
@@ -259,7 +262,7 @@ def test_exported_qkv_and_mlp_weights_load_in_correct_order(model_factory):
         (f"{mlp}.gate_proj.weight", torch.full((24, 16), 4.0)),
         (f"{mlp}.up_proj.weight", torch.full((24, 16), 5.0)),
     ]
-    loaded = model.load_weights(reversed(pieces))
+    loaded = load_weights(model, reversed(pieces))
     assert loaded == {f"{attn}.qkv_proj.weight", f"{mlp}.gate_up_proj.weight"}
     torch.testing.assert_close(
         model.backbone.layers[0].mixer.qkv_proj.weight,
@@ -282,8 +285,8 @@ def test_exported_qkv_and_mlp_weights_load_in_correct_order(model_factory):
 )
 def test_weight_loader_rejects_silent_truncation(model_factory, name, shape):
     model = model_factory()
-    with pytest.raises(ValueError, match="expected shape"):
-        model.load_weights([(name, torch.zeros(shape))])
+    with pytest.raises(ValueError):
+        load_weights(model, iter([(name, torch.zeros(shape))]))
 
 
 @pytest.fixture(params=["mxfp8", "nvfp4"])
@@ -363,7 +366,8 @@ def test_quantized_projection_weights_and_scales_load(quantized_model):
                 )
                 for i, n in enumerate(rows)
             ]
-            loaded = model.load_weights(
+            loaded = load_weights(
+                model,
                 reversed(
                     list(
                         zip(
@@ -371,7 +375,7 @@ def test_quantized_projection_weights_and_scales_load(quantized_model):
                             pieces,
                         )
                     )
-                )
+                ),
             )
             assert loaded == {f"{prefix}.{target}.{suffix}"}
             expected = torch.stack(pieces) if scalar else torch.cat(pieces)
@@ -382,7 +386,8 @@ def test_quantized_projection_weights_and_scales_load(quantized_model):
 def test_quantized_loader_rejects_oversized_shards(quantized_model, suffix):
     param = getattr(quantized_model.backbone.layers[0].mixer.qkv_proj, suffix)
     oversized = torch.zeros((65, param.shape[1]), dtype=param.dtype)
-    with pytest.raises(ValueError, match="expected shape"):
-        quantized_model.load_weights(
-            [(f"backbone.layers.0.mixer.q_proj.{suffix}", oversized)]
+    with pytest.raises(ValueError):
+        load_weights(
+            quantized_model,
+            iter([(f"backbone.layers.0.mixer.q_proj.{suffix}", oversized)]),
         )

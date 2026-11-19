@@ -18,6 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 
 
 class _FakeLmHead:
@@ -176,7 +177,9 @@ def test_replicated_lm_head_skips_tp_communication_and_preserves_processing(
             params_dtype=torch.bfloat16,
             disable_tp=True,
         )
-    lm_head.weight_loader(lm_head.weight, weight)
+    model = torch.nn.Module()
+    model.lm_head = lm_head
+    load_with_ops(model, iter([("lm_head.weight", weight)]), [])
     assert lm_head.tp_size == 1
 
     with mock.patch.object(lp, "_gather_logits") as gather_mock:

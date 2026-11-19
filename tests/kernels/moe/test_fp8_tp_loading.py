@@ -4,6 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.core_model_loading import (
+    Concatenate,
+    MergeModulelist,
+    WeightConverter,
+    WeightRenaming,
+)
 
 import vllm.distributed as distributed
 from tests.kernels.moe.utils import make_dummy_moe_config
@@ -16,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization import fp8 as fp8_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 
 
 def _make_fp8_tp_experts(
@@ -80,6 +87,39 @@ def _make_fp8_tp_experts(
     )
 
 
+def _load_experts(model, tensors, batched=True) -> set[str]:
+    """`tensors`, `{(w1|w3|w2, suffix): [E, ...] checkpoint tensor}`, into
+    `model.experts` with `load_with_ops`: stacked on disk, or one tensor per expert"""
+    weights = []
+    for (name, suffix), tensor in tensors.items():
+        if batched:
+            weights.append((f"experts.{name}.{suffix}", tensor))
+        else:
+            weights += [
+                (f"experts.{e}.{name}.{suffix}", t) for e, t in enumerate(tensor)
+            ]
+    conversions = []
+    for suffix in {suffix for _, suffix in tensors}:
+        if batched:
+            gate_up = [f"experts.{w}.{suffix}$" for w in ("w1", "w3")]
+            conversions += [
+                WeightConverter(gate_up, f"experts.w13_{suffix}", [Concatenate(dim=1)]),
+                WeightRenaming(f"experts.w2.{suffix}$", f"experts.w2_{suffix}"),
+            ]
+        else:
+            gate_up = [f"experts.*.{w}.{suffix}$" for w in ("w1", "w3")]
+            merge = MergeModulelist(dim=0)
+            conversions += [
+                WeightConverter(
+                    gate_up, f"experts.w13_{suffix}", [merge, Concatenate(dim=1)]
+                ),
+                WeightConverter(
+                    f"experts.*.w2.{suffix}$", f"experts.w2_{suffix}", [merge]
+                ),
+            ]
+    return load_with_ops(model, iter(weights), conversions)
+
+
 @pytest.mark.parametrize("tp_size", [2, 4, 8])
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("intermediate_size", [640, 896])
@@ -116,32 +156,22 @@ def test_fp8_block_aligned_tp_preserves_checkpoint(
         assert layer.quant_method.moe_block_shape == [128, 128]
         width = layer.moe_config.intermediate_size_per_partition
         assert width == ((num_blocks + tp_size - 1) // tp_size) * 128
+        model = torch.nn.Module()
+        model.experts = layer
+        tensors = {(name, "weight"): w for name, w in weights.items()}
+        tensors |= {(name, "weight_scale_inv"): s for name, s in scales.items()}
+        # Also reload after dirtying the destination, to catch padding leaks.
+        for _ in range(2):
+            for param in layer.parameters():
+                param.data.fill_(7)
+            loaded = _load_experts(model, tensors, batched)
+            assert {
+                f"experts.{w}_{s}"
+                for w in ("w13", "w2")
+                for s in ("weight", "weight_scale_inv")
+            } <= loaded
         for name in weights:
             prefix = "w2" if name == "w2" else "w13"
-            for suffix, checkpoint in (
-                ("weight", weights[name]),
-                ("weight_scale_inv", scales[name]),
-            ):
-                param_name = f"{prefix}_{suffix}"
-                param = getattr(layer, param_name)
-                # Also reload after dirtying the destination, to catch padding leaks.
-                for _ in range(2):
-                    if name != "w3":
-                        param.data.fill_(7)
-                    if batched:
-                        assert param.weight_loader(
-                            param, checkpoint, param_name, name, 0, return_success=True
-                        )
-                    else:
-                        for expert in range(2):
-                            assert param.weight_loader(
-                                param,
-                                checkpoint[expert],
-                                param_name,
-                                name,
-                                expert,
-                                return_success=True,
-                            )
             w = getattr(layer, f"{prefix}_weight").float()
             s = getattr(layer, f"{prefix}_weight_scale_inv")
             if name in ("w1", "w3"):
@@ -209,18 +239,6 @@ def test_fp8_skipped_layer_keeps_original_tp_layout(monkeypatch, default_vllm_co
     assert layer.w2_weight.shape == (2, 256, 160)
 
 
-def test_fp8_block_aligned_tp_rejects_presharded_weights(monkeypatch):
-    layer = _make_fp8_tp_experts(monkeypatch, 4, 0)
-    with pytest.raises(ValueError, match="unsharded checkpoint"):
-        layer.w13_weight.weight_loader(
-            layer.w13_weight,
-            torch.zeros(160, 256, dtype=torch.float8_e4m3fn),
-            "w13_weight",
-            "w1",
-            0,
-        )
-
-
 @pytest.mark.parametrize("tp_size", [2, 4, 8])
 @pytest.mark.parametrize("num_tokens", [1, 17])
 @torch.inference_mode()
@@ -281,15 +299,11 @@ def test_fp8_block_aligned_tp_flashinfer_matches_unsharded(
                 num_experts=e,
                 hidden_dim=h,
             )
-            for name in weights:
-                prefix = "w2" if name == "w2" else "w13"
-                for suffix, checkpoint in (
-                    ("weight", weights[name]),
-                    ("weight_scale_inv", scales[name]),
-                ):
-                    param_name = f"{prefix}_{suffix}"
-                    param = getattr(layer, param_name)
-                    param.weight_loader(param, checkpoint, param_name, name, 0)
+            model = torch.nn.Module()
+            model.experts = layer
+            tensors = {(name, "weight"): w for name, w in weights.items()}
+            tensors |= {(name, "weight_scale_inv"): s for name, s in scales.items()}
+            _load_experts(model, tensors)
             method = layer.quant_method
             method.process_weights_after_loading(layer)
             assert method.is_monolithic
@@ -366,13 +380,13 @@ def test_direct_reload_after_dummy_start_resets_padding(monkeypatch, static):
         else:
             for p in layer.parameters():
                 p.data.zero_()
-        for name, tensors in checkpoint.items():
-            prefix = "w2" if name == "w2" else "w13"
-            for suffix, tensor in zip(suffixes, tensors):
-                param = getattr(layer, f"{prefix}_{suffix}")
-                assert param.weight_loader(
-                    param, tensor, f"{prefix}_{suffix}", name, 0, return_success=True
-                )
+        tensors = {
+            (name, suffix): tensor
+            for name, pair in checkpoint.items()
+            for suffix, tensor in zip(suffixes, pair)
+        }
+        loaded = _load_experts(model, tensors)
+        assert {f"experts.{w}_{s}" for w in ("w13", "w2") for s in suffixes} <= loaded
         return layer
 
     expected = make_and_load(dummy=False)

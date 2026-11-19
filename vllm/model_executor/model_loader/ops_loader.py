@@ -259,10 +259,15 @@ class ShardOutputs(ConversionOps):
 
 
 def _load_into(param: torch.Tensor, value: torch.Tensor) -> None:
-    """`value` into `param` through the param's loader when it takes `(param, value)`:
-    a layer sharding for itself (its param declares no sharding: `value` is whole),
-    online quantization, layerwise reload. Loaders of the per-shard protocol
-    (`shard_id`, `expert_id`) cannot be called: copied"""
+    """`value` (this rank's, converted) into `param`. A same-size value is viewed at
+    the param's shape (a scalar scale into `[1]`); a layer's output padding (rows
+    after `weight_loader_numel`) stays zero. Then the param's loader when it takes
+    `(param, value)` (a layer sharding for itself, online quantization, layerwise
+    reload), else a copy: a shape mismatch raises."""
+    if value.shape != param.shape and value.numel() == param.numel():
+        value = value.reshape(param.shape)
+    elif getattr(param, "weight_loader_numel", None) == value.numel():
+        param = param[: value.shape[0]]  # ponytail: padding is trailing rows only
     loader = getattr(param, "weight_loader", None)
     try:
         inspect.signature(loader).bind(param, value)

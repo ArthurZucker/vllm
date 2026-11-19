@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from torch import nn
 
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.quantization.modelopt import (
@@ -15,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.utils import weights_already_processed
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -40,6 +42,13 @@ def _mixed_precision_config() -> ModelOptMixedPrecisionConfig:
     return config
 
 
+def _load(layer: VocabParallelEmbedding, **tensors: torch.Tensor) -> None:
+    model = nn.Module()
+    model.embed_tokens = layer
+    weights = [(f"embed_tokens.{name}", value) for name, value in tensors.items()]
+    load_with_ops(model, iter(weights), [])
+
+
 def test_nvfp4_embedding_matches_reference_dequant(dist_init):
     torch.manual_seed(0)
     # The layer pads the vocabulary, so a size that is not a multiple of the
@@ -58,12 +67,7 @@ def test_nvfp4_embedding_matches_reference_dequant(dist_init):
     scale = torch.rand(vocab, hidden // 16).mul(4).to(torch.float8_e4m3fn)
     # ModelOpt checkpoints store the global scale as a 0-dim tensor.
     global_scale = torch.tensor(0.03)
-    for name, value in (
-        ("weight", weight),
-        ("weight_scale", scale),
-        ("weight_scale_2", global_scale),
-    ):
-        layer.weight_loader(getattr(layer, name), value)
+    _load(layer, weight=weight, weight_scale=scale, weight_scale_2=global_scale)
     # The loader post-processes under the model dtype; reloads do not.
     with set_default_torch_dtype(torch.bfloat16):
         layer.quant_method.process_weights_after_loading(layer)
@@ -123,12 +127,7 @@ def test_nvfp4_embedding_triton_matches_torch(dist_init, dtype, hidden):
     # Every finite non-negative e4m3 code, subnormals included.
     scale = torch.randint(0, 0x7F, (vocab, hidden // 16), dtype=torch.uint8)
     scale = scale.view(torch.float8_e4m3fn)
-    for name, value in (
-        ("weight", weight),
-        ("weight_scale", scale),
-        ("weight_scale_2", torch.tensor(0.03)),
-    ):
-        layer.weight_loader(getattr(layer, name), value)
+    _load(layer, weight=weight, weight_scale=scale, weight_scale_2=torch.tensor(0.03))
     with set_default_torch_dtype(dtype):
         layer.quant_method.process_weights_after_loading(layer)
 

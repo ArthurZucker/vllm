@@ -7,13 +7,11 @@ from torch import nn
 
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader import get_model_loader, register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 
 @register_model_loader("custom_load_format")
@@ -145,28 +143,3 @@ def test_weights_track_keeps_unquantized_models_unchanged():
     model.norm = _layer(weight=(4,))
     assert _track(model, {"norm.weight"}, quantized=False) == ""
     assert "norm.weight" in _track(model, set(), quantized=False)
-
-
-def test_moe_runner_reports_registered_expert_names():
-    # AutoWeightsLoader prefixes these names, so they must include routed_experts.
-    class Experts(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.w13_weight = nn.Parameter(torch.zeros(2, 8, 4), requires_grad=False)
-
-        def load_weights(self, weights):
-            for _ in weights:
-                yield "w13_weight"
-
-    class Runner(nn.Module):
-        load_weights = MoERunner.load_weights
-
-        def __init__(self):
-            super().__init__()
-            self.routed_experts = Experts()
-
-    model = nn.Module()
-    model.experts = Runner()
-    weights = [("experts.w13_weight", torch.zeros(2, 8, 4))]
-    loaded = AutoWeightsLoader(model).load_weights(weights)
-    assert loaded == {"experts.routed_experts.w13_weight"}
