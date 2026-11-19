@@ -222,7 +222,7 @@ class Lfm2AttentionDecoderLayer(nn.Module):
         )
 
         self.feed_forward = Lfm2MLP(
-            dim=config.block_dim,
+            dim=config.hidden_size,
             intermediate_size=config.intermediate_size,
             multiple_of=config.block_multiple_of,
             auto_adjust_ff_dim=config.block_auto_adjust_ff_dim,
@@ -292,7 +292,7 @@ class Lfm2BidirectionalShortConv(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        dim = config.conv_dim
+        dim = config.hidden_size
         self.conv = ColumnParallelLinear(
             config.conv_L_cache, dim, bias=config.conv_bias, prefix=f"{prefix}.conv1d"
         )
@@ -350,7 +350,7 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
         else:
             self.short_conv = ShortConv(
                 config=config,
-                dim=config.conv_dim,
+                dim=config.hidden_size,
                 layer_idx=layer_idx,
                 model_config=model_config,
                 cache_config=cache_config,
@@ -359,7 +359,7 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
             )
 
         self.feed_forward = Lfm2MLP(
-            dim=config.block_dim,
+            dim=config.hidden_size,
             intermediate_size=config.intermediate_size,
             multiple_of=config.block_multiple_of,
             auto_adjust_ff_dim=config.block_auto_adjust_ff_dim,
@@ -554,7 +554,7 @@ class Lfm2ForCausalLM(
 
         return MambaStateShapeCalculator.short_conv_state_shape(
             tp_world_size=parallel_config.tensor_parallel_size,
-            intermediate_size=hf_config.conv_dim,
+            intermediate_size=hf_config.hidden_size,
             conv_kernel=hf_config.conv_L_cache,
         )
 

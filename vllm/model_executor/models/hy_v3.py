@@ -131,7 +131,7 @@ class HYV3MoEFused(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
         top_k = config.num_experts_per_tok
-        intermediate_size = config.expert_hidden_dim
+        intermediate_size = config.moe_intermediate_size
         router_scaling_factor = getattr(config, "router_scaling_factor", 1.0)
         vllm_config = get_current_vllm_config()
         eplb_config = vllm_config.parallel_config.eplb_config
@@ -154,7 +154,8 @@ class HYV3MoEFused(nn.Module):
         if config.num_shared_experts > 0:
             self.shared_mlp = HYV3FeedForward(
                 hidden_size=config.hidden_size,
-                intermediate_size=config.expert_hidden_dim * config.num_shared_experts,
+                intermediate_size=config.moe_intermediate_size
+                * config.num_shared_experts,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.shared_mlp",
