@@ -3275,13 +3275,15 @@ _CONVERSION_MAPPING["GlmOcrMTP"] = _glm_ocr_mtp
 _CONVERSION_MAPPING["HYV3MTP"] = _hy_v3_mtp
 _CONVERSION_MAPPING["Llama4Attention"] = _llama4_attention
 # Llama 4's experts, `[E, hidden, 2 * intermediate]` on disk: vLLM's transposed
+# experts stored `[e, in, out]`, as are ModelOpt FP8's 3D block scales
 _CONVERSION_MAPPING["Llama4MoE"] = [
     WeightConverter(
-        rf"experts\.routed_experts\.{w}_weight$",
-        f"experts.routed_experts.{w}_weight",
+        rf"experts\.routed_experts\.{w}_{kind}$",
+        f"experts.routed_experts.{w}_{kind}",
         operations=[Transpose(1, 2, check_dims=True)],
     )
     for w in ("w13", "w2")
+    for kind in ("weight", "weight_scale")
 ]
 _CONVERSION_MAPPING["FalconAttention"] = _falcon_attention
 _CONVERSION_MAPPING["KimiLinearModel"] = _kimi_linear
