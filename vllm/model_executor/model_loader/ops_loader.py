@@ -36,6 +36,7 @@ from transformers.modeling_utils import LoadStateDictConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    model_parallel_is_initialized,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -97,6 +98,8 @@ def _placement(layer: nn.Module, param: nn.Parameter) -> tuple[int | None, int, 
     if hasattr(layer, "moe_config"):  # the experts
         config = layer.moe_config.moe_parallel_config
         return getattr(param, "shard_dim", None), config.tp_rank, config.tp_size
+    if not model_parallel_is_initialized():  # a model built alone (e.g. a test)
+        return getattr(param, "shard_dim", None), 0, 1
     rank = get_tensor_model_parallel_rank()
     return (
         getattr(param, "shard_dim", None),
@@ -372,14 +375,16 @@ def load_with_ops(
         load_in_place=_load_into,
     )
     info, _ = convert_and_load_state_dict_in_model(model, dict(weights), config)
-    unexpected = sorted(k for k in info.unexpected_keys if "_dropped_" not in k)
-    if unexpected or info.mismatched_keys or info.conversion_errors:
+    if info.conversion_errors or info.mismatched_keys:  # a tensor that can't load
+        raise ValueError(
+            f"Loading failed: {list(info.conversion_errors.items())[:4]}; "
+            f"mismatched: {sorted(info.mismatched_keys)[:4]}"
+        )
+    if unexpected := sorted(k for k in info.unexpected_keys if "_dropped_" not in k):
         logger.warning(
             "Checkpoint tensors matching no param (add them to conversion_mapping.py): "
-            "%s; mismatched: %s; conversion errors: %s",
+            "%s",
             unexpected[:8],
-            sorted(info.mismatched_keys)[:4],
-            list(info.conversion_errors.items())[:4],
         )
     # a param the checkpoint lacks, tied to another (an MLM decoder to the embeddings)
     for name, param in params.items():

@@ -384,7 +384,7 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     for name, args in info.loaded_weights:
         param = getattr(layer, name)
         args.arguments["param"] = param
-        param.weight_loader(*args.args, **args.kwargs)
+        _get_weight_loader(param)(*args.args, **args.kwargs)
 
     _process_loaded_layer(layer, info)
     logger.debug("%s: Processed", layer.__class__.__name__)
