@@ -12,68 +12,11 @@ from vllm.model_executor.layers.quantization.online.nvfp4 import (
     _quantize_moe_weight_to_nvfp4,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import weight_amax
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-
-def _rename(arg: Any, old: str, new: str) -> Any:
-    return arg.replace(old, new) if isinstance(arg, str) else arg
-
-
-def _load_quantized(layer: torch.nn.Module, name: str, *scale_names: str):
-    """Load `(values, *scales)` as a checkpoint of that layout is loaded."""
-    load = getattr(getattr(layer, name), "weight_loader", default_weight_loader)
-    layer.quantizes_on_load = True
-
-    def load_quantized(param, quantized, *args, **kwargs):
-        values, *scales = quantized
-        for scale_name, scale in zip(scale_names, scales):
-            scale_param = getattr(layer, scale_name)
-            # the MoE loader picks how to load a scale by its parameter name
-            getattr(scale_param, "weight_loader", default_weight_loader)(
-                scale_param,
-                scale,
-                *(_rename(a, name, scale_name) for a in args),
-                **{k: _rename(v, name, scale_name) for k, v in kwargs.items()},
-            )
-        return load(param, values, *args, **kwargs)
-
-    return load_quantized
-
-
-def quantize_on_load(
-    layer: torch.nn.Module, name: str, quantize: Callable, *scale_names: str
-) -> None:
-    """Make quantized `layer.<name>` load high-precision tensors via `quantize`."""
-    load = _load_quantized(layer, name, *scale_names)
-
-    def loader(param, loaded_weight, *args, **kwargs):
-        weight = loaded_weight.to(param.device, layer.params_dtype).contiguous()
-        return load(param, quantize(weight), *args, **kwargs)
-
-    getattr(layer, name).weight_loader = loader
 
 
 def _quantize_fp8_per_channel(weight: torch.Tensor) -> tuple:
     scale = online_fp8._fp8_channel_scale(weight_amax(weight, dim=-1, keepdim=True))
     return online_fp8._fp8_quant_per_channel(weight, scale), scale
-
-
-def _nvfp4_on_load(layer: torch.nn.Module) -> None:
-    """The loader's stacked experts (this rank's, gate and up together) quantized
-    at once: one global scale per expert, shared by its gate and up halves"""
-    for p in ("w13_", "w2_"):
-        names = (f"{p}weight", f"{p}weight_scale", f"{p}weight_scale_2")
-        load, scale_2 = _load_quantized(layer, *names), getattr(layer, names[2])
-
-        def loader(param, loaded_weight, load=load, scale_2=scale_2):
-            weight = loaded_weight.to(param.device, layer.params_dtype)
-            values, scales, global_scale = _quantize_moe_weight_to_nvfp4(weight)
-            # one per expert, in each of the param's slots (w13: gate, up)
-            shape = (-1, *([1] * (scale_2.dim() - 1)))
-            global_scale = global_scale.view(shape).expand(scale_2.shape)
-            return load(param, (values, scales, global_scale.contiguous()))
-
-        getattr(layer, names[0]).weight_loader = loader
 
 
 def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
@@ -138,10 +81,30 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
 
     def create_weights_quantized_on_load(layer, *args, **kwargs):
         create_weights(layer, *args, **kwargs)
-        if weight == qu.kNvfp4Static:
-            return _nvfp4_on_load(layer)
-        for p in ("w13_", "w2_") if is_moe else ("",):
-            quantize_on_load(layer, f"{p}weight", quantize, f"{p}{scale}")
+        layer.quantizes_on_load = True
+
+    def checkpoint_quantizer(layer):
+        """The layer's full precision tensors, quantized as they load"""
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmQuantizeQuantizer,
+        )
+
+        if weight == qu.kNvfp4Static:  # stacked experts, a global scale each
+            targets = {
+                f"{p}weight": (
+                    _quantize_moe_weight_to_nvfp4,
+                    [f"{p}weight_scale", f"{p}weight_scale_2"],
+                    True,
+                )
+                for p in ("w13_", "w2_")
+            }
+        else:
+            prefixes = ("w13_", "w2_") if is_moe else ("",)
+            targets = {
+                f"{p}weight": (quantize, [f"{p}{scale}"], False) for p in prefixes
+            }
+        return VllmQuantizeQuantizer(targets)
 
     method.create_weights = create_weights_quantized_on_load  # type: ignore[method-assign]
+    method.checkpoint_quantizer = checkpoint_quantizer  # type: ignore[attr-defined]
     return method

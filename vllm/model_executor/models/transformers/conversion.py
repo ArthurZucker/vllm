@@ -13,6 +13,8 @@ checkpoint key ─▶ plan: the layer's quantizer
 
 from functools import partial
 
+import torch
+from transformers.core_model_loading import ConversionOps
 from transformers.quantizers import (
     HfQuantizer,
     register_quantization_config,
@@ -74,6 +76,56 @@ class VllmLayoutQuantizer(VllmFormatQuantizer):
 
     def get_weight_conversions(self):
         return []  # the model's converters read the tensors
+
+
+class QuantizeOnLoad(ConversionOps):
+    """A full precision tensor quantized as it loads (an online quantization): its
+    quantizer's function of the param, whose outputs fill the param and its scales.
+    Experts are stacked: one call each, unless the function takes them stacked"""
+
+    def __init__(self, quantizer: "VllmQuantizeQuantizer"):
+        self.quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        key = kwargs["full_layer_name"]
+        prefix, _, name = key.rpartition(".")
+        quantize, scale_names, stacked = self.quantizer.targets[name]
+        layer = kwargs["model"].get_submodule(prefix)
+        value = next(iter(input_dict.values()))
+        tensor = value[0] if isinstance(value, list) else value
+        tensor = tensor.to(getattr(layer, name).device, layer.params_dtype).contiguous()
+        if tensor.dim() == 3 and not stacked:  # experts, one at a time
+            values, *scales = (torch.stack(o) for o in zip(*map(quantize, tensor)))
+        else:
+            values, *scales = quantize(tensor)
+        out = {key: values}
+        for scale_name, scale in zip(scale_names, scales):
+            param = getattr(layer, scale_name)
+            if (
+                scale.numel() != param.numel()
+            ):  # one a row, in each of the param's slots
+                scale = scale.reshape(len(scale), *[1] * (param.dim() - 1))
+                scale = scale.expand(param.shape).contiguous()
+            out[f"{prefix}.{scale_name}"] = scale
+        return out
+
+
+class VllmQuantizeQuantizer(VllmFormatQuantizer):
+    """Quantizes a full precision checkpoint as it loads: `targets` maps a param
+    name to `(quantize, its scales' names, takes stacked experts)`"""
+
+    load_serialized = False
+
+    def __init__(self, targets: dict[str, tuple]):
+        super().__init__(VllmFormatConfig("vllm_online"), pre_quantized=False)
+        self.targets = targets
+
+    def param_needs_quantization(self, model, param_name, **kwargs):
+        return param_name.rpartition(".")[2] in self.targets
+
+    def get_quantize_ops(self):
+        return QuantizeOnLoad(self)
 
 
 def checkpoint_plan(model) -> HfQuantizer | None:
