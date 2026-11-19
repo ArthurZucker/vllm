@@ -17,6 +17,7 @@ sharded on read, before the ops: a fused `qkv_proj` concatenates this rank's q, 
 and v slices; a lazy safetensors slice reads only them.
 """
 
+import inspect
 import re
 from collections.abc import Iterable
 from copy import deepcopy
@@ -258,10 +259,16 @@ class ShardOutputs(ConversionOps):
 
 
 def _load_into(param: torch.Tensor, value: torch.Tensor) -> None:
-    """`value` (this rank's, converted) into `param`, through the param's loader: the
-    copy, or what wraps it (online quantization, layerwise reload: buffered until the
-    layer is complete)"""
-    (getattr(param, "weight_loader", None) or default_weight_loader)(param, value)
+    """`value` into `param` through the param's loader when it takes `(param, value)`:
+    a layer sharding for itself (its param declares no sharding: `value` is whole),
+    online quantization, layerwise reload. Loaders of the per-shard protocol
+    (`shard_id`, `expert_id`) cannot be called: copied"""
+    loader = getattr(param, "weight_loader", None)
+    try:
+        inspect.signature(loader).bind(param, value)
+    except (TypeError, ValueError):
+        loader = default_weight_loader
+    loader(param, value)
 
 
 def _padded_converters(model: nn.Module) -> list[WeightConverter]:

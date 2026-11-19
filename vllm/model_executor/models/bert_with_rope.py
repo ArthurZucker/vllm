@@ -10,7 +10,6 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -37,7 +36,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
-from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -275,44 +273,8 @@ class NomicMoE(nn.Module):
             )
         )
         self.bias = nn.Parameter(torch.zeros(self.hidden_size))
-        set_weight_attrs(
-            self.w1,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-        set_weight_attrs(
-            self.w2,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-    ):
-        # NOTE: Nomic-MoE has fused experts weights with shape
-        # (num_experts * intermediate_size, hidden_size)
-        tp_rank = get_tensor_model_parallel_rank()
-        param_data = param.data
-        shard_size = self.intermediate_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
-        if weight_name.endswith("w1"):
-            loaded_weight = loaded_weight.reshape(
-                self.num_total_experts,
-                self.total_intermediate_size,
-                self.hidden_size,
-            )[:, shard]
-        if weight_name.endswith("w2"):
-            loaded_weight = loaded_weight.reshape(
-                self.num_total_experts,
-                self.total_intermediate_size,
-                self.hidden_size,
-            )[:, shard].transpose(1, 2)
-        param_data.copy_(loaded_weight)
+        # stored `[experts * intermediate, hidden]`, w2 transposed (conversion_mapping)
+        self.w1.shard_dim, self.w2.shard_dim = 1, 2
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape

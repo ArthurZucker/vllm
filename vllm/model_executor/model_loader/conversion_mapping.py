@@ -32,6 +32,7 @@ from transformers.core_model_loading import (
 
 from vllm.model_executor.model_loader.weight_ops import (
     Deinterleave,
+    ExpertRows,
     OutputConcatenate,
     RepeatLastSource,
     SwapHalves,
@@ -1332,6 +1333,10 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("experts.mlp.", ""),
         rename("experts.", ""),
         rename("router.layer", "router"),
+        # experts stacked on the rows; w2 stored `[e * i, h]`, the param `[e, h, i]`
+        WeightConverter(
+            ".mlp.w2$", ".mlp.w2", operations=[ExpertRows(), Transpose(1, 2)]
+        ),
     ],
     "OPTForCausalLM": [
         rename("^decoder.", "model.decoder."),

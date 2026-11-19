@@ -135,3 +135,17 @@ class Deinterleave(ConversionOps):
         shape = tensor.shape
         tensor = tensor.view((heads, self.parts, -1) + shape[1:]).transpose(0, 1)
         return {target_patterns[0]: tensor.reshape(shape)}
+
+
+class ExpertRows(ConversionOps):
+    """Experts stacked along the rows (`[experts * rows, cols]`, Nomic MoE) as
+    `[experts, rows, cols]`, `experts` read from the config"""
+
+    def __init__(self, experts_attr: str = "num_experts"):
+        self.experts_attr = experts_attr
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        tensor = _first(input_dict)
+        experts = getattr(kwargs["config"].get_text_config(), self.experts_attr)
+        return {target_patterns[0]: tensor.view(experts, -1, *tensor.shape[1:])}
