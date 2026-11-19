@@ -62,7 +62,10 @@ def _load_st_projector(model_config: "ModelConfig") -> nn.Module | None:
             layers.append(linear)
             if act_name := layer_config.get("activation_function"):
                 layers.append(get_act_fn(act_name))
-        return nn.Sequential(*layers).to(dtype=model_config.head_dtype)
+        projector = nn.Sequential(*layers).to(dtype=model_config.head_dtype)
+        for param in projector.parameters():  # loaded here, not from the checkpoint
+            param.loaded_at_init = True
+        return projector
     except Exception:
         logger.exception("ST projector loading failed")
 

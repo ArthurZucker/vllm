@@ -6,6 +6,14 @@ import torch
 from transformers.core_model_loading import Concatenate, ConversionOps
 
 
+def _each(input_dict: dict, fn) -> dict:
+    """`fn` over every tensor, Transformers' lists of them as well"""
+    return {
+        k: [fn(t) for t in v] if isinstance(v, list) else fn(v)
+        for k, v in input_dict.items()
+    }
+
+
 def _first(input_dict: dict) -> torch.Tensor:
     """The one tensor of a single-source op (Transformers passes lists)"""
     tensor = next(iter(input_dict.values()))
@@ -75,7 +83,7 @@ class NegExp(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        return {key: -torch.exp(tensor.float()) for key, tensor in input_dict.items()}
+        return _each(input_dict, lambda t: -torch.exp(t.float()))
 
 
 class Affine(ConversionOps):
@@ -87,7 +95,7 @@ class Affine(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        return {k: t * self.scale + self.offset for k, t in input_dict.items()}
+        return _each(input_dict, lambda t: t * self.scale + self.offset)
 
 
 class Gather(ConversionOps):
@@ -99,12 +107,11 @@ class Gather(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        out = {}
-        for key, t in input_dict.items():
+        def gather(t):
             raw = t.view(torch.uint8) if t.element_size() == 1 else t
-            index = self.index.to(t.device)
-            out[key] = raw.index_select(self.dim, index).view(t.dtype)
-        return out
+            return raw.index_select(self.dim, self.index.to(t.device)).view(t.dtype)
+
+        return _each(input_dict, gather)
 
 
 class SwapHalves(ConversionOps):

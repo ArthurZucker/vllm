@@ -110,11 +110,6 @@ class ColBERTMixin(nn.Module, SupportsLateInteraction):
             pooler_config,
             projector=self.colbert_linear,
         )
-        # a Sentence-Transformers projector (`1_Dense/`) is loaded as it is built
-        projector = getattr(getattr(pooler, "head", None), "projector", None)
-        if projector is not None and projector is not self.colbert_linear:
-            for param in projector.parameters():
-                param.loaded_at_init = True
         return pooler
 
     # --------------------------------------------------------- config helper
