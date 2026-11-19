@@ -40,7 +40,6 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     packed_nccl_broadcast_consumer,
     packed_nccl_broadcast_producer,
 )
-from vllm.model_executor.model_loader import ops_loader
 
 # NCCLWeightTransferInitInfo is re-exported here for convenience; its canonical
 # home is nccl_common, shared with the sparse backend.
@@ -338,6 +337,8 @@ class NCCLWeightTransferEngine(
                     )
                 ),
             )
+        from vllm.model_executor.model_loader import ops_loader
+
         model = self.model
         load_weights = (
             partial(ops_loader.load_weights, model)
