@@ -42,6 +42,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_processing,
 )
@@ -281,8 +282,10 @@ def test_untied_head_matches_reference(online_head_config, num_tokens):
     assert isinstance(head.quant_method, Int4PerGroup32AsymLMHeadMethod)
     assert head.weight.is_meta  # materialized while loading
     loaded = (torch.randn(VOCAB, HIDDEN, device="cuda") * 0.02).to(torch.bfloat16)
-    head.weight.weight_loader(head.weight, loaded)
-    # The padded vocab rows are never loaded: processing waits for finalize.
+    root = torch.nn.Module()
+    root.lm_head = head
+    load_with_ops(root, iter([("lm_head.weight", loaded)]), conversions=[])
+    # The padded vocab rows are padded by the loader; processing waits for finalize.
     finalize_layerwise_processing(head, model_config=None)
     assert head.weight.dtype == torch.int8 or head.weight.dtype == torch.int32
     x = torch.randn(num_tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
