@@ -117,7 +117,7 @@ def test_checkpoint_rotation_is_checked_and_dropped():
     h = hadamard_matrix(32, w.device)
     layer.weight.data.copy_(block_hadamard_rotate(w, h))
     signs = (h * 32**0.5).round().to(torch.int8)
-    layer.input_rotation.weight_loader(layer.input_rotation, signs)
+    default_weight_loader(layer.input_rotation, signs)
 
     method.process_weights_after_loading(layer)
 
@@ -129,8 +129,10 @@ def test_rejects_non_sylvester_and_missing_rotation():
     layer, method = _make_layer(rotate_weight=False)
     flipped = (hadamard_matrix(32, torch.device("cpu")) * 32**0.5).round()
     flipped[0] = -flipped[0]
+    default_weight_loader(layer.input_rotation, flipped.to(torch.int8))
     with pytest.raises(NotImplementedError, match="Sylvester"):
-        layer.input_rotation.weight_loader(layer.input_rotation, flipped.to(torch.int8))
+        method.process_weights_after_loading(layer)
+    layer, method = _make_layer(rotate_weight=False)
     with pytest.raises(ValueError, match="input_rotation"):
         method.process_weights_after_loading(layer)
 
@@ -156,8 +158,9 @@ def test_layerwise_reload(rotate_weight: bool, default_vllm_config):
         layer.weight.weight_loader(
             layer.weight, w if rotate_weight else block_hadamard_rotate(w, h)
         )
-        if not rotate_weight:
-            layer.input_rotation.weight_loader(layer.input_rotation, signs)
+        if not rotate_weight:  # the layerwise reload's loader, once it wraps one
+            rotation = layer.input_rotation
+            getattr(rotation, "weight_loader", default_weight_loader)(rotation, signs)
 
     set_random_seed(0)
     load(torch.randn(16, 128))

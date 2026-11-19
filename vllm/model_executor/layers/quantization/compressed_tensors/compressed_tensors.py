@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
@@ -12,10 +11,10 @@ from compressed_tensors.quantization import (
     QuantizationType,
 )
 from compressed_tensors.transform import TransformConfig
+from transformers.core_model_loading import ConversionOps
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
@@ -74,6 +73,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_ops import _each
 from vllm.model_executor.utils import is_weights_pre_processed
 from vllm.platforms import current_platform
 
@@ -1194,73 +1194,28 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
             torch.zeros(n_scales, requires_grad=False)
         )
 
-        # TP-aware loading for attn_head strategy follows attention head partitioning:
-        # - q_scale is partitioned over query heads.
-        # - k/v_scale is partitioned over kv heads when total_kv_heads >= tp_size,
-        #   and replicated when total_kv_heads < tp_size.
+        # ATTN_HEAD: one scale per kv head (`AttnHeadScales` reduces q's), each
+        # rank's heads; kv heads replicate over the ranks when fewer than them
         if strategy == QuantizationStrategy.ATTN_HEAD:
+            total_kv_heads = self.quant_config.total_num_kv_heads  # type: ignore[attr-defined]
+            replicas = max(get_tensor_model_parallel_world_size() // total_kv_heads, 1)
+            for kind in "qkv":
+                for name in (f"{kind}_scale", f"{kind}_zero_point"):
+                    param = getattr(layer, name)
+                    param.shard_dim, param.shard_replicas = 0, replicas
 
-            def _tp_aware_loader(
-                param: torch.Tensor,
-                loaded_weight: torch.Tensor,
-                kind: Literal["q", "k", "v"],
-                param_type: Literal["scale", "zero_point"],
-            ):
-                # Zero-points are not used as vLLM only supports symmetric quantization
-                if param_type == "zero_point":
-                    return
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """ATTN_HEAD scales load as one per kv head (`AttnHeadScales`)"""
+        scheme = getattr(self.quant_config, "kv_cache_scheme", None)
+        strategy = None if scheme is None else QuantizationStrategy(scheme["strategy"])
+        if strategy != QuantizationStrategy.ATTN_HEAD:
+            return None
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmLayoutQuantizer,
+        )
 
-                # LLM-Compressor stores scales as 3D tensors of shape [num_heads, 1, 1]
-                loaded_weight = loaded_weight.flatten()
-
-                # FlashAttn expects [num_kv_heads] instead of [num_heads] for q_scale.
-                # We reduce by taking the max scale in each attention head group.
-                if kind == "q":
-                    reduction_factor = (
-                        self.quant_config.total_num_heads  # type: ignore[attr-defined]
-                        // self.quant_config.total_num_kv_heads  # type: ignore[attr-defined]
-                    )
-                    loaded_weight = torch.amax(
-                        loaded_weight.view(-1, reduction_factor), dim=1
-                    )
-
-                tp_rank = get_tensor_model_parallel_rank()
-                tp_size = get_tensor_model_parallel_world_size()
-
-                if layer.num_kv_heads * tp_size == self.quant_config.total_num_kv_heads:  # type: ignore[attr-defined]
-                    # heads evenly distributed
-                    loaded_weight = loaded_weight[
-                        tp_rank * layer.num_kv_heads : (tp_rank + 1)
-                        * layer.num_kv_heads
-                    ]
-                else:
-                    # heads replicated to match TP size
-                    assert layer.num_kv_heads == 1
-                    replicas = tp_size // self.quant_config.total_num_kv_heads  # type: ignore[attr-defined]
-                    shard_rank = tp_rank // replicas
-                    loaded_weight = loaded_weight[shard_rank : shard_rank + 1]
-
-                param.data.copy_(loaded_weight.to(dtype=param.dtype))
-
-            layer.q_scale.weight_loader = partial(
-                _tp_aware_loader, kind="q", param_type="scale"
-            )
-            layer.k_scale.weight_loader = partial(
-                _tp_aware_loader, kind="k", param_type="scale"
-            )
-            layer.v_scale.weight_loader = partial(
-                _tp_aware_loader, kind="v", param_type="scale"
-            )
-
-            layer.q_zero_point.weight_loader = partial(
-                _tp_aware_loader, kind="q", param_type="zero_point"
-            )
-            layer.k_zero_point.weight_loader = partial(
-                _tp_aware_loader, kind="k", param_type="zero_point"
-            )
-            layer.v_zero_point.weight_loader = partial(
-                _tp_aware_loader, kind="v", param_type="zero_point"
-            )
+        names = [f"{k}_{t}" for k in "qkv" for t in ("scale", "zero_point")]
+        return VllmLayoutQuantizer(AttnHeadScales, names)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Override the default vLLM placeholder scales with the llm-compressor loaded
@@ -1290,3 +1245,30 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         # Sync host (cpu) scale copies read by AITER fused kernels.
         layer._k_scale_cpu.fill_(layer._k_scale_float)
         layer._v_scale_cpu.fill_(layer._v_scale_float)
+
+
+class AttnHeadScales(ConversionOps):
+    """LLM-Compressor's ATTN_HEAD KV-cache scales (`[num_heads, 1, 1]`) as one per
+    kv head: q's reduced by the max over each kv head's group (FlashAttention reads
+    `[num_kv_heads]`). Zero points load as zeros: only symmetric quantization is
+    supported. Whole: each rank's kv heads are sharded after (`shard_dim`,
+    `shard_replicas`)"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        self.quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        prefix, _, name = kwargs["full_layer_name"].rpartition(".")
+        config = kwargs["model"].get_submodule(prefix).quant_method.quant_config
+
+        def per_kv_head(tensor: torch.Tensor) -> torch.Tensor:
+            tensor = tensor.flatten()
+            if name.startswith("q"):
+                group = config.total_num_heads // config.total_num_kv_heads
+                tensor = torch.amax(tensor.view(-1, group), dim=1)
+            return torch.zeros_like(tensor) if "zero_point" in name else tensor
+
+        return _each(input_dict, per_kv_head)

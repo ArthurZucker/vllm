@@ -152,6 +152,7 @@ def _load_weight_in_sent_dtype(layer: torch.nn.Module) -> None:
         getattr(param, "weight_loader", None) or default_weight_loader
     )
     param.weight_loader = MethodType(_weight_loader_in_sent_dtype, layer)
+    param.keeps_sent_dtype = True  # not cast on read: its loader picks the dtype
 
 
 def _weight_loader_in_sent_dtype(

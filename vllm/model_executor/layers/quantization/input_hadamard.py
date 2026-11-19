@@ -17,7 +17,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
 )
-from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
@@ -109,23 +108,12 @@ class InputHadamardLinearMethod(LinearMethodBase):
                 torch.zeros(self.size, self.size, dtype=torch.int8),
                 requires_grad=False,
             )
-            set_weight_attrs(
-                input_rotation, {"weight_loader": self._load_input_rotation}
-            )
             layer.register_parameter("input_rotation", input_rotation)
 
-    def _load_input_rotation(
-        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, *args, **kwargs
-    ) -> None:
-        """Every shard of a fused layer carries the same rotation, and it must
-        be the Sylvester matrix `apply` rotates by."""
-        hadamard = hadamard_matrix(self.size, loaded_weight.device)
-        if not torch.equal(loaded_weight.float(), (hadamard * self.size**0.5).round()):
-            raise NotImplementedError(
-                "Only the Sylvester Hadamard input rotation is supported; random "
-                "or trained rotations are not."
-            )
-        param.data.copy_(loaded_weight)
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """The wrapped method's (e.g. Quark's scale layouts)"""
+        inner = getattr(self.quant_method, "checkpoint_quantizer", None)
+        return None if inner is None else inner(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Online methods may be called again after quantizing; rotate once.
@@ -140,6 +128,16 @@ class InputHadamardLinearMethod(LinearMethodBase):
                     raise ValueError(
                         "The checkpoint did not provide the input_rotation of an "
                         "online-rotated layer."
+                    )
+                # every shard of a fused layer carries the same rotation, and it
+                # must be the Sylvester matrix `apply` rotates by
+                sylvester = hadamard_matrix(self.size, input_rotation.device)
+                if not torch.equal(
+                    input_rotation.float(), (sylvester * self.size**0.5).round()
+                ):
+                    raise NotImplementedError(
+                        "Only the Sylvester Hadamard input rotation is supported; "
+                        "random or trained rotations are not."
                     )
                 del layer.input_rotation
         self.quant_method.process_weights_after_loading(layer)

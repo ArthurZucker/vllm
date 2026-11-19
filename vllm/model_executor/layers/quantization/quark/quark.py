@@ -1109,6 +1109,12 @@ class QuarkLinearMethod(LinearMethodBase, InputHadamardFusable):
             scheme.fuse_input_hadamard(layer, size)
         )
 
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """The scheme's, when its checkpoint needs vLLM's layout"""
+        scheme = getattr(layer, "scheme", None)
+        method = getattr(scheme, "checkpoint_quantizer", None)
+        return None if method is None else method(layer)
+
 
 class QuarkKVCacheMethod(BaseKVCacheMethod):
     """Supports loading kv-cache scaling factors from quark checkpoints."""

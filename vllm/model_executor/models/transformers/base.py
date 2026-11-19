@@ -67,7 +67,10 @@ from vllm.model_executor.models.interfaces import (
     SupportsQuant,
 )
 from vllm.model_executor.models.interfaces_base import VllmModel
-from vllm.model_executor.models.transformers.conversion import quantization_plan
+from vllm.model_executor.models.transformers.conversion import (
+    checkpoint_plan,
+    quantization_plan,
+)
 from vllm.model_executor.models.transformers.fuser import BaseFuser, Fusers
 from vllm.model_executor.models.transformers.fusers import AttentionFuser, MLAFuser
 from vllm.model_executor.models.transformers.fusers.attention import (
@@ -931,6 +934,15 @@ class Base(
             getattr(self.config, "quantization_config", None),
             serialized=self.quant_config is not None,
         )
+        # vLLM layers whose quant method loads its own layout join the plan
+        if (layouts := checkpoint_plan(self)) is not None:
+            if hf_quantizer is None:
+                hf_quantizer = layouts
+            else:
+                hf_quantizer.set_quantizers(
+                    {**layouts.quantizers, **hf_quantizer.quantizers}
+                )
+                hf_quantizer.map_module_to_quantizer(self.model)
         conversions = self.conversions()
         if hf_quantizer is not None:
             conversions = hf_quantizer.update_weight_conversions(

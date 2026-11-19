@@ -169,6 +169,8 @@ class VllmShard:
             return None
         # on the device first: no CPU kernel in the loader's threads (OpenMP's pool is
         # invalid there, in a forked worker)
+        if getattr(param, "keeps_sent_dtype", False):
+            dtype = None  # FP8 or BF16 as sent (`dequant_linear`)
         tensor = tensor.to(device=device).to(dtype=dtype)
         for op in getattr(param, "load_ops", ()):  # e.g. A_log's `-exp`
             out = next(iter(op.convert({"t": [tensor]}, ["t"], ["t"]).values()))
