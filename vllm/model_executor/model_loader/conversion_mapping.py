@@ -83,6 +83,9 @@ def fused(target: str, *sources: str | tuple[str, int]) -> WeightConverter:
     filling several shards is `(pattern, shards)`"""
     # module names, not regexes: `.k.` must not match the `ock` of `blocks`
     patterns = [re.escape(s if isinstance(s, str) else s[0]) for s in sources]
+    # a bare name (`q_proj`) Transformers anchors at the key's end, missing
+    # `q_proj.weight`: a module boundary instead, as `.q_proj` has
+    patterns = [rf"(?<![^.]){p}" if re.fullmatch(r"\w+", p) else p for p in patterns]
     converter = Fused(patterns, target, operations=[OutputConcatenate()])
     converter.shards = [1 if isinstance(s, str) else s[1] for s in sources]
     return converter
