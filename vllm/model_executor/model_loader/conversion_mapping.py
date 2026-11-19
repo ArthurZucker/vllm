@@ -2663,8 +2663,9 @@ _CONVERSION_MAPPING["BailingMoeV3ForCausalLM"] = _CONVERSION_MAPPING[
 ]
 _CONVERSION_MAPPING["CohereAsrForConditionalGeneration"] = (
     [
-        rename("^transf_decoder._decoder", "decoder"),
-        rename("^transf_decoder._embedding", "decoder.embedding"),
+        # NeMo's names, with or without the `model.` body (Transformers saves it)
+        rename(r"^(?:model\.)?transf_decoder\._decoder", "decoder"),
+        rename(r"^(?:model\.)?transf_decoder\._embedding", "decoder.embedding"),
         rename("second_sub_layer.query_net", "second_sub_layer.q_proj"),
         rename("^log_softmax.mlp.layer0.", "proj_out."),
         rename("^(?!proj_out.)", "model."),
