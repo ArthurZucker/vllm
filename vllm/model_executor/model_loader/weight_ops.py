@@ -149,3 +149,31 @@ class ExpertRows(ConversionOps):
         tensor = _first(input_dict)
         experts = getattr(kwargs["config"].get_text_config(), self.experts_attr)
         return {target_patterns[0]: tensor.view(experts, -1, *tensor.shape[1:])}
+
+
+class HeadPermute(ConversionOps):
+    """Each head's channels gathered by `index` (`head_dim` channels a head), on the
+    sources at `positions` (all by default): K2-Horizon's partial-RoPE channels
+    reordered for NeoX rope. Per head: sharded heads permute alone"""
+
+    def __init__(self, index: torch.Tensor, head_dim: int, positions=None):
+        self.index, self.head_dim, self.positions = index, head_dim, positions
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        chosen = [
+            p
+            for i, p in enumerate(source_patterns)
+            if self.positions is None or i in self.positions
+        ]
+        for pattern in chosen:
+            if (value := input_dict.get(pattern)) is None:
+                continue
+            tensors = value if isinstance(value, list) else [value]
+            input_dict[pattern] = [
+                t.view(-1, self.head_dim, *t.shape[1:])[:, self.index.to(t.device)]
+                .reshape(t.shape)
+                .contiguous()
+                for t in tensors
+            ]
+        return input_dict

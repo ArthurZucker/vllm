@@ -11,7 +11,7 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
-from vllm.distributed import divide, get_tensor_model_parallel_rank
+from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -100,6 +100,8 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes = output_sizes.copy()
         output_sizes[replicated_shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
+        # every rank loads the replicated shard whole
+        self.shard_replicas = {replicated_shard_id: tp_size}
 
 
 def is_fused_kda_decode_supported(

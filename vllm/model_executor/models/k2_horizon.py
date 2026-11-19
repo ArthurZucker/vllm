@@ -615,6 +615,11 @@ class K2HorizonAttention(nn.Module):
             self.k_norm = K2HorizonRMSNorm(
                 hidden_size=self.kv_size, n_groups=self.num_kv_heads, eps=rms_norm_eps
             )
+            # sharded by heads; a kv head shared by tp / kv-heads ranks
+            self.q_norm.weight.shard_dim = self.k_norm.weight.shard_dim = 0
+            self.k_norm.weight.shard_replicas = max(
+                1, tp_size // self.total_num_kv_heads
+            )
 
         self.gate_func = gate_func
         if self.gate_func is not None:
@@ -727,6 +732,7 @@ class K2HorizonMoVAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qk_proj",
         )
+        self.qk_proj.shard_replicas = {1: max(1, tp_size // self.total_num_kv_heads)}
 
         self.v_router = ReplicatedLinear(
             hidden_size,
@@ -800,6 +806,11 @@ class K2HorizonMoVAAttention(nn.Module):
             )
             self.k_norm = K2HorizonRMSNorm(
                 hidden_size=self.kv_size, n_groups=self.num_kv_heads, eps=rms_norm_eps
+            )
+            # sharded by heads; a kv head shared by tp / kv-heads ranks
+            self.q_norm.weight.shard_dim = self.k_norm.weight.shard_dim = 0
+            self.k_norm.weight.shard_replicas = max(
+                1, tp_size // self.total_num_kv_heads
             )
 
         self.gate_func = gate_func

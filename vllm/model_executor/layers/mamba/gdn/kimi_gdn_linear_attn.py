@@ -82,6 +82,8 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes = output_sizes.copy()
         output_sizes[replicated_shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
+        # every rank loads the replicated shard whole
+        self.shard_replicas = {replicated_shard_id: tp_size}
 
 
 @PluggableLayer.register("kimi_gated_delta_net_attention")

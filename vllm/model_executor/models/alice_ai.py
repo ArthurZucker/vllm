@@ -66,12 +66,6 @@ from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
-_SPLIT_KDA_CONV_SHARDS = {
-    ".linear_attn.q_conv1d": (".linear_attn.conv1d", 0),
-    ".linear_attn.k_conv1d": (".linear_attn.conv1d", 1),
-    ".linear_attn.v_conv1d": (".linear_attn.conv1d", 2),
-}
-
 
 def get_attn_res_block_size(hf_config: object) -> int:
     """Return the architecture-rebase AttnRes grouping, not legacy metadata."""

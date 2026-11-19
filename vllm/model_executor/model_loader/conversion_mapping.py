@@ -33,6 +33,7 @@ from transformers.core_model_loading import (
 from vllm.model_executor.model_loader.weight_ops import (
     Deinterleave,
     ExpertRows,
+    HeadPermute,
     OutputConcatenate,
     RepeatLastSource,
     SwapHalves,
@@ -335,9 +336,51 @@ def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
     ]
 
 
+def _k2_horizon(module: nn.Module) -> list[WeightTransform]:
+    """Each attention layer's (scoped to it, names from it): dense q/k projections
+    fold the partial-RoPE channel order into their rows and their norms' scales, so
+    the runtime uses NeoX rope; a MoVA layer fuses only q and k"""
+    if not module.fold_rope_weights:
+        return []
+    from vllm.model_executor.models.k2_horizon import _rope_weight_perm
+
+    head_dim = module.head_dim
+    permute = HeadPermute(_rope_weight_perm(head_dim, module.rope_head_dim), head_dim)
+    mova = hasattr(module, "qk_proj")
+    qk = (
+        fused("qk_proj", "q_proj", "k_proj")
+        if mova
+        else fused("qkv_proj", "q_proj", "k_proj", "v_proj")
+    )
+    qk.operations = [HeadPermute(permute.index, head_dim, (0, 1)), *qk.operations]
+    norms = [
+        WeightConverter(f"{norm}.weight", f"{norm}.weight", operations=[permute])
+        for norm in ("q_norm", "k_norm")
+        if getattr(module, "query_key_norm", False)
+    ]
+    return [qk, *norms]
+
+
+def _kimi_kda(module: nn.Module) -> list[WeightTransform]:
+    """Each KDA layer's (scoped to it): q, k, v, the gate when full rank, f_a and
+    the beta into `in_proj_qkvgfab` in its shard order; the split convs"""
+    full_rank = getattr(module, "use_full_rank_gate", False)
+    parts = (
+        ("q", "k", "v", "g", "f_a", "b") if full_rank else ("q", "k", "v", "b", "f_a")
+    )
+    return [
+        fused("in_proj_qkvgfab", *(f"{p}_proj" for p in parts)),
+        fused("conv1d", "q_conv1d", "k_conv1d", "v_conv1d"),
+    ]
+
+
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
+    "K2HorizonAttention": _k2_horizon,
+    "KimiGatedDeltaNetAttention": _kimi_kda,
+    "KimiK3DeltaAttention": _kimi_kda,
+    "K2HorizonMoVAAttention": _k2_horizon,
     "MistralLarge4ForCausalLM": MISTRAL_LARGE4,
     "Gemma4Model": _gemma4,
     "GPT2LMHeadModel": GPT2,
@@ -388,14 +431,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "AliceAIModel": [
         rename(".linear_attn.a_log_bias", ".linear_attn.A_log"),
-        fused(
-            ".linear_attn.in_proj_qkvgfab",
-            ".linear_attn.q_proj",
-            ".linear_attn.k_proj",
-            ".linear_attn.v_proj",
-            ".linear_attn.b_proj",
-            ".linear_attn.f_a_proj",
-        ),
     ],
     "Alpamayo2SuperForConditionalGeneration": [
         rename("^vlm.model.visual.", "visual."),
@@ -1969,11 +2004,9 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
     (e.g. a vision tower's to `visual`), outermost first: its renamings see the
     checkpoint's names, its converters the model's"""
     instances: dict[str, list[str]] = {}
-    first: dict[str, nn.Module] = {}
     for name, module in model.named_modules():
         if (cls := _entry_name(type(module))) is not None:
             instances.setdefault(cls, []).append(name)
-            first.setdefault(cls, module)
     model_types = {
         module.config.model_type
         for module in model.modules()
@@ -1983,10 +2016,16 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
     seen: dict[tuple, list[str]] = {}
     out += _layer_experts(model)
     for cls, names in sorted(instances.items(), key=lambda kv: min(map(len, kv[1]))):
-        parts = os.path.commonprefix([name.split(".") for name in names])
-        scope = ".".join(p for p in parts if not p.isdigit())
-        entry = _CONVERSION_MAPPING[cls]  # a list, or a function of the module (config)
-        for transform in entry(first[cls]) if callable(entry) else entry:
+        entry = _CONVERSION_MAPPING[cls]  # a list, or a function of the module
+        if callable(entry):  # each instance its own, scoped to it (a layer's)
+            scoped = [
+                (name, t) for name in names for t in entry(model.get_submodule(name))
+            ]
+        else:
+            parts = os.path.commonprefix([name.split(".") for name in names])
+            scope = ".".join(p for p in parts if not p.isdigit())
+            scoped = [(scope, t) for t in entry]
+        for scope, transform in scoped:
             # an inner class repeating its outer class's transform applies it once
             key = (type(transform), *transform._original_source_patterns)
             outer = seen.setdefault(key, [])

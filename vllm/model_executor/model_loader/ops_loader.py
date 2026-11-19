@@ -189,6 +189,7 @@ class VllmShard:
             local = shape[dim] // size
         elif self.sources == 1:  # the param's own range, e.g. a padded vocab
             local = target[dim]
+            replicas = getattr(self.param, "shard_replicas", 1)  # e.g. a kv norm
         else:
             shard = shards[self.index] if self.index < len(shards) else None
             replicas = _replicas(layer, shard)
