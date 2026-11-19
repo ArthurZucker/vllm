@@ -227,10 +227,12 @@ class FalconMLP(nn.Module):
     ):
         super().__init__()
         hidden_size = config.hidden_size
+        # as Transformers' `FalconMLP`
+        ffn_size = getattr(config, "ffn_hidden_size", None) or 4 * hidden_size
 
         self.dense_h_to_4h = ColumnParallelLinear(
             hidden_size,
-            4 * hidden_size,
+            ffn_size,
             bias=config.bias,
             skip_bias_add=True,
             quant_config=quant_config,
@@ -241,7 +243,7 @@ class FalconMLP(nn.Module):
             config.new_decoder_architecture or config.parallel_attn
         )
         self.dense_4h_to_h = RowParallelLinear(
-            4 * hidden_size,
+            ffn_size,
             hidden_size,
             bias=config.bias,
             skip_bias_add=True,
