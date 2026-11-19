@@ -62,7 +62,6 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
     UnquantizedLinearMethod,
-    register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
@@ -117,6 +116,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
@@ -544,7 +544,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             if self.quant_config.is_checkpoint_fp8_serialized
             else params_dtype
         )
-        weight_loader = extra_weight_attrs.get("weight_loader")
 
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
 
@@ -557,7 +556,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
 
@@ -570,7 +568,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
 
@@ -584,11 +581,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 1.0,
                 dtype=torch.float32,
             ),
-            weight_loader=weight_loader,
         )
         w2_weight_scale = PerTensorScaleParameter(
             data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -596,11 +591,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         # INPUT SCALES - Per-tensor scaling for ModelOpt
         w13_input_scale = PerTensorScaleParameter(
             data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-            weight_loader=weight_loader,
         )
         w2_input_scale = PerTensorScaleParameter(
             data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -988,7 +981,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.quant_config = self.quant_config
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
-        weight_loader = extra_weight_attrs.get("weight_loader")
         global_num_experts = extra_weight_attrs.get("global_num_experts")
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
         # GEMM 1
@@ -1002,7 +994,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
 
@@ -1017,7 +1008,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
 
@@ -1031,7 +1021,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
@@ -1045,7 +1034,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=1,
             output_dim=2,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -1055,13 +1043,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(num_experts, w13_num_shards, dtype=torch.float32),
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(num_experts, dtype=torch.float32),
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
@@ -1078,13 +1064,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 w13_num_shards,
                 dtype=torch.float32,
             ),
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
             data=torch.empty(global_sf_num_experts, dtype=torch.float32),
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
@@ -1457,7 +1441,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             )
 
         layer.num_experts = num_experts
-        weight_loader = extra_weight_attrs.get("weight_loader")
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
 
         # GEMM 1 weights: [E, (2I or I), H]
@@ -1470,7 +1453,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
 
@@ -1484,7 +1466,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
 
@@ -1498,7 +1479,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
@@ -1511,7 +1491,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -2391,7 +2370,7 @@ class QuantKeyScheme:
 
     key: QuantKey
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         raise NotImplementedError
 
     def process(self, layer, role) -> None:
@@ -2404,8 +2383,12 @@ class QuantKeyScheme:
         )
 
     @staticmethod
-    def register_params(layer, name, shape, dtype, cls, wl, *, init=None, **dims):
-        p = cls(data=torch.empty(shape, dtype=dtype), weight_loader=wl, **dims)
+    def register_params(
+        layer, name, shape, dtype, cls, *, init=None, loader=None, **dims
+    ):
+        p = cls(data=torch.empty(shape, dtype=dtype), **dims)
+        if loader is not None:
+            p.weight_loader = loader
         if init is not None:
             p.data.fill_(init)
         layer.register_parameter(name, p)
@@ -2416,7 +2399,7 @@ class KNvfp4Static(QuantKeyScheme):
 
     key = kNvfp4Static
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not WEIGHT:
             self.reject(role)
         if shapes.input_size_per_partition % 16 != 0:
@@ -2430,7 +2413,6 @@ class KNvfp4Static(QuantKeyScheme):
             (shapes.output_size_per_partition, shapes.input_size_per_partition // 2),
             torch.uint8,
             ModelWeightParameter,
-            wl,
             input_dim=1,
             output_dim=0,
         )
@@ -2441,7 +2423,6 @@ class KNvfp4Static(QuantKeyScheme):
             (shapes.num_partitions,),
             torch.float32,
             PerTensorScaleParameter,
-            wl,
         )
         # Per-block (group_size) weight scale. Initialized to NaN (rather than
         # left as torch.empty garbage) so an unloaded scale is unambiguously
@@ -2455,7 +2436,6 @@ class KNvfp4Static(QuantKeyScheme):
             ),
             torch.float8_e4m3fn,
             ModelWeightParameter,
-            wl,
             input_dim=1,
             output_dim=0,
             init=float("nan"),
@@ -2498,7 +2478,7 @@ class KNvfp4Dynamic(QuantKeyScheme):
 
     key = kNvfp4Dynamic
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not ACT:
             self.reject(role)
         self.register_params(
@@ -2507,7 +2487,6 @@ class KNvfp4Dynamic(QuantKeyScheme):
             (shapes.num_partitions,),
             torch.float32,
             PerTensorScaleParameter,
-            wl,
         )
 
     def process(self, layer, role) -> None:
@@ -2537,7 +2516,7 @@ class KFp8StaticTensor(QuantKeyScheme):
 
     key = kFp8StaticTensorSym
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is WEIGHT:
             self.register_params(
                 layer,
@@ -2545,7 +2524,6 @@ class KFp8StaticTensor(QuantKeyScheme):
                 (shapes.output_size_per_partition, shapes.input_size_per_partition),
                 torch.float8_e4m3fn,
                 ModelWeightParameter,
-                wl,
                 input_dim=1,
                 output_dim=0,
             )
@@ -2556,7 +2534,6 @@ class KFp8StaticTensor(QuantKeyScheme):
                 (shapes.num_partitions,),
                 torch.float32,
                 PerTensorScaleParameter,
-                wl,
                 init=FP8_SCALE_SENTINEL,
             )
         elif role is ACT:
@@ -2566,7 +2543,6 @@ class KFp8StaticTensor(QuantKeyScheme):
                 (shapes.num_partitions,),
                 torch.float32,
                 PerTensorScaleParameter,
-                wl,
                 init=FP8_SCALE_SENTINEL,
             )
         else:
@@ -2612,7 +2588,7 @@ class KFp8StaticChannel(QuantKeyScheme):
 
     key = kFp8StaticTokenSym
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not WEIGHT:
             self.reject(role)
         self.register_params(
@@ -2621,7 +2597,6 @@ class KFp8StaticChannel(QuantKeyScheme):
             (shapes.output_size_per_partition, shapes.input_size_per_partition),
             torch.float8_e4m3fn,
             ModelWeightParameter,
-            wl,
             input_dim=1,
             output_dim=0,
         )
@@ -2631,7 +2606,6 @@ class KFp8StaticChannel(QuantKeyScheme):
             (shapes.output_size_per_partition,),
             torch.float32,
             ChannelQuantScaleParameter,
-            wl,
             output_dim=0,
             init=FP8_SCALE_SENTINEL,
         )
@@ -2655,7 +2629,7 @@ class KFp8Block128(QuantKeyScheme):
 
     key = kFp8Static128BlockSym
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not WEIGHT:
             self.reject(role)
         out = shapes.output_size_per_partition
@@ -2673,7 +2647,6 @@ class KFp8Block128(QuantKeyScheme):
             (out, in_),
             torch.float8_e4m3fn,
             ModelWeightParameter,
-            wl,
             input_dim=1,
             output_dim=0,
         )
@@ -2684,7 +2657,6 @@ class KFp8Block128(QuantKeyScheme):
             (ob, 1, ib, 1),
             torch.float32,
             BlockQuantScaleParameter,
-            wl,
             input_dim=2,
             output_dim=0,
             init=FP8_SCALE_SENTINEL,
@@ -2711,7 +2683,7 @@ class KMxfp8Static(QuantKeyScheme):
     key = kMxfp8Static
 
     @staticmethod
-    def get_scale_weight_loader(weight_loader: Callable, ctx: CkptCtx) -> Callable:
+    def get_scale_weight_loader(ctx: CkptCtx) -> Callable | None:
         block_rows, block_cols = ctx.scale_block_size or (1, MXFP8_BLOCK_SIZE)
         if block_rows < 1 or block_cols != MXFP8_BLOCK_SIZE:
             raise NotImplementedError(
@@ -2723,11 +2695,11 @@ class KMxfp8Static(QuantKeyScheme):
             loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
                 block_rows, dim=0
             )
-            return weight_loader(param, loaded_weight, *args, **kwargs)
+            default_weight_loader(param, loaded_weight)
 
-        return scaled_loader if block_rows > 1 else weight_loader
+        return scaled_loader if block_rows > 1 else None
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not WEIGHT:
             self.reject(role)
         if shapes.input_size_per_partition % MXFP8_BLOCK_SIZE != 0:
@@ -2741,11 +2713,10 @@ class KMxfp8Static(QuantKeyScheme):
             (shapes.output_size_per_partition, shapes.input_size_per_partition),
             MXFP8_VALUE_DTYPE,
             ModelWeightParameter,
-            wl,
             input_dim=1,
             output_dim=0,
         )
-        scale_loader = self.get_scale_weight_loader(wl, ctx)
+        scale_loader = self.get_scale_weight_loader(ctx)
         self.register_params(
             layer,
             "weight_scale",
@@ -2755,7 +2726,7 @@ class KMxfp8Static(QuantKeyScheme):
             ),
             MXFP8_SCALE_DTYPE,
             ModelWeightParameter,
-            scale_loader,
+            loader=scale_loader,
             input_dim=1,
             output_dim=0,
         )
@@ -2788,7 +2759,7 @@ class KInt8Static(QuantKeyScheme):
 
     key = kInt8Static
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not WEIGHT:
             self.reject(role)
         out, in_ = shapes.output_size_per_partition, shapes.input_size_per_partition
@@ -2803,7 +2774,7 @@ class KInt8Static(QuantKeyScheme):
             if loaded_weight.dtype != torch.int8:
                 raise ValueError(f"expected an int8 weight, got {loaded_weight.dtype}")
             packed = loaded_weight.contiguous().view(torch.uint8) ^ 0x80
-            return wl(param, packed.view(torch.int32), *args, **kwargs)
+            default_weight_loader(param, packed.view(torch.int32))
 
         self.register_params(
             layer,
@@ -2811,7 +2782,7 @@ class KInt8Static(QuantKeyScheme):
             (out, in_ // 4),
             torch.int32,
             PackedvLLMParameter,
-            weight_loader,
+            loader=weight_loader,
             input_dim=1,
             output_dim=0,
             packed_dim=1,
@@ -2824,7 +2795,6 @@ class KInt8Static(QuantKeyScheme):
             (out, in_ // group_size),
             shapes.params_dtype,
             GroupQuantScaleParameter,
-            wl,
             input_dim=1,
             output_dim=0,
             init=float("nan"),
@@ -2847,7 +2817,7 @@ class KDynamicNoParam(QuantKeyScheme):
     non-None activation key. Activation-role only. Serves the fp8 per-token, fp8
     per-block, and mxfp8 dynamic activation keys."""
 
-    def create_weights(self, layer, role, ctx, shapes, wl) -> None:
+    def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not ACT:
             self.reject(role)
         # dynamic -> nothing stored
@@ -2945,7 +2915,7 @@ class FormatScheme:
     `ModelOptLinearMethod` itself.
     """
 
-    def extra_weights(self, layer, shapes: "Shapes", ctx: CkptCtx, wl) -> None:
+    def extra_weights(self, layer, shapes: "Shapes", ctx: CkptCtx) -> None:
         """Register format-level params (after the key schemes' weights)."""
 
     def kernel_weight_shape(self, layer) -> tuple[int, int]:
@@ -3016,11 +2986,9 @@ class _DropInputScale(FormatScheme):
     Kept for backward compat with previously-exported ModelOpt checkpoints.
     """
 
-    def extra_weights(self, layer, shapes, ctx, wl) -> None:
+    def extra_weights(self, layer, shapes, ctx) -> None:
         data = torch.full((shapes.num_partitions,), torch.nan)
-        layer.register_parameter(
-            "input_scale", PerTensorScaleParameter(data=data, weight_loader=wl)
-        )
+        layer.register_parameter("input_scale", PerTensorScaleParameter(data=data))
 
     def post_process(self, layer) -> None:
         scale = getattr(layer, "input_scale", None)
@@ -3038,16 +3006,11 @@ class _DropInputScale(FormatScheme):
 _DROP_INPUT_SCALE = _DropInputScale()
 
 
-@register_weight_loader_v2_supported_method
 class ModelOptLinearMethod(LinearMethodBase):
     """Generic, format-agnostic ModelOpt linear method. Holds a weight scheme +
     an activation scheme (from the QuantSpec pair) and an optional
     `FormatScheme`, runs a fixed lifecycle, selects the kernel from the pair,
     and applies.
-
-    Registered for weight_loader_v2 (like every ModelOpt linear method) so the
-    `BasevLLMParameter` params route through the v2 fused loader, not the
-    legacy shape-assert path.
     """
 
     def __init__(
@@ -3107,16 +3070,15 @@ class ModelOptLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ) -> None:
         del input_size, output_size
-        weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = sum(output_partition_sizes)
         shapes = Shapes(output_partition_sizes, input_size_per_partition, params_dtype)
 
-        self.wkey.create_weights(layer, WEIGHT, self.ctx, shapes, weight_loader)
+        self.wkey.create_weights(layer, WEIGHT, self.ctx, shapes)
         if self.akey:
-            self.akey.create_weights(layer, ACT, self.ctx, shapes, weight_loader)
-        self.fmt.extra_weights(layer, shapes, self.ctx, weight_loader)
+            self.akey.create_weights(layer, ACT, self.ctx, shapes)
+        self.fmt.extra_weights(layer, shapes, self.ctx)
 
         rt = RuntimeDtypes(self.input_dtype, self.out_dtype)
         self.kernel = select_linear_kernel(
@@ -3261,9 +3223,8 @@ def resolve(algo: str, subcfg, prefix: str):
 #
 #     LINEAR_METHOD_BUILDERS["FOO"] = lambda cfg, prefix: ModelOptFooLinearMethod(cfg)
 #
-# Keep the ModelOpt* class-name prefix and decorate the class with
-# @register_weight_loader_v2_supported_method if it uses BasevLLMParameter
-# params. Also add the algo to the owning config's quant_method validation.
+# Keep the ModelOpt* class-name prefix. Also add the algo to the owning
+# config's quant_method validation.
 LINEAR_METHOD_BUILDERS: dict[str, Callable[..., LinearMethodBase]] = {}
 
 

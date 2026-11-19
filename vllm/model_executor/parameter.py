@@ -30,36 +30,14 @@ logger = init_logger(__name__)
 
 
 class BasevLLMParameter(Parameter):
-    """Base parameter for vLLM linear layers. Extends the torch.nn.parameter
-    by taking in a linear weight loader. Will copy the loaded weight
-    into the parameter when the provided weight loader is called.
-    """
+    """Base parameter for vLLM linear layers. A `weight_loader` assigned to it
+    is the param-level load hook `ops_loader` calls."""
 
     def __new__(cls, data: torch.Tensor | None, **kwargs):
         return super().__new__(cls, data=data, requires_grad=False)
 
-    def __init__(self, data: torch.Tensor, weight_loader: Callable | None = None):
-        """Initialize the BasevLLMParameter.
-
-        Args:
-            data: torch tensor with the parameter data
-            weight_loader: weight loader callable
-
-        """
-        # During weight loading, we often do something like:
-        # narrowed_tensor = param.data.narrow(0, offset, len)
-        # narrowed_tensor.copy_(real_weight)
-        # expecting narrowed_tensor and param.data to share the same storage.
-        # However, on TPUs, narrowed_tensor will lazily propagate to the base
-        # tensor, which is param.data, leading to the redundant memory usage.
-        # This sometimes causes OOM errors during model loading. To avoid this,
-        # we sync the param tensor after its weight loader is called.
-        from vllm.platforms import current_platform
-
-        if current_platform.use_sync_weight_loader():
-            weight_loader = current_platform.make_synced_weight_loader(weight_loader)
-
-        self._weight_loader = weight_loader
+    def __init__(self, data: torch.Tensor):
+        self._weight_loader: Callable | None = None
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -265,17 +243,12 @@ class SharedWeightParameter(BasevLLMParameter):
     def __new__(cls, **kwargs):
         return super().__new__(cls, data=None, **kwargs)
 
-    def __init__(self, input_dim: int = 1, output_dim: int = 0, **kwargs):
-        weight_loader: Callable = kwargs.get("weight_loader")  # type: ignore[assignment]
-        super().__init__(data=None, weight_loader=weight_loader)
+    def __init__(self, input_dim: int = 1, output_dim: int = 0):
+        super().__init__(data=None)
 
         self.local_tensors = set()
         self.partitions = {}
-        self.kwargs = {
-            "input_dim": input_dim,
-            "output_dim": output_dim,
-            "weight_loader": self._fake_weight_loader,
-        }
+        self.kwargs = {"input_dim": input_dim, "output_dim": output_dim}
 
         if self.tp_size > 1:
             raise NotImplementedError(
@@ -302,7 +275,9 @@ class SharedWeightParameter(BasevLLMParameter):
             data = self.tensors_registry[data_key]
 
         # create associated model parameter
-        self.partitions[index] = ModelWeightParameter(data=data, **self.kwargs)  # type: ignore[arg-type]
+        partition = ModelWeightParameter(data=data, **self.kwargs)  # type: ignore[arg-type]
+        partition.weight_loader = self._fake_weight_loader
+        self.partitions[index] = partition
 
         # hold local reference, since ModelWeightParameter does not
         # see https://github.com/pytorch/pytorch/issues/75932

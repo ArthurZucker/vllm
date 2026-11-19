@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 
 import torch
 
@@ -144,7 +143,6 @@ class QuarkW8A8Fp8(QuarkScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -159,7 +157,6 @@ class QuarkW8A8Fp8(QuarkScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 
@@ -170,13 +167,11 @@ class QuarkW8A8Fp8(QuarkScheme):
             weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty((sum(output_partition_sizes)), dtype=torch.float32),
                 output_dim=0,
-                weight_loader=weight_loader,
             )
         else:
             assert self.weight_qscheme == "per_tensor"
             weight_scale = PerTensorScaleParameter(
                 data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
             )
 
         # min requirement for fp8 kernels
@@ -187,7 +182,6 @@ class QuarkW8A8Fp8(QuarkScheme):
         if self.is_static_input_scheme:
             input_scale = PerTensorScaleParameter(
                 data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
             )
             input_scale[:] = torch.finfo(torch.float32).min
             layer.register_parameter("input_scale", input_scale)
@@ -250,7 +244,6 @@ class QuarkW8A8Fp8PerBlock(QuarkScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         input_size = kwargs.get("input_size", input_size_per_partition)
@@ -275,7 +268,6 @@ class QuarkW8A8Fp8PerBlock(QuarkScheme):
         weight = create_fp8_weight_parameter(
             output_size_per_partition,
             input_size_per_partition,
-            weight_loader,
         )
         layer.register_parameter("weight", weight)
 
@@ -289,7 +281,6 @@ class QuarkW8A8Fp8PerBlock(QuarkScheme):
             output_partition_sizes,
             input_size_per_partition,
             self.weight_block_size,
-            weight_loader,
             scale_dtype=scale_dtype,
         )
         # Match Quark-exported checkpoints (``.weight_scale``).

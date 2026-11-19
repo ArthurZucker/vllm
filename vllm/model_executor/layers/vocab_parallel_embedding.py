@@ -370,7 +370,6 @@ class VocabParallelEmbedding(PluggableLayer):
             self.input_size,
             self.output_size,
             params_dtype=params_dtype,
-            weight_loader=None,
         )
         self.update_param_tp_status()
 
@@ -482,7 +481,6 @@ class VocabParallelEmbedding(PluggableLayer):
         ret = base_embeddings + added_embeddings + padding
         assert len(ret) == self.num_embeddings_padded
         return ret
-
 
     def forward(self, input_):
         """Look up IDs, optionally reducing contributions from vocabulary shards."""

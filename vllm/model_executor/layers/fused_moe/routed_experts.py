@@ -210,7 +210,7 @@ class RoutedExperts(PluggableLayer):
 
         loader = self.shared_expert_online_loader
         if loader is not None and loader.stages_shared_experts:
-            loader.create_staging(self, params_dtype, weight_loader=None)
+            loader.create_staging(self, params_dtype)
 
         self.lora_base_layer_prefix = ""
         self._flag_padding_for_reload()
@@ -753,6 +753,3 @@ class RoutedExperts(PluggableLayer):
         **kwargs,
     ) -> torch.Tensor:
         raise AssertionError("Call forward_modular or forward_monolithic instead.")
-
-
-# Mark the RoutedExperts weight_loader as supporting MoE-specific parameters

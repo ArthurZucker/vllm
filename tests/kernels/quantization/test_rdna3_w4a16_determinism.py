@@ -116,7 +116,6 @@ def _build_layer(k, n, seed, dtype, group=GROUP):
     q_int4_kn = torch.randint(0, 16, (k, n), dtype=torch.int32)
     scales_gn = (torch.randn(k // group, n) * 0.01 + 0.02).to(dtype)
     qweight = pack_quantized_values_into_int32(q_int4_kn, WEIGHT_TYPE, packed_dim=0)
-    no_loader = lambda *a, **kw: None  # noqa: E731
 
     class DummyLayer(torch.nn.Module):
         pass
@@ -126,7 +125,6 @@ def _build_layer(k, n, seed, dtype, group=GROUP):
         "qweight",
         PackedvLLMParameter(
             data=qweight,
-            weight_loader=no_loader,
             input_dim=0,
             output_dim=1,
             packed_dim=0,
@@ -135,9 +133,7 @@ def _build_layer(k, n, seed, dtype, group=GROUP):
     )
     layer.register_parameter(
         "scales",
-        GroupQuantScaleParameter(
-            data=scales_gn, weight_loader=no_loader, input_dim=0, output_dim=1
-        ),
+        GroupQuantScaleParameter(data=scales_gn, input_dim=0, output_dim=1),
     )
     layer.to(device)
     return layer, q_int4_kn, scales_gn

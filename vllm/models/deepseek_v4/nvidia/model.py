@@ -3,7 +3,6 @@
 import typing
 from itertools import islice
 
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -58,7 +57,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -1106,52 +1104,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
 
 
-def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
-        # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant (LoRA-wrapped experts).
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale",
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant of the above.
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale_inv",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "hc_head": "model.hc_head",
-            "mtp.": "model.mtp.",
-        },
-        orig_to_new_regex=scale_regex,
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-        },
-        orig_to_new_substr={
-            ".shared_experts.w2": ".shared_experts.down_proj",
-            "mtp.": None,
-        },
-    )
-
-
 class DeepseekV4MixtureOfExperts(MixtureOfExperts):
     moe_mlp_layers: list["DeepseekV4MoE"]
 
@@ -1198,10 +1150,6 @@ class DeepseekV4ForCausalLM(
 ):
     model_cls = DeepseekV4Model
 
-    # Default mapper assumes the original FP4-expert checkpoint layout.
-    # Overridden per-instance in __init__ when expert_dtype != "fp4".
-    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
-
     packed_modules_mapping = {
         "gate_up_proj": ["w1", "w3"],
         "fused_wqa_wkv": ["wq_a", "wkv"],
@@ -1216,9 +1164,6 @@ class DeepseekV4ForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
-        if expert_dtype != "fp4":
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

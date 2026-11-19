@@ -5,7 +5,6 @@ from collections.abc import Callable
 from functools import partial
 from itertools import islice
 
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -57,7 +56,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -1654,63 +1652,6 @@ def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
     return "weight_scale" if use_mxfp8 else "weight_scale_inv"
 
 
-def _make_deepseek_v4_weights_mapper(
-    expert_dtype: str, linear_scale_name: str = "weight_scale_inv"
-) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). Linear scales use the
-        # parameter name registered by their quantization method.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant (LoRA-wrapped experts).
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale",
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            # The ``embed.weight`` -> ``embed_tokens.weight`` suffix rule
-            # renames the engram fp8 table but not its scale; route the
-            # scale explicitly to the same module.
-            re.compile(r"(engram\.embed)\.scale$"): r"\1_tokens.weight_scale_inv",
-            re.compile(r"\.scale$"): f".{linear_scale_name}",
-        }
-    else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant of the above.
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale_inv",
-            # Same engram reroute as the fp4 branch above.
-            re.compile(r"(engram\.embed)\.scale$"): r"\1_tokens.weight_scale_inv",
-            re.compile(r"\.scale$"): f".{linear_scale_name}",
-        }
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "mtp.": "model.mtp.",
-        },
-        orig_to_new_regex=scale_regex,
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-        },
-        orig_to_new_substr={
-            ".shared_experts.w2": ".shared_experts.down_proj",
-            "mtp.": None,
-            # The v4.1 checkpoint declares the VL arch even for text-only
-            # use; the text backbone drops the vision-tower weights.
-            "vision.": None,
-            "aligner.": None,
-            "image_": None,
-        },
-    )
-
-
 class DeepseekV41LLMForCausalLM(
     nn.Module,
     SupportsPP,
@@ -1719,10 +1660,6 @@ class DeepseekV41LLMForCausalLM(
     DeepseekV4MixtureOfExperts,
 ):
     model_cls = DeepseekV4Model
-
-    # Default mapper assumes the original FP4-expert checkpoint layout.
-    # Overridden per-instance in __init__ when expert_dtype != "fp4".
-    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
 
     packed_modules_mapping = {
         "gate_up_proj": ["w1", "w3"],
@@ -1745,9 +1682,8 @@ class DeepseekV41LLMForCausalLM(
         # SM80 and SM90 record the metadata builds of FULL decode steps.
         self.records_decode_metadata = records_decode_metadata(vllm_config)
         expert_dtype = getattr(config, "expert_dtype", "fp4")
-        self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
-            expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
-        )
+        # read by its checkpoint's conversion mapping (`.scale` tensors)
+        self.linear_scale_name = _linear_scale_param_name(vllm_config, expert_dtype)
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

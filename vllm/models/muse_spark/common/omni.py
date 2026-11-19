@@ -7,7 +7,6 @@ import math
 from copy import copy
 from typing import TYPE_CHECKING, cast
 
-import regex as re
 import torch
 from torch import nn
 
@@ -23,7 +22,6 @@ from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -43,97 +41,6 @@ from .processor import (
 from .vision import NaViT, get_navit_patch_count, get_navit_video_patch_count
 
 logger = init_logger(__name__)
-
-
-OMNI_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_regex={
-        re.compile(pattern): replacement
-        for pattern, replacement in {
-            r"^model\.language_model\.": "model.",
-            r"^(model\.layers\.\d+)\.input_layernorm\.": (
-                r"\1.self_attn.pre_qkv_proj_norm."
-            ),
-            r"^(model\.layers\.\d+)\.post_attention_residual_gate\.": (r"\1.add_attn."),
-            r"^(model\.layers\.\d+)\.post_feedforward_residual_gate\.": (
-                r"\1.add_ffn."
-            ),
-            r"^(model\.layers\.\d+)\.pre_feedforward_layernorm\.": (
-                r"\1.pre_ffn_norm."
-            ),
-            r"^(model\.layers\.\d+)\.post_feedforward_layernorm\.": (
-                r"\1.post_ffn_norm."
-            ),
-            r"^(model\.layers\.\d+)\.mlp\.experts\.post_expert_norm\.": (
-                r"\1.feed_forward.post_expert_norm."
-            ),
-            r"^(model\.layers\.\d+)\.mlp\.gate\.e_score_correction_bias$": (
-                r"\1.feed_forward.expert_bias"
-            ),
-            r"^(model\.layers\.\d+)\.mlp\.gate\.": r"\1.feed_forward.router.",
-            r"^(model\.layers\.\d+)\.mlp\.pre_expert_proj\.": (
-                r"\1.feed_forward.pooler."
-            ),
-            r"^(model\.layers\.\d+)\.mlp\.post_expert_proj\.": (
-                r"\1.feed_forward.unpooler."
-            ),
-            r"^(model\.layers\.\d+)\.mlp\.": r"\1.feed_forward.",
-            r"\.experts\.gate_up_proj_input_scale$": (".experts.w13_input_scale"),
-            r"\.experts\.gate_up_proj_weight_scale_2$": (".experts.w13_weight_scale_2"),
-            r"\.experts\.gate_up_proj_weight_scale$": (".experts.w13_weight_scale"),
-            r"\.experts\.down_proj_input_scale$": ".experts.w2_input_scale",
-            r"\.experts\.down_proj_weight_scale_2$": (".experts.w2_weight_scale_2"),
-            r"\.experts\.down_proj_weight_scale$": ".experts.w2_weight_scale",
-            r"\.experts\.gate_up_proj$": ".experts.w13_weight",
-            r"\.experts\.down_proj$": ".experts.w2_weight",
-            r"^model\.vision_adapter\.fc1\.": "vision_model.adapter.c_fc.",
-            r"^model\.vision_adapter\.fc2\.": "vision_model.adapter.c_proj.",
-            r"^model\.vision_tower\.patch_embedder\.patch_embedding\.": (
-                "vision_model.conv1_linear."
-            ),
-            (
-                r"^model\.vision_tower\.patch_embedder\."
-                r"position_embedding_table\.weight$"
-            ): "vision_model.positional_embedding_vlm",
-            r"^model\.vision_tower\.layers\.": "vision_model.encoder.layers.",
-            r"^model\.vision_tower\.": "vision_model.",
-            r"^model\.vision_projection\.": "vision_projection.",
-            r"^(vision_model\.encoder\.layers\.\d+)\.attn\.proj\.": (
-                r"\1.attn.out_proj."
-            ),
-            r"^(vision_model\.encoder\.layers\.\d+)\.norm1\.": r"\1.ln_1.",
-            r"^(vision_model\.encoder\.layers\.\d+)\.norm2\.": r"\1.ln_2.",
-            r"^(vision_model\.encoder\.layers\.\d+)\.mlp\.fc1\.": r"\1.mlp.c_fc.",
-            r"^(vision_model\.encoder\.layers\.\d+)\.mlp\.fc2\.": r"\1.mlp.c_proj.",
-            **{
-                rf"^model\.audio_tower\.layers\.(\d+)\.conv_blocks\.{block}\.": (
-                    rf"audio_encoder.stages.\1.{block + 1}."
-                )
-                for block in range(2)
-            },
-            r"^(audio_encoder\.stages\.\d+\.\d+)\.conv\.": r"\1.conv.conv.",
-            r"^(audio_encoder\.stages\.\d+\.\d+)\.mlp\.fc1\.": r"\1.linear1.",
-            r"^(audio_encoder\.stages\.\d+\.\d+)\.mlp\.fc2\.": r"\1.linear2.",
-            r"^model\.audio_tower\.layers\.(\d+)\.patch_embedder\.norm\.": (
-                r"audio_encoder.stages.\1.0.norm."
-            ),
-            r"^model\.audio_tower\.layers\.(\d+)\.patch_embedder\.proj\.": (
-                r"audio_encoder.stages.\1.0.linear."
-            ),
-            r"^model\.audio_tower\.post_proj_norm\.": "audio_encoder.dual_norm.",
-            r"^model\.audio_tower\.proj\.": "audio_encoder.o_proj.",
-            r"^model\.audio_tower\.norm\.": "audio_encoder.norm.",
-        }.items()
-    },
-    orig_to_new_stacked={
-        ".self_attn.q_proj.": (".self_attn.qkv_proj.", "q"),
-        ".self_attn.k_proj.": (".self_attn.qkv_proj.", "k"),
-        ".self_attn.v_proj.": (".self_attn.qkv_proj.", "v"),
-        ".self_attn.gate_proj.": (".self_attn.qkv_proj.", "o_gate"),
-        ".attn.q_proj.": (".attn.qkv_proj.", "q"),
-        ".attn.k_proj.": (".attn.qkv_proj.", "k"),
-        ".attn.v_proj.": (".attn.qkv_proj.", "v"),
-    },
-)
 
 
 def register_omni_processor(cls: type) -> type:
@@ -549,4 +456,4 @@ class MuseSparkOmniMixin:
         )
 
 
-__all__ = ["OMNI_WEIGHTS_MAPPER", "MuseSparkOmniMixin", "register_omni_processor"]
+__all__ = ["MuseSparkOmniMixin", "register_omni_processor"]

@@ -22,7 +22,6 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -440,34 +439,12 @@ class K3DSparkForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
-    hf_to_vllm_mapper = WeightsMapper(
-        # confidence_head is training-only. The frozen target embedding and LM
-        # head are shared after this draft-specific checkpoint is loaded.
-        orig_to_new_substr={
-            "confidence_head": None,
-            "embed_tokens": None,
-            "lm_head": None,
-        },
-        orig_to_new_prefix={"": "model."},
-        orig_to_new_stacked={
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-            ".q_a_proj": (".fused_qkv_a_proj", 0),
-            ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        if getattr(self.config, "enable_confidence_head", False):
-            # The class mapper drops the head as training-only; keep it for drafts
-            # that actually built one, since adaptive verification reads it.
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_substr={"confidence_head": "confidence_head"}
-            )
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = K3DSparkModel(
             vllm_config=vllm_config,

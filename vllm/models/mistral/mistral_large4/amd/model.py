@@ -6,8 +6,7 @@ The text model is hosted by `PixtralForConditionalGeneration` for the
 multimodal checkpoint.
 """
 
-from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import regex as re
 import torch
@@ -15,18 +14,12 @@ from torch import nn
 from transformers import PreTrainedConfig
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
-)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
 )
 from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
 from vllm.model_executor.models.utils import (
@@ -345,6 +338,7 @@ _QUANT_CONFIG_NAME_MAP: list[tuple[str, str]] = [
     ),
 ]
 
+
 def _to_vllm_weight_name(name: str) -> str:
     for pattern, repl in _CHECKPOINT_NAME_MAP:
         name = re.sub(pattern, repl, name)
@@ -414,4 +408,3 @@ class MistralLarge4ForCausalLM(nn.Module, SupportsEagle3):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-

@@ -53,7 +53,6 @@ class INCMxfp8LinearScheme(INCLinearScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=extra_weight_attrs.get("weight_loader"),
         )
         layer.register_parameter("weight", weight)
 
@@ -65,7 +64,6 @@ class INCMxfp8LinearScheme(INCLinearScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=extra_weight_attrs.get("weight_loader"),
         )
         layer.register_parameter("weight_scale", weight_scale)
 

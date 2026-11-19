@@ -1075,7 +1075,6 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
-        weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,
@@ -1083,7 +1082,6 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
             output_partition_sizes=output_partition_sizes,
             output_size=output_size,
             params_dtype=params_dtype,
-            weight_loader=weight_loader,
         )
         self.supports_pre_processed_weights = (
             layer.scheme.supports_pre_processed_weights

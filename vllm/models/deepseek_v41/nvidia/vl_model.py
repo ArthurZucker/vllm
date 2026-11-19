@@ -32,7 +32,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
@@ -56,8 +55,6 @@ from ..common.vl_cudagraph import DeepseekV4VLEncoderCudaGraphMixin
 from ..decoder_replay_layers import DecoderReplayLayers
 from .model import (
     DeepseekV41LLMForCausalLM,
-    _linear_scale_param_name,
-    _make_deepseek_v4_weights_mapper,
 )
 
 
@@ -80,35 +77,6 @@ class DeepseekV4VLImagePixelInputs(TensorSchema):
     # [n_llm_h, n_llm_w] per image
     llm_grid: Annotated[torch.Tensor, TensorShape("ni", 2)]
     types: Annotated[torch.Tensor, TensorShape("ns", dynamic_dims={"ns"})]
-
-
-def _make_deepseek_v4_vl_weights_mapper(
-    expert_dtype: str, linear_scale_name: str
-) -> WeightsMapper:
-    """Text-checkpoint mapping rules re-rooted under `language_model.`."""
-    base = _make_deepseek_v4_weights_mapper(expert_dtype, linear_scale_name)
-    orig_to_new_prefix: dict[str, str | None] = {
-        "layers.": "language_model.model.layers.",
-        "embed.": "language_model.model.embed.",
-        "norm.": "language_model.model.norm.",
-        "hc_head": "language_model.model.hc_head",
-        "mtp.": "language_model.model.mtp.",
-    }
-    return WeightsMapper(
-        orig_to_new_prefix=orig_to_new_prefix,
-        orig_to_new_regex=base.orig_to_new_regex,
-        orig_to_new_suffix={
-            "head.weight": "language_model.lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-        },
-        orig_to_new_substr={
-            ".shared_experts.w2": ".shared_experts.down_proj",
-            # The MTP/DSpark draft heads are not supported for the vision
-            # variant; drop their weights.
-            "mtp.": None,
-        },
-    )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -189,20 +157,8 @@ class DeepseekV41ForCausalLM(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
-        # The outer mapper (see load_weights) fully resolves HF names into
-        # this wrapper's namespace before AutoWeightsLoader strips the
-        # "language_model." prefix and delegates to the child's load_weights,
-        # so the child's own mapper must be a no-op. Its suffix rules are not
-        # idempotent (e.g. "lm_head.weight".endswith("head.weight") would
-        # re-fire "head.weight" -> "lm_head.weight").
-        self.language_model.hf_to_vllm_mapper = WeightsMapper()
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
-        )
-
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
-        self.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
-            expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )
 
     def _parse_and_validate_image_input(

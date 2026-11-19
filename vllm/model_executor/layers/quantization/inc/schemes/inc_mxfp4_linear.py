@@ -57,7 +57,6 @@ class INCMxfp4LinearMethod(INCLinearScheme):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.params_dtype = params_dtype
-        weight_loader = extra_weight_attrs.get("weight_loader")
 
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -67,7 +66,6 @@ class INCMxfp4LinearMethod(INCLinearScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight_packed", weight)
 
@@ -79,7 +77,6 @@ class INCMxfp4LinearMethod(INCLinearScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
 

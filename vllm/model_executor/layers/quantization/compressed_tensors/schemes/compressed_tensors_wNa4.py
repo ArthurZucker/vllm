@@ -9,7 +9,6 @@ Static, per-tensor, and asymmetric activation quantization are not supported.
 """
 
 import math
-from collections.abc import Callable
 from fractions import Fraction
 
 import torch
@@ -139,7 +138,6 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -188,7 +186,6 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
                 output_dim=0,
                 packed_factor=self.pack_factor,
                 packed_dim=1,
-                weight_loader=weight_loader,
                 data=torch.empty(
                     output_size_per_partition,
                     packed_input_dim,
@@ -205,13 +202,11 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
                 data=scale_data,
                 output_dim=0,
                 input_dim=1,
-                weight_loader=weight_loader,
             )
         else:
             weight_scale = ChannelQuantScaleParameter(
                 data=scale_data,
                 output_dim=0,
-                weight_loader=weight_loader,
             )
         layer.register_parameter("weight_scale", weight_scale)
 
@@ -229,7 +224,6 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
                     output_dim=0,
                     packed_dim=0,
                     packed_factor=self.pack_factor,
-                    weight_loader=weight_loader,
                     data=zeros_data,
                 )
             else:
@@ -238,7 +232,6 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
                     output_dim=0,
                     packed_dim=0,
                     packed_factor=self.pack_factor,
-                    weight_loader=weight_loader,
                     data=zeros_data,
                 )
             layer.register_parameter("weight_zero_point", qzeros)
@@ -247,7 +240,6 @@ class CompressedTensorsWNA4Int(CompressedTensorsScheme):
             "weight_shape",
             BasevLLMParameter(
                 data=torch.empty(2, dtype=torch.int64),
-                weight_loader=weight_loader,
             ),
         )
 

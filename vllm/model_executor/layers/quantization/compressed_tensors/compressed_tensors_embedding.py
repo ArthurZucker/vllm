@@ -112,7 +112,6 @@ class CompressedTensorsEmbeddingWNA16Int(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        weight_loader = extra_weight_attrs["weight_loader"]
         # Embedding weight is [num_embeddings(vocab), embedding_dim(hidden)];
         # vocab is the output (partitioned) dim, hidden is the input dim.
         vocab_pp = sum(output_partition_sizes)
@@ -124,7 +123,6 @@ class CompressedTensorsEmbeddingWNA16Int(QuantizeMethodBase):
             output_dim=0,
             packed_dim=1,
             packed_factor=self.pack_factor,
-            weight_loader=weight_loader,
             data=torch.empty(vocab_pp, hidden // self.pack_factor, dtype=torch.int32),
         )
 
@@ -133,7 +131,6 @@ class CompressedTensorsEmbeddingWNA16Int(QuantizeMethodBase):
             weight_scale = GroupQuantScaleParameter(
                 output_dim=0,
                 input_dim=1,
-                weight_loader=weight_loader,
                 data=torch.empty(
                     vocab_pp, hidden // self.group_size, dtype=params_dtype
                 ),
@@ -141,13 +138,10 @@ class CompressedTensorsEmbeddingWNA16Int(QuantizeMethodBase):
         else:
             weight_scale = ChannelQuantScaleParameter(
                 output_dim=0,
-                weight_loader=weight_loader,
                 data=torch.empty(vocab_pp, 1, dtype=params_dtype),
             )
 
-        weight_shape = BasevLLMParameter(
-            data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
-        )
+        weight_shape = BasevLLMParameter(data=torch.empty(2, dtype=torch.int64))
 
         layer.register_parameter("weight_packed", weight_packed)
         layer.register_parameter("weight_scale", weight_scale)

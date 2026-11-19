@@ -198,8 +198,6 @@ class Mixer2RMSNormGated(CustomOp):
         return self.forward_cuda(x, gate)
 
 
-
-
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
 # --8<-- [start:mamba_mixer2]
 @PluggableLayer.register("mamba_mixer2")
@@ -251,7 +249,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         self.tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
 
         assert num_heads % self.tp_size == 0, (
             "Tensor parallel world size must divide num heads."

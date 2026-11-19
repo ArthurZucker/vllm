@@ -108,7 +108,6 @@ def _build_layer(
     dtype: torch.dtype,
 ) -> torch.nn.Module:
     """Build a dummy layer carrying GPTQ-format params, as the loader would."""
-    no_loader = lambda *args, **kwargs: None  # noqa: E731
 
     # qweight: int4 packed along K into int32 -> [K//8, N].
     qweight = pack_quantized_values_into_int32(q_int4_kn, WEIGHT_TYPE, packed_dim=0)
@@ -121,7 +120,6 @@ def _build_layer(
         "qweight",
         PackedvLLMParameter(
             data=qweight,
-            weight_loader=no_loader,
             input_dim=0,
             output_dim=1,
             packed_dim=0,
@@ -132,7 +130,6 @@ def _build_layer(
         "scales",
         GroupQuantScaleParameter(
             data=scales_gn.to(dtype),
-            weight_loader=no_loader,
             input_dim=0,
             output_dim=1,
         ),
@@ -144,7 +141,6 @@ def _build_layer(
             "qzeros",
             PackedvLLMParameter(
                 data=qzeros,
-                weight_loader=no_loader,
                 input_dim=0,
                 output_dim=1,
                 packed_dim=1,

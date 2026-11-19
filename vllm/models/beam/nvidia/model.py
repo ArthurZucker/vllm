@@ -19,7 +19,6 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 from vllm.model_executor.layers.fused_moe import MoERunner
@@ -38,7 +37,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -53,7 +51,7 @@ from .allreduce import (
     beam_allreduce_norm_residual_norm,
     beam_finalize_allreduce_norm_residual_norm,
 )
-from .attention import BeamAttention, use_merged_qkv_gate
+from .attention import BeamAttention
 from .layernorm import RMSNorm, beam_norm_residual_norm, beam_rms_norm
 from .moe import BeamMLP, BeamSparseMoeBlock
 
@@ -184,49 +182,9 @@ class BeamDecoderLayer(nn.Module):
 
 
 class BeamModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # Renamed so it cannot be matched as a `gate_up_proj` shard by
-            # `packed_modules_mapping` consumers such as LoRA.
-            ".self_attn.gate_proj": ".self_attn.output_gate_proj",
-        },
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-            # `.mlp.experts.N.gate_proj` does not contain `.mlp.gate_proj`, so
-            # expert weights fall through to `MoERunner.load_weights` (which is
-            # also what keeps them correct under EP and redundant experts).
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-        },
-    )
-
-    @classmethod
-    def get_weights_mapper(cls, config: BeamConfig, tp_size: int) -> WeightsMapper:
-        mapper = cls.hf_to_vllm_mapper
-        if not use_merged_qkv_gate(config, tp_size):
-            return mapper
-        return WeightsMapper(
-            orig_to_new_substr=mapper.orig_to_new_substr,
-            orig_to_new_stacked={
-                **mapper.orig_to_new_stacked,
-                **{
-                    f".self_attn.{name}": (".self_attn.qkv_gate_proj", shard)
-                    for shard, name in enumerate(
-                        ("q_proj", "k_proj", "v_proj", "output_gate_proj")
-                    )
-                },
-            },
-        )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
-        self.hf_to_vllm_mapper = self.get_weights_mapper(
-            config, get_tensor_model_parallel_world_size()
-        )
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 

@@ -5,7 +5,7 @@
 import functools
 import json
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -1376,7 +1376,6 @@ def validate_fp8_block_shape_moe(
 def create_fp8_weight_parameter(
     output_size_per_partition: int,
     input_size_per_partition: int,
-    weight_loader: Callable | None,
 ) -> torch.nn.Parameter:
     """Create FP8 weight parameter."""
     from vllm.model_executor.parameter import ModelWeightParameter
@@ -1389,7 +1388,6 @@ def create_fp8_weight_parameter(
         ),
         input_dim=1,
         output_dim=0,
-        weight_loader=weight_loader,
     )
 
 
@@ -1398,7 +1396,6 @@ def create_fp8_scale_parameter(
     output_partition_sizes: list[int],
     input_size_per_partition: int,
     block_size: list[int] | None,
-    weight_loader: Callable | None,
     scale_dtype: torch.dtype | None = None,
 ) -> torch.nn.Parameter:
     """Create scale parameter based on quantization strategy."""
@@ -1407,7 +1404,6 @@ def create_fp8_scale_parameter(
         scale = parameter_type(
             data=torch.empty((sum(output_partition_sizes), 1), dtype=dtype),
             output_dim=0,
-            weight_loader=weight_loader,
         )
     elif parameter_type == BlockQuantScaleParameter:
         assert block_size is not None
@@ -1421,12 +1417,10 @@ def create_fp8_scale_parameter(
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
     elif parameter_type == PerTensorScaleParameter:
         scale = parameter_type(
             data=torch.empty(len(output_partition_sizes), dtype=dtype),
-            weight_loader=weight_loader,
         )
     else:
         raise ValueError(f"Unknown parameter type: {parameter_type}")
@@ -1437,15 +1431,12 @@ def create_fp8_scale_parameter(
     return scale
 
 
-def create_fp8_input_scale(
-    output_partition_sizes: list[int], weight_loader: Callable | None
-) -> torch.nn.Parameter:
+def create_fp8_input_scale(output_partition_sizes: list[int]) -> torch.nn.Parameter:
     """Create input scale parameter for static activation quantization."""
     from vllm.model_executor.parameter import PerTensorScaleParameter
 
     scale = PerTensorScaleParameter(
         data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-        weight_loader=weight_loader,
     )
     scale[:] = torch.finfo(torch.float32).min
     return scale

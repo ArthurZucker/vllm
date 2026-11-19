@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
@@ -106,7 +105,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -129,7 +127,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
         # WEIGHT
         weight = create_fp8_weight_parameter(
-            output_size_per_partition, input_size_per_partition, weight_loader
+            output_size_per_partition, input_size_per_partition
         )
         layer.register_parameter("weight", weight)
 
@@ -139,13 +137,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             output_partition_sizes,
             input_size_per_partition,
             layer.weight_block_size,
-            weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
 
         # INPUT SCALE
         if self.is_static_input_scheme:
-            input_scale = create_fp8_input_scale(output_partition_sizes, weight_loader)
+            input_scale = create_fp8_input_scale(output_partition_sizes)
             layer.register_parameter("input_scale", input_scale)
 
         self.fp8_linear = init_fp8_linear_kernel(

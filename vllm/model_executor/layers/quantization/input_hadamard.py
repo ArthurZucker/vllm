@@ -15,9 +15,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
-    WEIGHT_LOADER_V2_SUPPORTED,
     LinearMethodBase,
-    register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -56,7 +54,6 @@ class InputHadamardFusable:
         raise NotImplementedError
 
 
-@register_weight_loader_v2_supported_method
 class InputHadamardLinearMethod(LinearMethodBase):
     """Wraps a linear method and rotates the layer input by an orthonormal
     block Hadamard matrix before the wrapped `apply`, in the manner of
@@ -98,10 +95,6 @@ class InputHadamardLinearMethod(LinearMethodBase):
                 f"Input size per partition {input_size_per_partition} is not "
                 f"divisible by the Hadamard size {self.size}."
             )
-        # This class is registered for weight_loader_v2; hand v1 to wrapped
-        # methods that are not, as CompressedTensorsLinearTransformMethod does.
-        if self.quant_method.__class__.__name__ not in WEIGHT_LOADER_V2_SUPPORTED:
-            extra_weight_attrs["weight_loader"] = layer.weight_loader
         self.quant_method.create_weights(
             layer,
             input_size_per_partition,

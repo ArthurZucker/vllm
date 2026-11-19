@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     is_layer_skipped,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import (
     is_weights_pre_processed,
     replace_parameter,
@@ -741,26 +742,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         return loaded_weight
 
     @staticmethod
-    def get_scale_weight_loader(weight_loader):
-        def mxfp4_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int,
-            return_success: bool = False,
-        ) -> bool | None:
-            loaded_weight = Mxfp4MoEMethod._encode_mxfp4_weight_scale(loaded_weight)
-            return weight_loader(
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-                return_success=return_success,
-            )
-
-        return mxfp4_weight_loader
+    def load_weight_scale(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
+        """The e8m0 scales stored as uint8, whatever dtype the checkpoint has."""
+        loaded_weight = Mxfp4MoEMethod._encode_mxfp4_weight_scale(loaded_weight)
+        default_weight_loader(param, loaded_weight)
 
     def create_weights(
         self,
@@ -780,8 +765,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
-        weight_loader = extra_weight_attrs.pop("weight_loader")
-        scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
+        scale_weight_loader = Mxfp4MoEMethod.load_weight_scale
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -795,7 +779,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
-        set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
 
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
@@ -823,7 +806,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
-        set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
@@ -850,7 +832,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
-            set_weight_attrs(w13_bias, {"weight_loader": weight_loader})
 
             w2_bias = torch.nn.Parameter(
                 torch.zeros(
@@ -862,7 +843,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
-            set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
 
     def _setup_kernel(
         self,

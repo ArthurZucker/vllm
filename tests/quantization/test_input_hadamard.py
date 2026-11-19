@@ -86,23 +86,15 @@ def _make_layer(
     rotate_weight: bool, input_size: int = 128, output_size: int = 16, size: int = 32
 ) -> tuple[torch.nn.Module, InputHadamardLinearMethod]:
     layer = torch.nn.Module()
-    layer.weight_loader = "v1"
     method = InputHadamardLinearMethod(_DenseOnlineMethod(), size, rotate_weight)
     method.create_weights(
-        layer,
-        input_size,
-        [output_size],
-        input_size,
-        output_size,
-        torch.float32,
-        weight_loader="v2",
+        layer, input_size, [output_size], input_size, output_size, torch.float32
     )
     return layer, method
 
 
 def test_rotates_weight_once_and_input_on_apply():
     layer, method = _make_layer(rotate_weight=True)
-    assert layer.weight.weight_loader == "v1", "wrapped v1 methods keep the v1 loader"
     assert not hasattr(layer, "input_rotation")
     set_random_seed(0)
     w = torch.randn(16, 128)
@@ -197,7 +189,6 @@ class _FusingMethod(_DenseOnlineMethod, InputHadamardFusable):
 
 def test_fused_rotation_is_skipped_by_the_wrapper():
     layer = torch.nn.Module()
-    layer.weight_loader = "v1"
     method = InputHadamardLinearMethod(_FusingMethod(), 32, rotate_weight=True)
     method.create_weights(layer, 128, [16], 128, 16, torch.float32)
     set_random_seed(0)

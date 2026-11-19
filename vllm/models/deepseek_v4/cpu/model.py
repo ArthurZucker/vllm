@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from itertools import islice
 
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -44,7 +43,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -625,62 +623,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return hidden_states
 
 
-def _make_deepseek_v4_weights_mapper(
-    expert_dtype: str, fuse_shared_experts: bool = False
-) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts register scales as ``w{1,2,3}_weight_scale`` (no
-        # _inv); FP8 linear/shared-expert scales register as
-        # ``weight_scale_inv``. Route DeepSeek-native ``.scale`` and
-        # AMD-Quark ``.weight_scale`` keys accordingly, leaving expert/
-        # shared-expert ``w{1,2,3}.weight_scale`` untouched for the MXFP4
-        # loader.
-        scale_regex = {
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-            re.compile(r"(?<!\.w[123])\.weight_scale$"): ".weight_scale_inv",
-        }
-    else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    # Fused shared experts are redirected to routed expert slots elsewhere;
-    # leave their names untouched here.
-    substr_map: dict[str, str | None] = (
-        {}
-        if fuse_shared_experts
-        else {".shared_experts.w2": ".shared_experts.down_proj"}
-    )
-    # No MTP support on CPU yet: drop mtp.* weights (no model.mtp submodule).
-    substr_map["mtp."] = None
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "hc_head": "model.hc_head",
-            "mtp.": "model.mtp.",
-        },
-        orig_to_new_regex=scale_regex,
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-            ".input_scale": ".input_scale_2",
-        },
-        orig_to_new_substr=substr_map,
-    )
-
-
 class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     model_cls = DeepseekV4Model
 
-    # Default mapper assumes the original FP4-expert checkpoint layout.
-    # Overridden per-instance in __init__ when expert_dtype != "fp4".
-    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
     packed_modules_mapping = {
         "gate_up_proj": ["w1", "w3"],
         "fused_wqa_wkv": ["wq_a", "wkv"],
@@ -691,15 +636,9 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        if expert_dtype != "fp4" or self.model.is_fused_shared_expert_enabled:
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
-                expert_dtype,
-                fuse_shared_experts=self.model.is_fused_shared_expert_enabled,
-            )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,

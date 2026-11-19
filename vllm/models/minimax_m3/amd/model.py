@@ -95,7 +95,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     get_fused_shared_expert_layers,
     init_vllm_registered_model,
@@ -2044,23 +2043,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "mtp.": None,
-            # ModelOpt MXFP8 layers name the checkpoint's block scales this way.
-            "weight_scale_inv": "weight_scale",
-        },
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".index_q_proj": (".qkv_proj", "index_q"),
-            ".index_k_proj": (".qkv_proj", "index_k"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

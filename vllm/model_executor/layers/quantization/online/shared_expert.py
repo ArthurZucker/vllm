@@ -121,7 +121,6 @@ class OnlineSharedExpertLoader:
         self,
         layer: torch.nn.Module,
         params_dtype: torch.dtype,
-        **extra_weight_attrs,
     ) -> None:
         """Create parameters holding the fused shared experts as stored.
 
@@ -164,7 +163,7 @@ class OnlineSharedExpertLoader:
                 torch.empty(shape, dtype=dtype), requires_grad=False
             )
             layer.register_parameter(name, param)
-            set_weight_attrs(param, extra_weight_attrs | attrs)
+            set_weight_attrs(param, attrs)
             self.staging_parameters[name] = param
 
         w13_rows = moe_config.w13_num_shards * intermediate_size

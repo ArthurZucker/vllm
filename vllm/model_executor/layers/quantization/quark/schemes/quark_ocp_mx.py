@@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp6E3M2Static,
     kMxfp8Static,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -130,7 +131,7 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 "open an issue."
             )
 
-    def _expanding_scale_loader(self, weight_loader: Callable) -> Callable:
+    def _expanding_scale_loader(self) -> Callable | None:
         """Expand a 2-D block scale to one row per weight row.
 
         A `block_size=[R, 32]` export carries one e8m0 value per R weight
@@ -138,7 +139,7 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
         coincide, so the loader is passed through untouched.
         """
         if self.scale_block_rows == 1:
-            return weight_loader
+            return None
 
         rows = self.scale_block_rows
 
@@ -146,7 +147,7 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
             loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
                 rows, dim=0
             )
-            return weight_loader(param, loaded_weight, *args, **kwargs)
+            default_weight_loader(param, loaded_weight)
 
         return expanding_loader
 
@@ -163,7 +164,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         if input_size_per_partition % OCP_MX_BLOCK_SIZE != 0:
@@ -191,7 +191,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
             )
             layer.register_parameter("weight", weight)
 
@@ -203,8 +202,9 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=self._expanding_scale_loader(weight_loader),
             )
+            if (scale_loader := self._expanding_scale_loader()) is not None:
+                weight_scale.weight_loader = scale_loader
             layer.register_parameter("weight_scale", weight_scale)
             layer.weight_block_size = [1, OCP_MX_BLOCK_SIZE]
         else:
@@ -222,7 +222,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 output_dim=0,
                 packed_dim=1,
                 packed_factor=self.packed_factor,
-                weight_loader=weight_loader,
             )
             layer.register_parameter("weight", weight)
 
@@ -235,7 +234,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
             )
             layer.register_parameter("weight_scale", weight_scale)
 

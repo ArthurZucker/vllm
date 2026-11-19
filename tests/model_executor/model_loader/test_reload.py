@@ -348,16 +348,16 @@ def _load_marlin_checkpoint_format_weights(layer):
         output_dim=1,
         packed_dim=0,
         packed_factor=8,
-        weight_loader=default_weight_loader,
     )
+    layer.qweight.weight_loader = default_weight_loader
     layer.scales = GroupQuantScaleParameter(
         data=torch.ones(
             _MARLIN_SIZE_K // _MARLIN_GROUP_SIZE, _MARLIN_SIZE_N, dtype=torch.float16
         ),
         input_dim=0,
         output_dim=1,
-        weight_loader=default_weight_loader,
     )
+    layer.scales.weight_loader = default_weight_loader
 
 
 def test_marlin_post_load_does_not_own_workspace(monkeypatch, dist_init):
@@ -1571,7 +1571,8 @@ def test_attention_post_load_reads_normalized_transform(dist_init):
 
     transform = HadamardTransform.__new__(HadamardTransform)
     torch.nn.Module.__init__(transform)
-    transform.weight = SharedWeightParameter(weight_loader=default_weight_loader)
+    transform.weight = SharedWeightParameter()
+    transform.weight.weight_loader = default_weight_loader
     transform.weight.add_partition(0, object(), (4, 4))
     transform.weight.partitions[0].data.fill_(1.0)
 

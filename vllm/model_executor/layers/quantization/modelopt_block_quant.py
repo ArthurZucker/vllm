@@ -21,7 +21,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
-    register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -153,15 +152,11 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
                 ),
             ),
         ):
-            layer.register_parameter(
-                name,
-                ModelWeightParameter(
-                    data=torch.empty(shape, dtype=torch.uint8),
-                    input_dim=2,
-                    output_dim=1,
-                    weight_loader=self.weight_loader,
-                ),
+            param = ModelWeightParameter(
+                data=torch.empty(shape, dtype=torch.uint8), input_dim=2, output_dim=1
             )
+            param.weight_loader = self.weight_loader
+            layer.register_parameter(name, param)
 
     def weight_loader(
         self,
@@ -255,7 +250,6 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
 ModelOptBlockQuantMoEMethod.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
 
-@register_weight_loader_v2_supported_method
 class ModelOptBlockQuantLinearMethod(LinearMethodBase):
     """Load native block payloads and execute the prepared b12x dense API."""
 
@@ -312,7 +306,6 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=extra_weight_attrs["weight_loader"],
             ),
         )
 

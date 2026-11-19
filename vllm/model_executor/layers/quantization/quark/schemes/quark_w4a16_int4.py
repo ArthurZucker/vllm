@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -29,6 +28,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt4Static32Asym,
     kInt4StaticAsym,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedvLLMParameter,
@@ -79,7 +79,6 @@ class QuarkW4A16Int4(QuarkScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         input_size = kwargs["input_size"]
@@ -125,7 +124,7 @@ class QuarkW4A16Int4(QuarkScheme):
                 padded_weight = loaded_weight.new_zeros(param.data.shape)
                 padded_weight[:, : loaded_weight.shape[1]] = loaded_weight
                 loaded_weight = padded_weight
-            weight_loader(param, loaded_weight, *args, **loader_kwargs)
+            default_weight_loader(param, loaded_weight)
 
         weight = PackedvLLMParameter(
             data=torch.empty(
@@ -137,7 +136,6 @@ class QuarkW4A16Int4(QuarkScheme):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.pack_factor,
-            weight_loader=weight_loader,
         )
         num_groups = input_size_per_partition // group_size
         weight_zero_point = PackedvLLMParameter(
@@ -150,7 +148,6 @@ class QuarkW4A16Int4(QuarkScheme):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.pack_factor,
-            weight_loader=weight_loader,
         )
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
@@ -160,8 +157,8 @@ class QuarkW4A16Int4(QuarkScheme):
             ),
             input_dim=0,
             output_dim=1,
-            weight_loader=weight_scale_loader,
         )
+        weight_scale.weight_loader = weight_scale_loader
 
         layer.register_parameter("weight", weight)
         layer.register_parameter("weight_zero_point", weight_zero_point)

@@ -358,7 +358,6 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         **extra_weight_attrs,
     ) -> None:
         del input_size, output_size, params_dtype
-        weight_loader = extra_weight_attrs.get("weight_loader")
         weight = ModelWeightParameter(
             data=layer.allocate_embedding_weight(
                 sum(output_partition_sizes),
@@ -367,7 +366,6 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 
@@ -376,7 +374,6 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             output_partition_sizes,
             input_size_per_partition,
             None,
-            weight_loader,
             scale_dtype=torch.float32,
         )
         layer.register_parameter("weight_scale", weight_scale)
@@ -430,7 +427,6 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
                 "NVFP4 PLE embedding dimension must be divisible by "
                 f"{_NVFP4_BLOCK_SIZE}, got {input_size_per_partition}"
             )
-        weight_loader = extra_weight_attrs.get("weight_loader")
         num_rows = sum(output_partition_sizes)
         for name, width, dtype in (
             (
@@ -448,7 +444,6 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
                 data=layer.allocate_embedding_weight(num_rows, width, dtype),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
             )
             layer.register_parameter(name, parameter)
         weight_scale_2 = create_fp8_scale_parameter(
@@ -456,7 +451,6 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             output_partition_sizes,
             input_size_per_partition,
             None,
-            weight_loader,
             scale_dtype=torch.float32,
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
@@ -894,4 +888,3 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         weight = table.view(dtype).view(num_embeddings, embedding_dim)
         self._shared_ptrs.add(weight.data_ptr())
         return weight
-

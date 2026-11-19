@@ -45,28 +45,6 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-WEIGHT_LOADER_V2_SUPPORTED = [
-    "UnquantizedLinearMethod",
-    "CompressedTensorsLinearMethod",
-    "CompressedTensorsLinearTransformMethod",
-    "HummingNvFP4HadamardLinearMethod",
-    "AutoAWQMarlinLinearMethod",
-    "AutoAWQLinearMethod",
-    "AutoGPTQLinearMethod",
-    "Fp8LinearMethod",
-    "FBGEMMFp8LinearMethod",
-    "QuarkLinearMethod",
-    "HummingLinearMethod",
-    # ModelOptLinearMethod self-registers via
-    # register_weight_loader_v2_supported_method (see modelopt.py).
-]
-
-
-def register_weight_loader_v2_supported_method(cls):
-    """Decorator to register a LinearMethod as supporting weight_loader_v2."""
-    WEIGHT_LOADER_V2_SUPPORTED.append(cls.__name__)
-    return cls
-
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
@@ -136,7 +114,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # The weights are not quantized, and they are not sharded.
         # The amount of memory allocated for the weights is
         # sum(output_partition_sizes) * input_size_per_partition.
-        weight_loader = extra_weight_attrs.pop("weight_loader")
         weight = ModelWeightParameter(
             data=torch.empty(
                 sum(output_partition_sizes),
@@ -145,7 +122,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
 
         layer.register_parameter("weight", weight)
@@ -338,7 +314,6 @@ class ReplicatedLinear(LinearBase):
             self.input_size,
             self.output_size,
             self.params_dtype,
-            weight_loader=None,
         )
 
         if bias:
@@ -463,16 +438,6 @@ class ColumnParallelLinear(LinearBase):
         self._maybe_allow_fp8_block_shape_mismatch()
         self.gather_output = gather_output
 
-        from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
-
-        quant_method = self.quant_method
-        if (
-            isinstance(quant_method, OnlineLinearBase)
-            and quant_method.requantization_source is not None
-        ):
-            quant_method = quant_method.requantization_source
-        weight_loader = None  # loaded by `ops_loader`
-
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -480,7 +445,6 @@ class ColumnParallelLinear(LinearBase):
             input_size=self.input_size,
             output_size=self.output_size,
             params_dtype=self.params_dtype,
-            weight_loader=weight_loader,
         )
 
         if bias:
@@ -599,17 +563,10 @@ class DCPGroupColumnParallelLinear(ColumnParallelLinear):
 class StackedColumnParallelLinear(ColumnParallelLinear):
     """Column-parallel linear whose weight is several checkpoint tensors stacked
     along the output dimension, each addressed by a shard id.
-
-    Keeps track of which shards a load delivered to each parameter so the loader
-    can reject a parameter that was only partly filled.
     """
 
     shard_ids: tuple[str | int, ...]
     """Every shard this layer can receive."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.loaded_shard_ids: dict[str, set[str | int]] = {}
 
     def _get_shard_size_mapping(self, loaded_shard_id: Any) -> int | None:
         """Rows of this rank's parameter that belong to the shard."""
@@ -1041,16 +998,6 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
-        from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
-
-        quant_method = self.quant_method
-        if (
-            isinstance(quant_method, OnlineLinearBase)
-            and quant_method.requantization_source is not None
-        ):
-            quant_method = quant_method.requantization_source
-        weight_loader = None  # loaded by `ops_loader`
-
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -1058,7 +1005,6 @@ class RowParallelLinear(LinearBase):
             input_size=self.input_size,
             output_size=self.output_size,
             params_dtype=self.params_dtype,
-            weight_loader=weight_loader,
         )
         if not reduce_results and (bias and not skip_bias_add):
             raise ValueError(

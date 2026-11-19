@@ -99,7 +99,6 @@ def prepare_param(tensor, name, extra_attrs):
         "output_dim",
         "packed_dim",
         "packed_factor",
-        "weight_loader",
     ]
     cls_kwargs = {}
     for key in extra_attrs.copy():
@@ -424,12 +423,10 @@ class HummingLinearMethod(LinearMethodBase):
                         device=param.device,
                     )
                     extra_weight_attrs = layer.extra_weight_attrs.copy()
-                    orig_weight_loader = extra_weight_attrs.pop("weight_loader")
                     layer.weight = ModelWeightParameter(
                         data=tensor,
                         input_dim=1,
                         output_dim=0,
-                        weight_loader=orig_weight_loader,
                     )
                     layer.weight.tp_size = layer.tp_size
                     layer.weight.tp_rank = layer.tp_rank
@@ -437,8 +434,8 @@ class HummingLinearMethod(LinearMethodBase):
 
                 param = layer.weight
                 if shard_id is not None:
-                    return layer.weight.weight_loader(param, loaded_weight, shard_id)
-                return layer.weight.weight_loader(param, loaded_weight)
+                    return weight_loader(param, loaded_weight, shard_id)
+                return weight_loader(param, loaded_weight)
 
             # weight processing logic for specific quantization schema
             loaded_weight = self.weight_schema.process_loaded_weight(
@@ -482,9 +479,9 @@ class HummingLinearMethod(LinearMethodBase):
                 )
                 setattr(self, name, schema)
 
-        weight_loader = extra_weight_attrs.get("weight_loader", default_weight_loader)
-        new_weight_loader = self.prepare_weight_loader(layer, weight_loader)
-        extra_weight_attrs["weight_loader"] = new_weight_loader
+        extra_weight_attrs["weight_loader"] = self.prepare_weight_loader(
+            layer, default_weight_loader
+        )
 
         for key in ["weight_block_size", "block_structure"]:
             block_size = getattr(self.weight_schema, key, None)
@@ -735,9 +732,9 @@ class HummingMoEMethod(FusedMoEMethodBase):
                     shape_k=shape_k,
                 )
                 setattr(self, name, schema)
-        weight_loader = extra_weight_attrs.get("weight_loader", default_weight_loader)
-        weight_loader = self.prepare_weight_loader(layer, weight_loader)
-        extra_weight_attrs["weight_loader"] = weight_loader
+        extra_weight_attrs["weight_loader"] = self.prepare_weight_loader(
+            layer, default_weight_loader
+        )
 
         # sublayer: a layer contains multiple sets of weights for quantized GEMM
         # (e.g., weight, weight_scale, etc.).

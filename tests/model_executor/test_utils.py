@@ -111,8 +111,8 @@ def test_replace_parameter_keeps_object_by_default(
         data=torch.zeros(4, 4, dtype=torch.float32, device="cpu"),
         input_dim=1,
         output_dim=0,
-        weight_loader=weight_loader,
     )
+    old_param.weight_loader = weight_loader
     layer.register_parameter("weight", old_param)
     old_data_ptr = old_param.data_ptr()
 
@@ -307,9 +307,8 @@ def test_move_parameter_aliases_one_param(single_rank_tp: None) -> None:
         pass
 
     layer = torch.nn.Module()
-    src = ModelWeightParameter(
-        data=torch.ones(4, 4), input_dim=1, output_dim=0, weight_loader=weight_loader
-    )
+    src = ModelWeightParameter(data=torch.ones(4, 4), input_dim=1, output_dim=0)
+    src.weight_loader = weight_loader
     layer.register_parameter("weight_packed", src)
 
     move_parameter(layer, "weight_packed", "weight")
@@ -361,8 +360,8 @@ def test_replace_parameter_with_own_parameter_keeps_layout(single_rank_tp) -> No
         output_dim=0,
         packed_dim=0,
         packed_factor=8,
-        weight_loader=weight_loader,
     )
+    old_param.weight_loader = weight_loader
     layer.register_parameter("weight", old_param)
     old_param.data = torch.ones(4, 4)
 
@@ -386,7 +385,6 @@ def test_kept_param_ops_skip_python_torch_function(single_rank_tp: None) -> None
             data=torch.zeros(4, 4),
             input_dim=1,
             output_dim=0,
-            weight_loader=lambda param, loaded_weight: None,
         ),
     )
     replace_parameter(layer, "weight", torch.ones(4, 4))
@@ -412,8 +410,8 @@ def test_transposed_kept_param_keeps_checkpoint_dims(single_rank_tp: None) -> No
         data=torch.arange(6.0).view(2, 3),
         input_dim=1,
         output_dim=0,
-        weight_loader=lambda param, loaded_weight: None,
     )
+    weight.weight_loader = lambda param, loaded_weight: None
     layer.register_parameter("weight", weight)
 
     MPLinearKernel._transform_param(

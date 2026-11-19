@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 
 import torch
 
@@ -74,7 +73,6 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -114,7 +112,6 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
         weight = PackedvLLMParameter(
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
             packed_factor=self.pack_factor,
             packed_dim=1,
             data=torch.empty(
@@ -128,7 +125,6 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
         # expand by 8x via `cutlass_pack_scale_fp8`
         # and construct per-channel fp32 scales.
         weight_scale_args = {
-            "weight_loader": weight_loader,
             "data": torch.empty(
                 output_size_per_partition,
                 scales_and_zp_size,
@@ -145,9 +141,7 @@ class CompressedTensorsW4A8Fp8(CompressedTensorsScheme):
 
         # A 2D array defining the original shape of the weights
         # before packing
-        weight_shape = BasevLLMParameter(
-            data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
-        )
+        weight_shape = BasevLLMParameter(data=torch.empty(2, dtype=torch.int64))
 
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("weight_scale", weight_scale)

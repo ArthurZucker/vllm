@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
 
 import torch
 
@@ -41,7 +40,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -58,14 +56,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight_packed", weight)
 
         # Global Weight Scale
         weight_global_scale = PerTensorScaleParameter(
             data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight_global_scale", weight_global_scale)
 
@@ -78,7 +74,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
 
         layer.register_parameter("weight_scale", weight_scale)
@@ -86,7 +81,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         if not self.use_a16:
             input_global_scale = PerTensorScaleParameter(
                 data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
             )
             layer.register_parameter("input_global_scale", input_global_scale)
 

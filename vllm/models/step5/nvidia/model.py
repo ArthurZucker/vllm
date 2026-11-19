@@ -7,7 +7,6 @@ import typing
 from collections.abc import Iterable
 from typing import Any
 
-import regex as re
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -65,7 +64,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -174,12 +172,6 @@ def step5_swa_attention_with_output(
         layer, query, key, value, kv_cache, metadata, output, gate
     )
 
-
-STEP5_SHARE_EXPERT_MAPPER = WeightsMapper(
-    orig_to_new_regex={
-        re.compile(r"(?<!\.moe)\.share_expert\."): ".moe.share_expert.",
-    },
-)
 
 STEP5_PACKED_MODULES_MAPPING = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -566,7 +558,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=None,
         )
         self.register_parameter("weight", weight)
         self.update_param_tp_status()

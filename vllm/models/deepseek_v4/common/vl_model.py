@@ -29,7 +29,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -46,34 +45,6 @@ from .mm_preprocess import (
     image_sentinel_mask,
 )
 from .vision import DeepseekV4Aligner, DeepseekV4ViT, encode_images
-
-
-def _make_deepseek_v4_vl_weights_mapper(
-    text_mapper: WeightsMapper, image_enabled: bool
-) -> WeightsMapper:
-    """Text-checkpoint mapping rules re-rooted under `language_model.`."""
-    orig_to_new_prefix = {
-        src: None if dst is None else f"language_model.{dst}"
-        for src, dst in text_mapper.orig_to_new_prefix.items()
-    }
-    if not image_enabled:
-        orig_to_new_prefix.update({"vision.": None, "aligner.": None, "image_": None})
-    return WeightsMapper(
-        orig_to_new_renaming=text_mapper.orig_to_new_renaming,
-        orig_to_new_prefix=orig_to_new_prefix,
-        orig_to_new_regex=text_mapper.orig_to_new_regex,
-        orig_to_new_stacked=text_mapper.orig_to_new_stacked,
-        orig_to_new_suffix={
-            **text_mapper.orig_to_new_suffix,
-            "head.weight": "language_model.lm_head.weight",
-        },
-        orig_to_new_substr={
-            **text_mapper.orig_to_new_substr,
-            # Draft models load the checkpoint's MTP weights separately from
-            # the target model.
-            "mtp.": None,
-        },
-    )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -170,20 +141,8 @@ class DeepseekV4ForConditionalGeneration(
                 )
             finally:
                 del config._dsv4_vl_inner  # type: ignore[attr-defined]
-        # The outer mapper (see load_weights) fully resolves HF names into
-        # this wrapper's namespace before AutoWeightsLoader strips the
-        # "language_model." prefix and delegates to the child's load_weights,
-        # so the child's own mapper must be a no-op. Its suffix rules are not
-        # idempotent (e.g. "lm_head.weight".endswith("head.weight") would
-        # re-fire "head.weight" -> "lm_head.weight").
-        text_mapper = self.language_model.hf_to_vllm_mapper
-        self.language_model.hf_to_vllm_mapper = WeightsMapper()
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
-        )
-
-        self.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
-            text_mapper, image_enabled
         )
 
     def _parse_and_validate_image_input(self, **kwargs: object) -> dict | None:

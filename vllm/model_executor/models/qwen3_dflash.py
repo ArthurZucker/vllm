@@ -33,6 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.utils import (
     refill_derived,
@@ -67,8 +68,9 @@ def _is_mxfp8_linear(layer: nn.Module) -> bool:
     ) and not isinstance(layer.quant_method, UnquantizedLinearMethod)
 
 
-_QKV_PARAM = re.compile(
-    r"^layers\.(\d+)\.self_attn\.qkv_proj\.(weight|weight_scale|bias)$"
+# A draft layer's K or V checkpoint tensor (`midlayer`: layer 0)
+_KV_SOURCE = re.compile(
+    r"^(?:layers\.(\d+)|midlayer)\.self_attn\.([kv])_proj\.(weight|weight_scale|bias)$"
 )
 
 
@@ -417,27 +419,6 @@ class DFlashQwen3DecoderLayer(nn.Module):
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_regex={
-            # Match a complete module name, including bare names and trailing
-            # wildcards in quantization configs, but not e.g. midlayer_extra.
-            re.compile(r"(?<![A-Za-z0-9_])midlayer(?=\.|\*|$)"): "layers.0",
-            # Muse-Glimmer-30B-assistant names the aux-hidden-state encoder
-            # `encoder.fc` / `encoder.output_norm_enc`; this head calls them
-            # `fc` / `hidden_norm`. Same tensors and shapes, different names.
-            re.compile(r"(?<![A-Za-z0-9_])encoder\.output_norm_enc(?=\.|\*|$)"): (
-                "hidden_norm"
-            ),
-            re.compile(r"(?<![A-Za-z0-9_])encoder\.fc(?=\.|\*|$)"): "fc",
-        },
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
     # Maps module paths in the draft checkpoint's quantization exclusions to
     # this model's module paths.
     quant_config_mapper: WeightsMapper | None = None
@@ -463,7 +444,7 @@ class DFlashQwen3Model(nn.Module):
             self.quant_config.apply_vllm_mapper(self.quant_config_mapper)
         map_draft_quant_config(
             self.quant_config,
-            self.hf_to_vllm_mapper,
+            rename_mapper(DFlashQwen3Model) or WeightsMapper(),
             prefix,
             start_layer_id,
             self.config.num_hidden_layers,
@@ -848,13 +829,9 @@ class DFlashQwen3Model(nn.Module):
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
         for name, weight in weights:
-            mapped = self.hf_to_vllm_mapper._map_name_with_shard(name)
-            if mapped is not None and mapped[1] in ("k", "v"):
-                match = _QKV_PARAM.match(mapped[0])
-                if match is not None:
-                    self._load_context_kv(
-                        int(match[1]), str(mapped[1]), match[2], weight
-                    )
+            match = _KV_SOURCE.match(name)
+            if match is not None:
+                self._load_context_kv(int(match[1] or 0), match[2], match[3], weight)
             yield name, weight
 
 

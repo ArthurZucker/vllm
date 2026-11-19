@@ -16,7 +16,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
     IntermediateTensors,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -64,16 +63,6 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     """Dots3Note model with optional image and audio towers."""
 
     supports_encoder_tp_data = True
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-            "mtp.": "language_model.mtp.",
-            "vision_encoder.": "visual.",
-            "audio_encoder.": "audio_tower.",
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -157,16 +146,6 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
-
-        orig_to_new_prefix = dict[str, None]()
-        if self.visual is None:
-            orig_to_new_prefix["visual."] = None
-        if self.audio_tower is None:
-            orig_to_new_prefix["audio_tower."] = None
-        if orig_to_new_prefix:
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix=orig_to_new_prefix
-            )
 
     def _process_image_input(
         self,
@@ -309,7 +288,6 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

@@ -13,7 +13,6 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
-
 import regex as re
 import torch
 from torch import nn
@@ -50,7 +49,6 @@ from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
-    _EXTRA_WEIGHTS_MAPPER,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
@@ -173,8 +171,6 @@ def _make_draft_vllm_config(
 
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = _EXTRA_WEIGHTS_MAPPER
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
@@ -384,7 +380,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return sample_hidden_states, multi_hidden
 
 
-
 class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -451,7 +446,6 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

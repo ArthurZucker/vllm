@@ -56,7 +56,6 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     StageMissingLayer,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     get_fused_shared_expert_layers,
@@ -139,23 +138,6 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_weight_scale",
     "_input_scale",
 ]
-
-# The checkpoint stores these projections separately; runtime packs each group
-# into adjacent logical shards of a MergedColumnParallelLinear.
-_EXTRA_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_stacked={
-        "hyper_connection.input_mix_weight_down.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            0,
-        ),
-        "hyper_connection.block_inject_weight.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            1,
-        ),
-        "ple.key_proj": ("ple.kv_proj", 0),
-        "ple.value_proj": ("ple.kv_proj", 1),
-    }
-)
 
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):

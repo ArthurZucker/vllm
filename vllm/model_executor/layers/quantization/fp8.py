@@ -294,7 +294,6 @@ class Fp8LinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -314,7 +313,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         weight = create_fp8_weight_parameter(
-            output_size_per_partition, input_size_per_partition, weight_loader
+            output_size_per_partition, input_size_per_partition
         )
         layer.register_parameter("weight", weight)
 
@@ -325,7 +324,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 output_partition_sizes,
                 input_size_per_partition,
                 None,
-                weight_loader,
             )
             layer.register_parameter("weight_scale", scale)
         else:
@@ -336,7 +334,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 output_partition_sizes,
                 input_size_per_partition,
                 self.weight_block_size,
-                weight_loader,
                 scale_dtype=(torch.float8_e8m0fnu if self.is_scale_e8m0 else None),
             )
             # The weight_scale_inv name is intentional for deepseekv3
@@ -344,7 +341,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # INPUT ACTIVATION SCALE
         if self.act_q_static:
-            scale = create_fp8_input_scale(output_partition_sizes, weight_loader)
+            scale = create_fp8_input_scale(output_partition_sizes)
             set_weight_attrs(scale, {"scale_type": "input_scale"})
             layer.register_parameter("input_scale", scale)
 

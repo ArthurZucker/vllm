@@ -176,7 +176,6 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
             return
 
         output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -192,7 +191,6 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 

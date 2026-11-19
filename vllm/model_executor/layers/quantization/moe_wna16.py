@@ -290,11 +290,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
         strategy = FusedMoeWeightScaleSupported.GROUP.value
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": False})
 
-        assert "weight_loader" in extra_weight_attrs
-        weight_loader = extra_weight_attrs["weight_loader"]
-        wrapped_weight_loader = MoeWNA16Method.get_weight_loader(layer, weight_loader)
-        extra_weight_attrs["weight_loader"] = wrapped_weight_loader
-
         # Fused gate_up_proj (column parallel)
         w13_qweight = torch.nn.Parameter(
             torch.empty(

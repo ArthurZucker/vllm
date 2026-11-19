@@ -380,12 +380,6 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
         strategy = FusedMoeWeightScaleSupported.GROUP.value
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": False})
 
-        assert "weight_loader" in extra_weight_attrs
-        weight_loader = extra_weight_attrs["weight_loader"]
-        extra_weight_attrs["weight_loader"] = self.get_weight_loader(
-            layer, weight_loader
-        )
-
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,

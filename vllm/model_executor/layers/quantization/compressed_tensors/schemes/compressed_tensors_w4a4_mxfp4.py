@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
 
 import torch
 
@@ -52,7 +51,6 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -70,7 +68,6 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight_packed", weight)
 
@@ -83,7 +80,6 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
 

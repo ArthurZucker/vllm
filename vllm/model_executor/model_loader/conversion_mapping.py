@@ -272,14 +272,197 @@ def _cosmos3_edge() -> list[WeightTransform]:
     ]
 
 
-def _own_mapper(module: nn.Module) -> list[WeightTransform]:
-    """The `WeightsMapper` a model builds for itself (from its config)"""
-    return from_mapper(module.hf_to_vllm_mapper)
+def _beam(module: nn.Module) -> list[WeightTransform]:
+    """Beam's attention gate (not a `gate_up_proj` shard to LoRA): fused with q, k
+    and v when it has as many KV heads as TP ranks or more (`merged_qkv_gate`)"""
+    merged = any(getattr(m, "merged_qkv_gate", False) for m in module.modules())
+    qkv = (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj")
+    return [
+        rename(".self_attn.gate_proj", ".self_attn.output_gate_proj"),
+        fused(".self_attn.qkv_gate_proj", *qkv, ".self_attn.output_gate_proj")
+        if merged
+        else fused(".self_attn.qkv_proj", *qkv),
+        # not the experts' (`.mlp.experts.N.gate_proj`)
+        fused(".mlp.gate_up_proj", ".mlp.gate_proj", ".mlp.up_proj"),
+    ]
 
 
-def _extends(base: str) -> Callable:
-    """A class whose mapper extends another's: that class's entry, then its own"""
-    return lambda module: [*_CONVERSION_MAPPING.get(base, []), *_own_mapper(module)]
+def _dots3_note(module: nn.Module) -> list[WeightTransform]:
+    """The towers the model did not build (no config, no modality) are dropped"""
+    return [
+        rename("^model.", "language_model.model."),
+        rename("^lm_head.", "language_model.lm_head."),
+        rename("^mtp.", "language_model.mtp."),
+        rename("^vision_encoder.", "visual."),
+        rename("^audio_encoder.", "audio_tower."),
+        *(
+            drop(f"^{tower}.")
+            for tower in ("visual", "audio_tower")
+            if getattr(module, tower) is None
+        ),
+    ]
+
+
+def _k3_dspark(module: nn.Module) -> list[WeightTransform]:
+    """K3 DSpark's draft checkpoint, without the `model.` prefix: the target's
+    embedding and LM head are shared, the confidence head is training only unless
+    the draft built one (adaptive verification reads it)"""
+    confidence = getattr(module.config, "enable_confidence_head", False)
+    return [
+        *([] if confidence else [drop("confidence_head")]),
+        drop("embed_tokens"),
+        drop("lm_head"),
+        rename("^", "model."),
+        GATE_UP,
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        _k3_context_kv(module),
+    ]
+
+
+# Muse Spark Omni's checkpoint: the text stack's layers, NaViT vision, waveform audio
+MUSE_SPARK_OMNI = [
+    rename("^model.language_model.", "model."),
+    *(
+        rename(rf"^(model.layers.\d+).{old}", rf"\1.{new}")
+        for old, new in (
+            ("input_layernorm.", "self_attn.pre_qkv_proj_norm."),
+            ("post_attention_residual_gate.", "add_attn."),
+            ("post_feedforward_residual_gate.", "add_ffn."),
+            ("pre_feedforward_layernorm.", "pre_ffn_norm."),
+            ("post_feedforward_layernorm.", "post_ffn_norm."),
+            ("mlp.experts.post_expert_norm.", "feed_forward.post_expert_norm."),
+            ("mlp.gate.e_score_correction_bias$", "feed_forward.expert_bias"),
+            ("mlp.gate.", "feed_forward.router."),
+            ("mlp.pre_expert_proj.", "feed_forward.pooler."),
+            ("mlp.post_expert_proj.", "feed_forward.unpooler."),
+            ("mlp.", "feed_forward."),
+        )
+    ),
+    *(
+        rename(f".experts.{hf}{suffix}$", f".experts.{vllm}{suffix or '_weight'}")
+        for hf, vllm in (("gate_up_proj", "w13"), ("down_proj", "w2"))
+        for suffix in ("_input_scale", "_weight_scale_2", "_weight_scale", "")
+    ),
+    rename("^model.vision_adapter.fc1.", "vision_model.adapter.c_fc."),
+    rename("^model.vision_adapter.fc2.", "vision_model.adapter.c_proj."),
+    rename(
+        "^model.vision_tower.patch_embedder.patch_embedding.",
+        "vision_model.conv1_linear.",
+    ),
+    rename(
+        "^model.vision_tower.patch_embedder.position_embedding_table.weight$",
+        "vision_model.positional_embedding_vlm",
+    ),
+    rename("^model.vision_tower.layers.", "vision_model.encoder.layers."),
+    rename("^model.vision_tower.", "vision_model."),
+    rename("^model.vision_projection.", "vision_projection."),
+    *(
+        rename(rf"^(vision_model.encoder.layers.\d+).{old}", rf"\1.{new}")
+        for old, new in (
+            ("attn.proj.", "attn.out_proj."),
+            ("norm1.", "ln_1."),
+            ("norm2.", "ln_2."),
+            ("mlp.fc1.", "mlp.c_fc."),
+            ("mlp.fc2.", "mlp.c_proj."),
+        )
+    ),
+    *(
+        rename(
+            rf"^model.audio_tower.layers.(\d+).conv_blocks.{block}.",
+            rf"audio_encoder.stages.\1.{block + 1}.",
+        )
+        for block in range(2)
+    ),
+    *(
+        rename(rf"^(audio_encoder.stages.\d+.\d+).{old}", rf"\1.{new}")
+        for old, new in (
+            ("conv.", "conv.conv."),
+            ("mlp.fc1.", "linear1."),
+            ("mlp.fc2.", "linear2."),
+        )
+    ),
+    rename(
+        r"^model.audio_tower.layers.(\d+).patch_embedder.norm.",
+        r"audio_encoder.stages.\1.0.norm.",
+    ),
+    rename(
+        r"^model.audio_tower.layers.(\d+).patch_embedder.proj.",
+        r"audio_encoder.stages.\1.0.linear.",
+    ),
+    rename("^model.audio_tower.post_proj_norm.", "audio_encoder.dual_norm."),
+    rename("^model.audio_tower.proj.", "audio_encoder.o_proj."),
+    rename("^model.audio_tower.norm.", "audio_encoder.norm."),
+    fused(
+        ".self_attn.qkv_proj.",
+        ".self_attn.q_proj.",
+        ".self_attn.k_proj.",
+        ".self_attn.v_proj.",
+        ".self_attn.gate_proj.",
+    ),
+    fused(".attn.qkv_proj.", ".attn.q_proj.", ".attn.k_proj.", ".attn.v_proj."),
+]
+
+
+def _deepseek_v4(
+    module: nn.Module, vl: bool = False, image: bool = True
+) -> list[WeightTransform]:
+    """DeepSeek V4 / V4.1's reference checkpoint (`layers.`, `head.`, `mtp.`, `.scale`
+    tensors), under `language_model.` for a VL wrapper (`vl`; `image`: its vision tower
+    is built). Each platform's model (`vllm.models.deepseek_v4[1].<platform>.model`)
+    registers its own scale params"""
+    path = type(module).__module__
+    v41, amd, cpu = ".deepseek_v41." in path, ".amd." in path, ".cpu." in path
+    # V4 on AMD / CPU: Quark exports (`.input_scale`), shared experts fused into the
+    # routed ones (keeping their names), no LoRA-wrapped experts
+    quark = (amd or cpu) and not v41
+    fp4 = getattr(module.config, "expert_dtype", "fp4") == "fp4"
+    expert_scale = "weight_scale" if fp4 else "weight_scale_inv"
+    linear_scale = getattr(module, "linear_scale_name", "weight_scale_inv")
+    root = "language_model." if vl else ""
+    fused_shared = quark and bool(
+        module.model.is_fused_shared_expert_enabled
+        if cpu
+        else module.model.fused_shared_expert_layers
+    )
+    image_tensors = ("vision.", "aligner.", "image_")
+    # MXFP4 experts' scales are `weight_scale`, FP8 linears' `weight_scale_inv` (V4.1:
+    # its linear quant method's, `weight_scale` for MXFP8)
+    out: list[WeightTransform] = []
+    if not quark:
+        lora_experts = r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
+        out.append(rename(lora_experts, rf"\1.{expert_scale}"))
+    if fp4:
+        out.append(rename(r"(\.experts\.\d+\.w[123])\.scale$", r"\1.weight_scale"))
+    if v41:
+        # the `embed.weight` suffix renames the engram's fp8 table, not its scale;
+        # Quark (on AMD) spells it `weight_scale`
+        for scale in ("scale", "weight_scale") if amd else ("scale",):
+            out.append(
+                rename(rf"(engram\.embed)\.{scale}$", r"\1_tokens.weight_scale_inv")
+            )
+    out.append(rename(r"\.scale$", f".{linear_scale}"))
+    if cpu and fp4:
+        out.append(rename(r"(?<!\.w[123])\.weight_scale$", ".weight_scale_inv"))
+    if not fused_shared:
+        out.append(rename(".shared_experts.w2", ".shared_experts.down_proj"))
+    # MTP weights are loaded by the draft model
+    out.append(drop("mtp."))
+    if v41 and not vl:  # V4.1's checkpoint declares the VL architecture
+        out += [drop(name) for name in image_tensors]
+    # `hc_head_fn`, ...: a pattern ending in a word character only matches whole words
+    hc_head = ["hc_head_"] if vl or not v41 else []
+    for prefix in ("layers.", "embed.", "norm.", *hc_head, "mtp."):
+        out.append(rename("^" + prefix, f"{root}model.{prefix}"))
+    if not image:
+        out += [drop("^" + name) for name in image_tensors]
+    out += [
+        rename("head.weight$", f"{root}lm_head.weight"),
+        rename("embed.weight$", "embed_tokens.weight"),
+        rename(".ffn.gate.bias$", ".ffn.gate.e_score_correction_bias"),
+    ]
+    if quark:
+        out.append(rename(".input_scale$", ".input_scale_2"))
+    return out
 
 
 def _gemma4(module: nn.Module) -> list[WeightTransform]:
@@ -411,22 +594,62 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         COLBERT_LINEAR,
         rename("^(?!model.|colbert_linear.)", "model."),
     ],
-    # their mapper is built per instance by a helper (TODO: return transforms)
-    "BeamModel": _own_mapper,
-    "DFlashQwen3Model": _own_mapper,
-    "DeepseekV41ForCausalLM": _own_mapper,
-    "DeepseekV41LLMForCausalLM": _own_mapper,
-    "DeepseekV4ForCausalLM": _own_mapper,
-    "DeepseekV4ForConditionalGeneration": _own_mapper,
-    "Dots3NoteForCausalLM": _own_mapper,
-    "EmbeddingGemma2Model": _own_mapper,
-    "K3DSparkForCausalLM": lambda m: [*_own_mapper(m), _k3_context_kv(m)],
-    "MiniMaxM3SparseForCausalLM": _own_mapper,
-    "MuseSparkForConditionalGeneration": _extends("MuseSparkForCausalLM"),
-    "Qwen4ExpMultiTokenPredictor": _extends("Qwen3_5Model"),
-    "Step5ForConditionalGeneration": _extends("Step3p7ForConditionalGeneration"),
+    "BeamModel": _beam,
+    "DFlashQwen3Model": [
+        # whole module names, also bare or wildcarded (quant configs' exclusions),
+        # not e.g. `midlayer_extra`
+        rename(r"(?<![A-Za-z0-9_])midlayer(?=\.|\*|$)", "layers.0"),
+        # Muse-Glimmer-30B-assistant's aux-hidden-state encoder: same tensors
+        rename(r"(?<![A-Za-z0-9_])encoder.output_norm_enc(?=\.|\*|$)", "hidden_norm"),
+        rename(r"(?<![A-Za-z0-9_])encoder.fc(?=\.|\*|$)", "fc"),
+        QKV,
+        GATE_UP,
+    ],
+    "Dots3NoteForCausalLM": _dots3_note,
+    "EmbeddingGemma2Model": [
+        fused(
+            ".self_attn.qkv_proj.weight",
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+        ),
+        fused(
+            ".self_attn.qkv_proj.bias",
+            ".self_attn.q_proj.bias",
+            ".self_attn.k_proj.bias",
+            ".self_attn.v_proj.bias",
+        ),
+        fused(
+            ".mlp.gate_up_proj.weight", ".mlp.gate_proj.weight", ".mlp.up_proj.weight"
+        ),
+        fused(".mlp.gate_up_proj.bias", ".mlp.gate_proj.bias", ".mlp.up_proj.bias"),
+    ],
+    "K3DSparkForCausalLM": _k3_dspark,
+    "MiniMaxM3SparseForCausalLM": [
+        drop("mtp."),
+        # ModelOpt MXFP8 layers name the checkpoint's block scales this way
+        rename("weight_scale_inv", "weight_scale"),
+        # in the param's shard order (`MinimaxM3QKVParallelLinearWithIndexer`)
+        fused(
+            ".qkv_proj",
+            ".q_proj",
+            ".k_proj",
+            ".v_proj",
+            ".index_q_proj",
+            ".index_k_proj",
+        ),
+        GATE_UP,
+    ],
+    "MuseSparkForConditionalGeneration": MUSE_SPARK_OMNI,
     "MiMoMTP": _mimo_mtp,
     "ErnieMTP": _ernie_mtp,
+    # a VL wrapper's language model repeats its transforms, applied once
+    "DeepseekV41ForCausalLM": lambda m: _deepseek_v4(m.language_model, vl=True),
+    "DeepseekV41LLMForCausalLM": _deepseek_v4,
+    "DeepseekV4ForCausalLM": _deepseek_v4,
+    "DeepseekV4ForConditionalGeneration": lambda m: _deepseek_v4(
+        m.language_model, vl=True, image=m.vision is not None
+    ),
     "AIMv2Model": [
         fused(".fc13", ".fc1", ".fc3"),
     ],
@@ -1904,6 +2127,21 @@ _CONVERSION_MAPPING["Step3p7ForConditionalGeneration"] = (
         rename("^lm_head", "language_model.lm_head"),
     ]
 )
+# extends the base model's checkpoint (as its class does)
+_CONVERSION_MAPPING["Step5ForConditionalGeneration"] = [
+    *_CONVERSION_MAPPING["Step3p7ForConditionalGeneration"],
+    rename("(?<!.moe).share_expert.", ".moe.share_expert."),
+]
+_CONVERSION_MAPPING["Qwen4ExpMultiTokenPredictor"] = [
+    *_CONVERSION_MAPPING["Qwen3_5Model"],
+    # stored apart, packed into adjacent shards of a merged projection
+    fused(
+        "hyper_connection.input_mix_weight_down_block_inject.weight",
+        "hyper_connection.input_mix_weight_down.weight",
+        "hyper_connection.block_inject_weight.weight",
+    ),
+    fused("ple.kv_proj", "ple.key_proj", "ple.value_proj"),
+]
 _CONVERSION_MAPPING["StepVLForConditionalGeneration"] = [
     rename(".attn.in_proj_weight", ".attn.qkv_proj.weight"),
     rename(".attn.in_proj_bias", ".attn.qkv_proj.bias"),
