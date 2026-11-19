@@ -11,6 +11,7 @@ checkpoint key ─▶ plan: the layer's quantizer
 ```
 """
 
+import re
 from functools import partial
 
 import torch
@@ -253,8 +254,12 @@ def read_scales_along(conversions: list, hf_quantizer) -> list:
         sources = converter._original_source_patterns
         targets = converter._original_target_patterns
         if isinstance(converter, Fused):  # module names: into the fused weight
+            if any(s.endswith("bias") for s in sources):
+                continue  # not quantized
+            # `.q_proj`, `.q_proj.` or `.q_proj.weight` (escaped): the module
+            sources = [re.sub(r"\\\.(weight)?$", "", s) for s in sources]
             sources = [rf"(?:){s}\.{n}" for s in sources for n in along]
-            targets = [f"{t}.weight" for t in targets]
+            targets = [re.sub(r"\.(weight)?$", "", t) + ".weight" for t in targets]
         elif all(s.endswith("weight") for s in sources):
             sources = [
                 f"(?:){s.removesuffix('weight')}{n}" for s in sources for n in along
