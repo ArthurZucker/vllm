@@ -2765,6 +2765,13 @@ _CONVERSION_MAPPING["LlavaForConditionalGeneration"] = _CONVERSION_MAPPING[
 _CONVERSION_MAPPING["LlavaNextForConditionalGeneration"] = _CONVERSION_MAPPING[
     "BeeForConditionalGeneration"
 ]
+# its text layers saved as `encoder.layers.` (Transformers reverses its vision
+# tower's unanchored rename on save, and undoes it on load)
+_CONVERSION_MAPPING["QianfanOCRForConditionalGeneration"] = [
+    rename(
+        r"^language_model\.model\.encoder\.layers\.", "language_model.model.layers."
+    ),
+]
 # its vision tower saved bare (`vision_tower.encoder.`), as vLLM's CLIP's `vision_model`
 _CONVERSION_MAPPING["LlavaNextVideoForConditionalGeneration"] = [
     *_CONVERSION_MAPPING["BeeForConditionalGeneration"],
