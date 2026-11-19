@@ -848,6 +848,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "diffusion_gemma_text": Gemma4ModelArchConfigConvertor,
     "ernie_mtp": ErnieMTPModelArchConfigConvertor,
     "falcon": FalconModelArchConfigConvertor,
+    "gpt_bigcode": FalconModelArchConfigConvertor,  # `multi_query`: one KV head
     "falcon_mamba": MambaModelArchConfigConvertor,
     "gemma4": Gemma4ModelArchConfigConvertor,
     "gemma4_mtp": Gemma4MTPModelArchConfigConvertor,
