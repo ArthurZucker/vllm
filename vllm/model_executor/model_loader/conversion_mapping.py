@@ -105,7 +105,7 @@ EXPERT_SUFFIXES = {
 }
 FUSED_EXPERTS = [
     rename(
-        rf"{re.escape(hf)}{re.escape(suffix)}$",
+        rf"(?<!\w){re.escape(hf)}{re.escape(suffix)}$",  # not `shared_experts.`
         (vllm.removesuffix("_weight") + "_bias") if suffix == "_bias" else vllm + new,
     )
     for hf, vllm in TRANSFORMERS_EXPERTS.items()
@@ -121,7 +121,8 @@ def to_vllm(conversions: list[WeightTransform]) -> list[WeightTransform]:
     for conversion in conversions:
         targets = list(conversion._original_target_patterns)
         for hf, vllm in TRANSFORMERS_EXPERTS.items():
-            targets = [target.replace(hf, vllm) for target in targets]
+            # whole names only: a shared expert's `shared_experts.gate_up_proj` stays
+            targets = [re.sub(rf"(?<!\w){re.escape(hf)}", vllm, t) for t in targets]
         if targets == conversion._original_target_patterns:
             out.append(conversion)
         else:
