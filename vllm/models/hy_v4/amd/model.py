@@ -23,8 +23,7 @@
 # limitations under the License.
 """Inference-only HY V4 model compatible with HuggingFace weights (ROCm)."""
 
-import typing
-from collections.abc import Callable, MutableSequence, Sequence
+from collections.abc import MutableSequence, Sequence
 from itertools import islice
 
 import torch
@@ -402,32 +401,6 @@ class HYV4Model(nn.Module):
             hidden_states = hidden_states + residual
 
         return self.norm(hidden_states)
-
-    def load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ) -> bool:
-        param = params_dict[name]
-        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        loaded_local_expert = False
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            success = weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                expert_id,
-                return_success=True,
-            )
-            if success:
-                loaded_local_expert = True
-
-        return loaded_local_expert
 
     @torch.no_grad()
     def process_weights_after_loading(self) -> None:

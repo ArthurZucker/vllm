@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from typing import Literal
 
 import torch
@@ -41,9 +40,6 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
 )
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
-)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
@@ -448,45 +444,6 @@ def resolve_kda_prefill_backend(
     return "triton"
 
 
-def _make_decode_conv1d_weight_loader(
-    dims: list[int],
-    tp_size: int,
-    tp_rank: int,
-    decode_conv1d_weight: torch.Tensor | None,
-) -> Callable[..., None]:
-    sharded_dims = [dim // tp_size for dim in dims]
-
-    def weight_loader(
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: int,
-    ) -> None:
-        if loaded_weight.dim() == 2:
-            loaded_weight = loaded_weight.unsqueeze(1)
-        shard_size = sharded_dims[loaded_shard_id]
-        source_start = tp_rank * shard_size
-        target_start = sum(sharded_dims[:loaded_shard_id])
-        loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
-        if decode_conv1d_weight is not None and not param.is_meta:
-            decode_conv1d_weight[loaded_shard_id].copy_(
-                loaded_shard.squeeze(1).transpose(0, 1)
-            )
-
-    return weight_loader
-
-
-def _make_decode_norm_weight_loader(
-    decode_norm_weight: torch.Tensor,
-) -> Callable[..., None]:
-    def weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        default_weight_loader(param, loaded_weight)
-        if not param.is_meta:
-            decode_norm_weight.copy_(param.data)
-
-    return weight_loader
-
-
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3KDAAttentionBackend
@@ -719,18 +676,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.register_buffer(
             "decode_conv1d_weight", decode_conv1d_weight, persistent=False
         )
-        delattr(self.conv1d.weight, "weight_loader")
-        set_weight_attrs(
-            self.conv1d.weight,
-            {
-                "weight_loader": _make_decode_conv1d_weight_loader(
-                    [self.projection_size] * 3,
-                    self.tp_size,
-                    self.tp_rank,
-                    decode_conv1d_weight,
-                )
-            },
-        )
+        # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+        self.conv1d.shard_ids = (0, 1, 2)
 
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
@@ -810,15 +757,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 device=self.o_norm.weight.device,
             )
         self.register_buffer("decode_norm_weight", decode_norm_weight, persistent=False)
-        if decode_norm_weight is not None:
-            # Upcast once while loading; direct BF16 norm weights slow the
-            # fully fused decode kernel.
-            if hasattr(self.o_norm.weight, "weight_loader"):
-                delattr(self.o_norm.weight, "weight_loader")
-            set_weight_attrs(
-                self.o_norm.weight,
-                {"weight_loader": _make_decode_norm_weight_loader(decode_norm_weight)},
-            )
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
@@ -841,6 +779,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    @torch.no_grad()
+    def process_weights_after_loading(self) -> None:
+        """The fused decode kernel's copies, rewritten in place (captured graphs
+        read them): the q/k/v convs width-major, the output norm in FP32 (direct
+        BF16 norm weights slow it)"""
+        if self.decode_conv1d_weight is not None:
+            self.decode_conv1d_weight.copy_(
+                self.conv1d.weight.view(
+                    3, self.local_projection_size, self.conv_size
+                ).transpose(1, 2)
+            )
+        if self.decode_norm_weight is not None:
+            self.decode_norm_weight.copy_(self.o_norm.weight)
 
     def get_kv_cache_checkpoint_alignment(self, vllm_config: VllmConfig) -> int | None:
         return kda_prefill_checkpoint_alignment(self.kda_prefill_backend)

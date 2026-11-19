@@ -297,7 +297,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
-        weight_attrs = {"weight_loader": self.weight_loader}
+        # this rank's experts merged from the checkpoint's `experts.N.w*`, as their
+        # bytes (`conversion_mapping`)
+        weight_attrs = {"expert_dim": 0, "keeps_sent_dtype": (torch.uint8,)}
         self.w13_weight = nn.Parameter(
             torch.zeros(
                 num_local_experts,
@@ -354,44 +356,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-    def _map_global_expert_id(self, expert_id: int) -> int:
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
             return -1
         return expert_id - self.experts_start_idx
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> bool | None:
-        local_expert_id = self._map_global_expert_id(expert_id)
-        if local_expert_id == -1:
-            return False if return_success else None
-
-        expert_data = param.data[local_expert_id]
-        if shard_id in ("w1", "w3"):
-            if "w13_" not in weight_name:
-                return False if return_success else None
-            shard_offset = 0 if shard_id == "w1" else self.intermediate_size
-            expert_data = expert_data.narrow(0, shard_offset, self.intermediate_size)
-        elif shard_id == "w2":
-            if "w2_" not in weight_name:
-                return False if return_success else None
-        else:
-            raise ValueError(f"Unsupported expert shard id: {shard_id}")
-
-        if expert_data.shape != loaded_weight.shape:
-            raise ValueError(
-                f"DeepSeek V4 MegaMoE expert weight shape mismatch for "
-                f"{weight_name}: parameter shard {tuple(expert_data.shape)} "
-                f"vs checkpoint {tuple(loaded_weight.shape)}"
-            )
-        expert_data.copy_(loaded_weight)
-        return True if return_success else None
 
     @staticmethod
     def _ue8m0_uint8_to_float(sf: torch.Tensor) -> torch.Tensor:
@@ -524,9 +492,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             activation_clamp=activation_clamp,
             fast_math=fast_math,
         )
-
-
-DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
 
 def _deepseek_v4_mega_moe_experts_op(

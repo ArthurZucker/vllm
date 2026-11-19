@@ -10,10 +10,6 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -340,17 +336,8 @@ class BailingGroupRMSNormGate(RMSNormGated):
             dtype=dtype,
             activation="sigmoid",
         )
-        # Add custom weight loader for TP sharding
-        self.weight.weight_loader = self._weight_loader
-
-    @staticmethod
-    def _weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        """Load weight with TP sharding."""
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        shard_size = loaded_weight.shape[0] // tp_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
-        param.data.copy_(loaded_weight[shard].contiguous())
+        # this rank's slice of the checkpoint's norm
+        self.weight.shard_dim = 0
 
 
 # --8<-- [start:bailing_moe_linear_attention]
@@ -478,25 +465,6 @@ class BailingMoELinearAttention(LinearAttention):
         )
 
         return BailingLinearAttentionBackend
-
-    @staticmethod
-    def weight_direct_load(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        """Load weight for linear attention layers.
-
-        For FP8 quantized parameters, we need to use the weight_loader if available,
-        as it handles special cases like tensor parallelism sharding.
-        """
-        # Check if param has a weight_loader (for vLLM ModelWeightParameter)
-        weight_loader = getattr(param, "weight_loader", None)
-        if weight_loader is not None:
-            # Use the weight_loader which handles TP sharding and quantization
-            weight_loader(param, loaded_weight)
-        else:
-            # Fall back to direct copy for standard tensors
-            assert param.size() == loaded_weight.size(), (
-                f"Shape mismatch: {param.shape} vs {loaded_weight.shape}"
-            )
-            param.data.copy_(loaded_weight)
 
     def forward(
         self,

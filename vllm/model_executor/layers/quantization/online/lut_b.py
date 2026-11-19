@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.lut_b_utils import (
+    LUT_B_SM107_TILE_BYTES,
     LUT_B_SM107_TILE_K,
     LUT_B_SM107_TILE_N,
     dequantize_lut_b,
@@ -36,6 +37,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 
 logger = init_logger(__name__)
+
+# Weights per SM107 tile
+_TILE = LUT_B_SM107_TILE_N * LUT_B_SM107_TILE_K
 
 
 class LutBOnlineMoEMethod(OnlineMoEMethodBase):
@@ -83,18 +87,52 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
         # carry their codebooks and scales inline.
         return FUSED_MOE_UNQUANTIZED_CONFIG
 
+    @property
+    def _native(self) -> bool:
+        return self.experts_cls is LutBSm107Experts
+
+    def quantized_params(
+        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        params = []
+        for name, rows, cols in (
+            ("w13_weight", w13_rows, hidden),
+            ("w2_weight", hidden, intermediate),
+        ):
+            if self._native:  # SM107 tiles, viewed as rows of their bytes
+                shape = (num_experts, rows, cols * LUT_B_SM107_TILE_BYTES // _TILE)
+                params.append((name, shape, torch.uint8))
+            else:  # emulation: the dequantized weights
+                params.append((name, (num_experts, rows, cols), self.moe.in_dtype))
+        return params
+
+    def expert_scale_names(self, prefix: str) -> list[str]:
+        return []  # the native tiles carry their codebooks and scales inline
+
+    def quantize_experts(
+        self, layer: RoutedExperts, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        packed, codebooks, scales = quantize_lut_b(weight)
+        if self._native:
+            return (lut_b_to_sm107_tiles(packed, codebooks, scales),)
+        return (dequantize_lut_b(packed, codebooks, scales, weight.dtype),)
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        w13, w2 = self.get_weights_for_quantization(layer)
-        self._zero_padding(layer, w13, w2)
-        for name, weight in (("w13_weight", w13), ("w2_weight", w2)):
-            packed, codebooks, scales = quantize_lut_b(weight)
-            if self.experts_cls is LutBSm107Experts:
-                weight = lut_b_to_sm107_tiles(packed, codebooks, scales)
-            else:
-                weight = dequantize_lut_b(packed, codebooks, scales, weight.dtype)
+        for name, weight in zip(
+            ("w13_weight", "w2_weight"), self.quantized_weights(layer)
+        ):
+            if self._native and weight.dim() == 3:  # loaded: back to its tiles
+                num_experts, rows, width = weight.shape
+                cols = width * _TILE // LUT_B_SM107_TILE_BYTES
+                weight = weight.view(
+                    num_experts,
+                    rows // LUT_B_SM107_TILE_N,
+                    cols // LUT_B_SM107_TILE_K,
+                    LUT_B_SM107_TILE_BYTES,
+                )
             replace_parameter(layer, name, weight)
         self.release_requantization_source_weights(layer)
 

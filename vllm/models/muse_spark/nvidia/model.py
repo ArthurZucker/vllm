@@ -76,7 +76,6 @@ from vllm.model_executor.layers.quantization.online.base import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
@@ -466,9 +465,8 @@ class MuseSparkMoE(nn.Module):
 
         self.route_scale = config.routed_scaling_factor
 
-        # folded into the router weight as it loads (`_load_router_weight`)
+        # folded into the router weight as it loads (`conversion_mapping`'s Affine)
         self.router_output_multiplier = config.output_multiplier
-        self.router.weight.weight_loader = self._load_router_weight
 
         self.moe_router = MuseSparkRouter(
             top_k=config.num_experts_per_tok,
@@ -681,14 +679,6 @@ class MuseSparkMoE(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
             self.experts.finalize_weights()
-
-    def _load_router_weight(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor
-    ) -> None:
-        default_weight_loader(param, loaded_weight)  # replicated
-        if self.router_output_multiplier is not None:
-            with torch.no_grad():
-                param.mul_(self.router_output_multiplier)
 
     def _can_shard_projection(self, num_tokens: int, sp_active: bool) -> bool:
         return num_tokens <= _SHARDED_PROJECTION_MAX_TOKENS and (

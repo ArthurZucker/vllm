@@ -3,6 +3,7 @@
 
 from abc import abstractmethod
 from collections.abc import Callable, Iterator
+from functools import partial
 
 import torch
 
@@ -17,18 +18,30 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import triton_weight
 from vllm.model_executor.layers.quantization.online.requantization import (
     OnlineRequantizationMixin,
 )
-from vllm.model_executor.model_loader.reload.layerwise import (
-    initialize_online_processing,
-)
 from vllm.model_executor.utils import set_weight_attrs
 
 
-class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
-    """Base for MoE methods that load full-precision weights on meta device
-    and quantize them after loading via the QeRL layerwise processing system.
-    """
+def _zero_padded(
+    weight: torch.Tensor, shape: tuple[int, ...], segments: int
+) -> torch.Tensor:
+    """`weight` zero-padded to `shape`, each of its `segments` along dim 1 (w13's
+    gate and up) padded on its own."""
+    if tuple(weight.shape) == tuple(shape):
+        return weight
+    padded = weight.new_zeros(shape)
+    for source, target in zip(weight.chunk(segments, 1), padded.chunk(segments, 1)):
+        target[tuple(slice(0, n) for n in source.shape)] = source
+    return padded
 
-    uses_meta_device: bool = True
+
+class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
+    """Base for MoE methods quantizing full-precision experts as they load.
+
+    `create_quantized_weights` registers the quantized params, which the plan's
+    quantize op (`checkpoint_quantizer`) fills from the merged `[E, N, K]` experts
+    with `quantize_experts`, after the model's converter ops. A requantization
+    source keeps its own params instead, quantized after loading.
+    """
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -61,73 +74,103 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
             layer.num_experts = num_experts
             return
 
-        # Fused gate_up_proj (column parallel) — full precision on meta device
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                self.moe.w13_num_shards * intermediate_size_per_partition,
-                hidden_size,
-                device="meta",
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w13_rows = self.moe.w13_num_shards * intermediate_size_per_partition
+        for name, shape, dtype in self.quantized_params(
+            num_experts, w13_rows, intermediate_size_per_partition, hidden_size
+        ):
+            param = torch.nn.Parameter(
+                torch.empty(shape, dtype=dtype), requires_grad=False
+            )
+            layer.register_parameter(name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+        if layer.w2_weight.shape[-1] != intermediate_size_per_partition:
+            # packed along its TP-sharded dim: the loader shards the checkpoint's
+            # full-precision w2 evenly, not by the param's (packed) width
+            layer.w2_weight.shard_even = True
 
-        # down_proj (row parallel) — full precision on meta device
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                device="meta",
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-        # BIASES (for models like GPT-OSS that have biased MoE)
+        # BIASES (for models like GPT-OSS that have biased MoE), loaded as they are
         if self.moe.has_bias:
-            w13_bias = torch.nn.Parameter(
-                torch.zeros(
-                    num_experts,
-                    self.moe.w13_num_shards * intermediate_size_per_partition,
-                    device="meta",
-                    dtype=layer.orig_dtype,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("w13_bias", w13_bias)
-            set_weight_attrs(w13_bias, extra_weight_attrs)
-
-            w2_bias = torch.nn.Parameter(
-                torch.zeros(
-                    num_experts,
-                    hidden_size,
-                    device="meta",
-                    dtype=layer.orig_dtype,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("w2_bias", w2_bias)
-            set_weight_attrs(w2_bias, extra_weight_attrs)
+            for name, shape in (
+                ("w13_bias", (num_experts, w13_rows)),
+                ("w2_bias", (num_experts, hidden_size)),
+            ):
+                bias = torch.nn.Parameter(
+                    torch.zeros(shape, dtype=params_dtype), requires_grad=False
+                )
+                layer.register_parameter(name, bias)
+                set_weight_attrs(bias, extra_weight_attrs)
 
         layer.w13_input_scale = None
         layer.w2_input_scale = None
+        layer.quantizes_on_load = True
 
-        initialize_online_processing(layer)
+    def quantized_params(
+        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        """`(name, shape, dtype)` of each quantized param: `w13_weight` holds
+        `[num_experts, w13_rows, hidden]` experts, `w2_weight`
+        `[num_experts, hidden, intermediate]`, then their scales."""
+        raise NotImplementedError
 
-    def get_weights_for_quantization(
-        self, layer: torch.nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the high precision `(w13, w2)` of all local experts."""
+    def expert_scale_names(self, prefix: str) -> list[str]:
+        """The scales `quantize_experts` returns for `{prefix}weight`, in order."""
+        return [f"{prefix}weight_scale"]
+
+    def quantize_experts(
+        self, layer: torch.nn.Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """`(values, *scales)` of the full-precision `[E, N, K]` experts of `name`
+        (`w13_weight` or `w2_weight`), zero-padded to the layer's sizes."""
+        raise NotImplementedError
+
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """The plan's quantize op of each expert weight, after the experts merge"""
+        if self.requantization_source is not None:
+            return self.source_checkpoint_quantizer(layer)
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmQuantizeQuantizer,
+        )
+
+        return VllmQuantizeQuantizer(
+            {
+                f"{prefix}weight": (
+                    partial(self._quantize_on_load, layer, f"{prefix}weight"),
+                    self.expert_scale_names(prefix),
+                    True,
+                )
+                for prefix in ("w13_", "w2_")
+            }
+        )
+
+    def _quantize_on_load(
+        self, layer: torch.nn.Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        config = layer.moe_config
+        num_experts, hidden = weight.shape[0], config.hidden_dim
+        rows = config.intermediate_size_per_partition
+        if name == "w13_weight":
+            segments = self.moe.w13_num_shards
+            shape = (num_experts, segments * rows, hidden)
+        else:
+            shape, segments = (num_experts, hidden, rows), 1
+        return self.quantize_experts(layer, name, _zero_padded(weight, shape, segments))
+
+    def quantized_weights(self, layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
+        """`(w13, *w13 scales, w2, *w2 scales)`: as loaded, or the requantization
+        source's, quantized now."""
         if self.requantization_source is None:
-            return layer.w13_weight, layer.w2_weight
-        w13, w2 = self.quantize_weights(layer, lambda w13, w2: (w13, w2))
-        return w13, w2
+            return tuple(
+                getattr(layer, name)
+                for prefix in ("w13_", "w2_")
+                for name in (f"{prefix}weight", *self.expert_scale_names(prefix))
+            )
+        return self.quantize_weights(
+            layer,
+            lambda w13, w2: (
+                *self.quantize_experts(layer, "w13_weight", w13),
+                *self.quantize_experts(layer, "w2_weight", w2),
+            ),
+        )
 
     def iter_weights_for_quantization(
         self, layer: torch.nn.Module
@@ -258,43 +301,6 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
             return padded_w13, padded_w2
 
         return pad_moe_weights(w13, w2)
-
-    def _zero_padding(
-        self,
-        layer: torch.nn.Module,
-        w13_weight: torch.Tensor | None = None,
-        w2_weight: torch.Tensor | None = None,
-    ) -> None:
-        w13_weight = layer.w13_weight if w13_weight is None else w13_weight
-        w2_weight = layer.w2_weight if w2_weight is None else w2_weight
-        hidden_size = layer.moe_config.hidden_dim_unpadded
-        intermediate_size = layer.moe_config.intermediate_size_per_partition_unpadded
-
-        w13_shard = w13_weight.shape[1] // self.moe.w13_num_shards
-        if w13_shard > intermediate_size:
-            for shard in range(self.moe.w13_num_shards):
-                start = shard * w13_shard + intermediate_size
-                w13_weight[:, start : (shard + 1) * w13_shard, :] = 0
-        if w13_weight.shape[2] > hidden_size:
-            w13_weight[:, :, hidden_size:] = 0
-
-        if w2_weight.shape[1] > hidden_size:
-            w2_weight[:, hidden_size:, :] = 0
-        if w2_weight.shape[2] > intermediate_size:
-            w2_weight[:, :, intermediate_size:] = 0
-
-        if getattr(layer, "w13_bias", None) is not None:
-            w13_bias_shard = layer.w13_bias.shape[1] // self.moe.w13_num_shards
-            if w13_bias_shard > intermediate_size:
-                for shard in range(self.moe.w13_num_shards):
-                    start = shard * w13_bias_shard + intermediate_size
-                    layer.w13_bias[:, start : (shard + 1) * w13_bias_shard] = 0
-
-        if (
-            getattr(layer, "w2_bias", None) is not None
-            and layer.w2_bias.shape[1] > hidden_size
-        ):
-            layer.w2_bias[:, hidden_size:] = 0
 
     @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

@@ -31,6 +31,8 @@ from vllm.model_executor.layers.quantization.online.moe_base import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
     mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
@@ -82,6 +84,15 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
 
         self.kernel = init_mxfp8_linear_kernel(weight_shape=layer.weight.shape)
 
+    def quantized_params(self, n: int, k: int) -> list[tuple]:
+        scales = ((n, k // MXFP8_BLOCK_SIZE), MXFP8_SCALE_DTYPE)
+        return [(MXFP8_VALUE_DTYPE, 1), scales]
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return mxfp8_e4m3_quantize(weight.contiguous())
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if is_weights_pre_processed():
             if not self.supports_pre_processed_weights:
@@ -95,8 +106,7 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        weight = self.get_weight_for_quantization(layer)
-        weight_fp8, weight_scale = mxfp8_e4m3_quantize(weight.contiguous())
+        weight_fp8, weight_scale = self.quantized_weight(layer)
 
         layer.input_scale = None
         replace_parameter(layer, "weight", weight_fp8.data)
@@ -157,6 +167,31 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
         )
 
         layer.weight_block_size = [1, MXFP8_BLOCK_SIZE]
+
+    def quantized_params(
+        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        params = []
+        for prefix, rows, cols in (
+            ("w13_", w13_rows, hidden),
+            ("w2_", hidden, intermediate),
+        ):
+            params.append(
+                (f"{prefix}weight", (num_experts, rows, cols), MXFP8_VALUE_DTYPE)
+            )
+            params.append(
+                (
+                    f"{prefix}weight_scale",
+                    (num_experts, rows, cols // MXFP8_BLOCK_SIZE),
+                    MXFP8_SCALE_DTYPE,
+                )
+            )
+        return params
+
+    def quantize_experts(
+        self, layer: Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return self._quantize_mxfp8_moe_weight(weight)
 
     def _quantize_mxfp8_moe_weight(
         self, weight: torch.Tensor
@@ -259,13 +294,7 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
-        def quantize(w13_weight: torch.Tensor, w2_weight: torch.Tensor):
-            return (
-                *self._quantize_mxfp8_moe_weight(w13_weight),
-                *self._quantize_mxfp8_moe_weight(w2_weight),
-            )
-
-        w13, w13_scale, w2, w2_scale = self.quantize_weights(layer, quantize)
+        w13, w13_scale, w2, w2_scale = self.quantized_weights(layer)
 
         self._setup_kernel(
             layer,

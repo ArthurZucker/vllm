@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import importlib.machinery
-import inspect
 import sys
 import types
 from pathlib import Path
@@ -25,6 +24,7 @@ from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader import ops_loader
 from vllm.model_executor.model_loader.checkpoint_weight_patch import (
     CheckpointWeightPatch,
     load_checkpoint_weight_patches,
@@ -55,17 +55,20 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.repo_utils import hf_api
 
 
+def _write(param: torch.Tensor, value: torch.Tensor, name: str = "") -> None:
+    """One write as `load_with_ops` makes it, through the installed `load_into`"""
+    ops_loader.current_load_into()(name, param, value)
+
+
 def test_preserve_placement_remapping_until_checkpoint_iteration_finishes():
     """Deferred reload keeps loaders installed through trailing checkpoint entries."""
     layer = torch.nn.Linear(2, 2, bias=False)
     record_metadata_for_reloading(layer)
     initialize_layerwise_reload(layer, defer_processing=True)
     checkpoint = torch.arange(4, dtype=torch.float32).reshape(2, 2)
-    loader = layer.weight.weight_loader
-    loader(layer.weight, checkpoint)
+    _write(layer.weight, checkpoint)
     assert layer.weight.is_meta
-    assert layer.weight.weight_loader is loader
-    loader(layer.weight, checkpoint + 1)
+    _write(layer.weight, checkpoint + 1)
     assert layer.weight.is_meta
     finalize_layerwise_reload(layer, model_config=None)
     assert torch.equal(layer.weight, checkpoint + 1)
@@ -146,7 +149,6 @@ class _ReloadableMMEncoderAttention(MMEncoderAttention):
     def __init__(self):
         torch.nn.Module.__init__(self)
         self.weight = torch.nn.Parameter(torch.ones(2, 2))
-        self.weight.weight_loader = default_weight_loader
         self.post_load_called = False
 
     def process_weights_after_loading(self) -> None:
@@ -160,7 +162,6 @@ class _ReloadableAttentionLayer(
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(2, 2))
-        self.weight.weight_loader = default_weight_loader
         self.post_load_called = False
 
     def get_attn_backend(self):
@@ -199,7 +200,7 @@ def test_attention_reload_defers_post_load(default_vllm_config, layer_cls):
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
-    layer.weight.weight_loader(layer.weight, loaded_weight)
+    _write(layer.weight, loaded_weight)
 
     assert not layer.post_load_called
 
@@ -220,7 +221,7 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
     loaded_weight = torch.full_like(layer.weight, 7.0)
 
     initialize_online_processing(layer)
-    layer.weight.weight_loader(layer.weight, loaded_weight)
+    _write(layer.weight, loaded_weight)
 
     finalize_layerwise_reload(model, default_vllm_config.model_config)
 
@@ -349,7 +350,6 @@ def _load_marlin_checkpoint_format_weights(layer):
         packed_dim=0,
         packed_factor=8,
     )
-    layer.qweight.weight_loader = default_weight_loader
     layer.scales = GroupQuantScaleParameter(
         data=torch.ones(
             _MARLIN_SIZE_K // _MARLIN_GROUP_SIZE, _MARLIN_SIZE_N, dtype=torch.float16
@@ -357,7 +357,6 @@ def _load_marlin_checkpoint_format_weights(layer):
         input_dim=0,
         output_dim=1,
     )
-    layer.scales.weight_loader = default_weight_loader
 
 
 def test_marlin_post_load_does_not_own_workspace(monkeypatch, dist_init):
@@ -519,135 +518,15 @@ def test_model_cleanup(dist_init, default_vllm_config):
     assert len(mock_info_dict) == 0
 
 
-@pytest.mark.parametrize("is_gated", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("tp_rank", [0, 1])
-@pytest.mark.parametrize("padded", [False, True])
-def test_padded_moe_reload_releases_each_layer(
-    monkeypatch, is_gated, has_bias, tp_rank, padded
-):
-    """Checkpoint-sized copies finish each layer without global finalization."""
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-        UnquantizedFusedMoEMethod,
-    )
-
-    # Fresh allocations hold garbage; padding must not inherit it.
-    empty_strided = torch.empty_strided
-    monkeypatch.setattr(
-        torch,
-        "empty_strided",
-        lambda *a, **k: empty_strided(*a, **k).fill_(float("nan")),
-    )
-    hidden, intermediate, experts = 4, 3, 2
-    stored_hidden, stored_intermediate = (8, 8) if padded else (hidden, intermediate)
-    config = SimpleNamespace(
-        hidden_dim_unpadded=hidden,
-        intermediate_size_per_partition_unpadded=intermediate,
-        is_act_and_mul=is_gated,
-        has_bias=has_bias,
-        tp_rank=tp_rank,
-        tp_shard_with_padding=False,
-        num_experts=experts,
-        moe_parallel_config=SimpleNamespace(tp_size=2),
-    )
-    model = torch.nn.ModuleList()
-    processed: list[torch.nn.Module] = []
-    for _ in range(2):
-        method = object.__new__(UnquantizedFusedMoEMethod)
-        torch.nn.Module.__init__(method)
-        method.moe = config
-        # The regression concerns streaming reload, not kernel conversion.
-        monkeypatch.setattr(method, "process_weights_after_loading", processed.append)
-        layer = object.__new__(RoutedExperts)
-        torch.nn.Module.__init__(layer)
-        layer.moe_config = config
-        layer.quant_config = None
-        layer.quant_method = method
-        layer.expert_map_manager = SimpleNamespace(
-            map_global_to_local=lambda i: i, num_fused_shared_experts=0
-        )
-        layer._loaded_expert_biases = set()
-        layer.shared_expert_online_loader = None
-        method.create_weights(
-            layer,
-            experts,
-            stored_hidden,
-            stored_intermediate,
-            torch.float32,
-            weight_loader=layer.weight_loader,
-        )
-        model.append(layer)
-
-    record_metadata_for_reloading(model)
-    original_params = [dict(layer.named_parameters()) for layer in model]
-    shards = ["w1", "w3", "w2"] if is_gated else ["w1", "w2"]
-    for cycle in range(2):
-        initialize_layerwise_reload(model)
-        for layer_index, layer in enumerate(model):
-            info = reload_layerwise.get_layerwise_info(layer)
-            inputs = []
-            expected = {
-                name: torch.full_like(p, float("nan"))
-                for name, p in original_params[layer_index].items()
-            }
-            params = dict(layer.named_parameters())
-            calls = [
-                (e, s, b)
-                for e in range(experts)
-                for s in shards
-                for b in ([False, True] if has_bias else [False])
-            ]
-            for call_index, (expert, shard, bias) in enumerate(calls):
-                name = ("w2" if shard == "w2" else "w13") + (
-                    "_bias" if bias else "_weight"
-                )
-                shape = (
-                    ((hidden,) if bias else (hidden, 2 * intermediate))
-                    if shard == "w2"
-                    else ((2 * intermediate,) if bias else (2 * intermediate, hidden))
-                )
-                weight = torch.arange(
-                    torch.Size(shape).numel(), dtype=torch.float32
-                ).reshape(shape)
-                weight = weight + 100 * (1 + call_index + cycle)
-                inputs.append(ref(weight))
-                # Direct checkpoint loading is the reference for deferred reload.
-                layer.weight_loader(expected[name], weight, name, shard, expert)
-                param = params[name]
-                param.weight_loader(param, weight, name, shard, expert)
-                del weight
-                if call_index != len(calls) - 1:
-                    assert info.can_load(), (
-                        "Layer processed before its final checkpoint shard"
-                    )
-
-            assert not info.can_load(), (
-                "Padding must not defer the layer until finalization"
-            )
-            assert not info.loaded_weights
-            assert len(processed) == cycle * len(model) + layer_index + 1
-            assert all(source() is None for source in inputs)
-            for name, original in original_params[layer_index].items():
-                assert getattr(layer, name) is original
-                mask = torch.isfinite(expected[name])
-                assert torch.equal(original[mask], expected[name][mask])
-                assert torch.count_nonzero(original[~mask]) == 0
-
-
 def test_get_numel_loaded():
     param = torch.empty(10, device="meta")
     loaded_weight = torch.empty(10)
 
-    def complex_weight_loader(param, loaded_weight):
+    def complex_write():
         param[:3] = loaded_weight[:3]
         param[5:8] = loaded_weight[5:8]
-        return "value"
 
-    args = inspect.signature(complex_weight_loader).bind(param, loaded_weight)
-    num_loaded, ret = get_numel_loaded(complex_weight_loader, args)
-    assert num_loaded == 6
-    assert ret == "value"
+    assert get_numel_loaded(param, complex_write) == 6
 
 
 def test_get_numel_loaded_caps_at_param_size():
@@ -659,20 +538,16 @@ def test_get_numel_loaded_caps_at_param_size():
     loaded_weight = torch.ones(10)
     loader = composed_weight_loader(default_weight_loader, lambda x: x + 1)
 
-    args = inspect.signature(loader).bind(param, loaded_weight)
-    num_loaded, _ = get_numel_loaded(loader, args)
-    assert num_loaded == 10
+    assert get_numel_loaded(param, lambda: loader(param, loaded_weight)) == 10
 
 
 def test_layerwise_loading_warning_only_checks_new_layers(monkeypatch):
     layers = [torch.nn.Linear(16, 1, bias=False) for _ in range(2)]
 
-    def partial_weight_loader(param, loaded_weight):
-        param.view(-1)[: loaded_weight.numel()].copy_(loaded_weight)
-
     for layer in layers:
         layer.weight.requires_grad_(False)
-        layer.weight.weight_loader = partial_weight_loader
+        # more to load than three writes: the layers stay buffering
+        layer.weight.weight_loader_numel = 64
         reload_layerwise.initialize_online_processing(layer)
 
     monkeypatch.setattr(reload_layerwise, "has_device_tensors", lambda _: True)
@@ -685,31 +560,23 @@ def test_layerwise_loading_warning_only_checks_new_layers(monkeypatch):
     try:
         for layer in layers:
             for _ in range(3):
-                layer.weight.weight_loader(layer.weight, torch.ones(1))
+                _write(layer.weight, torch.ones(1, 16))
     finally:
         reload_layerwise.LOADING_LAYERS.clear()
+        reload_layerwise._untrack(layers)
 
     assert get_info_size.call_count == 2
     warning_once.assert_called_once()
 
 
 class _ComposedLoaderLayer(torch.nn.Module):
-    """Mimics a Mamba2 mixer's equal-numel direct params (A, D, dt_bias).
-
-    `A` uses `composed_weight_loader` (an extra in-place transform copy),
-    matching `MambaMixer2` where `A` is loaded as `-exp(A_log)`.
-    """
+    """Mimics a Mamba2 mixer's equal-numel direct params (A, D, dt_bias)."""
 
     def __init__(self):
         super().__init__()
         self.A = torch.nn.Parameter(torch.empty(4, dtype=torch.float32))
         self.D = torch.nn.Parameter(torch.ones(4))
         self.dt_bias = torch.nn.Parameter(torch.ones(4))
-        self.A.weight_loader = composed_weight_loader(
-            default_weight_loader, lambda x: -torch.exp(x.float())
-        )
-        self.D.weight_loader = default_weight_loader
-        self.dt_bias.weight_loader = default_weight_loader
 
 
 def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
@@ -748,10 +615,10 @@ def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
     params = dict(layer.named_parameters())
     for name in ("A", "dt_bias", "D"):
         param = params[name]
-        param.weight_loader(param, loaded[name])
+        _write(param, loaded[name])
     finalize_layerwise_reload(model, model_config=None)
 
-    assert torch.equal(layer.A, -torch.exp(loaded["A"]))
+    assert torch.equal(layer.A, loaded["A"])
     assert torch.equal(layer.dt_bias, loaded["dt_bias"])
     assert torch.equal(layer.D, loaded["D"])
 
@@ -783,11 +650,9 @@ class _LateBiasLayer(torch.nn.Module):
         super().__init__()
         self.quant_method = quant_method
         weight = torch.nn.Parameter(torch.empty(4, 2, device="meta"))
-        weight.weight_loader = default_weight_loader
         self.register_parameter("weight", weight)
         initialize_online_processing(self)
         bias = torch.nn.Parameter(torch.zeros(4))
-        bias.weight_loader = default_weight_loader
         self.register_parameter("bias", bias)
 
 
@@ -800,76 +665,12 @@ def test_online_processing_waits_for_late_registered_bias():
     layer = _LateBiasLayer(quant_method)
     loaded_bias = torch.full((4,), 3.0)
 
-    layer.weight.weight_loader(layer.weight, torch.full((4, 2), 2.0))
+    _write(layer.weight, torch.full((4, 2), 2.0))
     assert quant_method.bias_at_process is None
 
-    layer.bias.weight_loader(layer.bias, loaded_bias)
+    _write(layer.bias, loaded_bias)
     assert quant_method.bias_at_process is not None
     assert torch.equal(quant_method.bias_at_process, loaded_bias)
-
-
-@pytest.mark.parametrize("num_heads", [96, 128])
-@pytest.mark.parametrize("tp_rank", [0, 3])
-@pytest.mark.parametrize("reverse", [False, True])
-def test_kda_online_loading_releases_sources_and_zeros_padding(
-    monkeypatch, default_vllm_config, num_heads, tp_rank, reverse
-):
-    """Finish KDA's merged projection after six inputs, before model finalization."""
-    from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
-    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
-
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_tp_group",
-        lambda: SimpleNamespace(world_size=8, rank_in_group=tp_rank),
-    )
-    default_vllm_config.model_config = SimpleNamespace(dtype=torch.float32)
-    config = KimiLinearConfig(
-        hidden_size=16,
-        linear_attn_config={
-            "kda_layers": [0],
-            "full_attn_layers": [],
-            "head_dim": 128,
-            "num_heads": num_heads,
-            "short_conv_kernel_size": 4,
-            "use_full_rank_gate": True,
-        },
-    )
-    attention = KimiK3DeltaAttention(
-        config, default_vllm_config, prefix="model.layers.0.self_attn"
-    )
-    projection = attention.in_proj_qkvgfab
-    # Exercise online loading on CPU without selecting a GPU quantization kernel.
-    projection.weight = to_meta_tensor(projection.weight)
-    projection.quant_method = None
-    initialize_online_processing(projection)
-
-    empty_strided = torch.empty_strided
-
-    def poisoned_empty(*args, **kwargs):
-        return empty_strided(*args, **kwargs).fill_(float("nan"))
-
-    monkeypatch.setattr(torch, "empty_strided", poisoned_empty)
-    widths = [128 * num_heads] * 4 + [128, num_heads]
-    expected = {}
-    sources = []
-    for shard in reversed(range(6)) if reverse else range(6):
-        source = torch.arange(widths[shard] * 16, dtype=torch.float32).reshape(-1, 16)
-        sources.append(ref(source))
-        local_width = widths[shard] if shard == 4 else widths[shard] // 8
-        start = 0 if shard == 4 else tp_rank * local_width
-        expected[shard] = source[start : start + local_width].clone()
-        assert projection.weight.is_meta
-        projection.weight.weight_loader(projection.weight, source, shard)
-        del source
-
-    assert not projection.weight.is_meta
-    assert all(source() is None for source in sources)
-    expected_weight = torch.cat([expected[shard] for shard in range(6)])
-    torch.testing.assert_close(
-        projection.weight[: len(expected_weight)], expected_weight
-    )
-    padding = projection.weight[len(expected_weight) :]
-    assert torch.equal(padding, torch.zeros_like(padding))
 
 
 def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypatch):
@@ -895,7 +696,7 @@ def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypat
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
-    layer.weight.weight_loader(layer.weight, loaded_weight)
+    _write(layer.weight, loaded_weight)
     finalize_layerwise_reload(model, model_config=None)
 
     assert torch.equal(layer.weight, loaded_weight)
@@ -938,8 +739,8 @@ def test_layerwise_reload_skips_child_parameter_alias_buffers(monkeypatch):
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
-    layer.conv1d.weight.weight_loader(layer.conv1d.weight, loaded_conv)
-    layer.scale.weight_loader(layer.scale, loaded_scale)
+    _write(layer.conv1d.weight, loaded_conv)
+    _write(layer.scale, loaded_scale)
     finalize_layerwise_reload(model, model_config=None)
 
     assert torch.equal(layer.conv1d.weight, loaded_conv)
@@ -974,7 +775,7 @@ def test_layerwise_reload_restores_alias_buffer_on_zero_size_layer(monkeypatch):
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
-    layer.conv1d.weight.weight_loader(layer.conv1d.weight, loaded_conv)
+    _write(layer.conv1d.weight, loaded_conv)
     finalize_layerwise_reload(model, model_config=None)
 
     assert torch.equal(layer.conv_weights, loaded_conv.view(-1))
@@ -1009,7 +810,7 @@ def test_layerwise_reload_preserves_unloaded_non_persistent_buffers(monkeypatch)
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
-    layer.weight.weight_loader(layer.weight, loaded_weight)
+    _write(layer.weight, loaded_weight)
     finalize_layerwise_reload(model, model_config=None)
 
     assert torch.equal(layer.weight, loaded_weight)
@@ -1042,8 +843,8 @@ def test_layerwise_reload_updates_loaded_non_persistent_buffers(monkeypatch):
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
-    layer.weight.weight_loader(layer.weight, loaded_weight)
-    layer.scale.weight_loader(layer.scale, loaded_scale)
+    _write(layer.weight, loaded_weight)
+    _write(layer.scale, loaded_scale)
     finalize_layerwise_reload(model, model_config=None)
 
     assert torch.equal(layer.weight, loaded_weight)
@@ -1144,8 +945,8 @@ def test_hpc_rope_norm_kernel_sees_refit_norm_weights(monkeypatch, hpc_rope_norm
 
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
-    layer.q_norm.weight.weight_loader(layer.q_norm.weight, loaded(2.0))
-    layer.k_norm.weight.weight_loader(layer.k_norm.weight, loaded(3.0))
+    _write(layer.q_norm.weight, loaded(2.0))
+    _write(layer.k_norm.weight, loaded(3.0))
     finalize_layerwise_reload(model, model_config=None)
 
     q, k = kernel_norm_weights()
@@ -1487,7 +1288,7 @@ class _TwoLayerModel(torch.nn.Module):
         loaded = set()
         for name, tensor in weights:
             param = params[name]
-            getattr(param, "weight_loader", default_weight_loader)(param, tensor)
+            _write(param, tensor, name)
             loaded.add(name)
         return loaded
 
@@ -1572,7 +1373,6 @@ def test_attention_post_load_reads_normalized_transform(dist_init):
     transform = HadamardTransform.__new__(HadamardTransform)
     torch.nn.Module.__init__(transform)
     transform.weight = SharedWeightParameter()
-    transform.weight.weight_loader = default_weight_loader
     transform.weight.add_partition(0, object(), (4, 4))
     transform.weight.partitions[0].data.fill_(1.0)
 

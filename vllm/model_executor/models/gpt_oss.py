@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
-from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -34,10 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    make_attention_sink,
-)
+from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -56,24 +52,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-
-_GPT_OSS_STREAMED_EXPERT_SUFFIX_TO_SHARD = {
-    "w13_weight": "gpt_oss_w13",
-    "w2_weight": "gpt_oss_w2",
-    "w13_bias": "gpt_oss_w13",
-    "w2_bias": "gpt_oss_w2",
-    "w13_weight_scale": "gpt_oss_w13",
-    "w2_weight_scale": "gpt_oss_w2",
-    "w13_weight_packed": "gpt_oss_w13",
-    "w2_weight_packed": "gpt_oss_w2",
-}
-
-
-def _get_weight_loader(param: torch.Tensor) -> Callable[..., object]:
-    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-    if not callable(weight_loader):
-        raise TypeError("weight_loader must be callable")
-    return weight_loader
 
 
 class OAIAttention(nn.Module):
@@ -185,28 +163,8 @@ class OAIAttention(nn.Module):
 
 
 class GptOssRoutedExperts(RoutedExperts):
-    """Load one GPT-OSS expert at a time without assembling the global stack."""
-
-    @staticmethod
-    def _narrow_for_rank(
-        loaded_weight: torch.Tensor,
-        dim: int,
-        rank: int,
-        size: int,
-    ) -> torch.Tensor:
-        start = rank * size
-        available = loaded_weight.shape[dim] - start
-        return loaded_weight.narrow(dim, start, min(size, max(available, 0)))
-
-    @staticmethod
-    def _copy_to_expert(expert_data: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        if expert_data.numel() == loaded_weight.numel() == 1:
-            expert_data.copy_(loaded_weight.reshape(()))
-            return
-        while loaded_weight.ndim > expert_data.ndim and loaded_weight.shape[-1] == 1:
-            loaded_weight = loaded_weight.squeeze(-1)
-        slices = tuple(slice(0, size) for size in loaded_weight.shape)
-        expert_data[slices].copy_(loaded_weight)
+    """GPT-OSS's routed experts (a class of their own: expert substitution
+    requires the default ones)"""
 
 
 class MLPBlock(torch.nn.Module):
@@ -404,32 +362,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
         if len(aux_hidden_states) > 0:
             return x, aux_hidden_states
         return x
-
-    @staticmethod
-    def _get_streamed_expert_info(
-        name: str,
-        params_dict: dict[str, torch.nn.Parameter],
-    ) -> tuple[int, str, str] | None:
-        """Parse `...experts.<expert_id>.<fused_param>` checkpoint keys."""
-        if ".mlp.experts." not in name:
-            return None
-        suffix = name.rsplit(".", 1)[-1]
-        shard_id = _GPT_OSS_STREAMED_EXPERT_SUFFIX_TO_SHARD.get(suffix)
-        if shard_id is None:
-            return None
-
-        prefix, expert_suffix = name.split(".mlp.experts.", maxsplit=1)
-        expert_id_str, separator, param_suffix = expert_suffix.partition(".")
-        if not separator or not expert_id_str.isdigit():
-            return None
-        expert_id = int(expert_id_str)
-        for base_layer_prefix in ("", "base_layer."):
-            fused_name = (
-                f"{prefix}.mlp.experts.{base_layer_prefix}routed_experts.{param_suffix}"
-            )
-            if fused_name in params_dict:
-                return expert_id, fused_name, shard_id
-        return None
 
 
 class GptOssForCausalLM(

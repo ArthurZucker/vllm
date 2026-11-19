@@ -306,8 +306,7 @@ def _check_peer_group_table(store_path: str):
         )
     assert table.dp_size == 1
     assert table.peer_rows == -(-sum(HEAD_SIZES) // WORLD_SIZE)
-    table.weight.weight_loader(table.weight, weight)
-    table.weight_scale_inv.weight_loader(table.weight_scale_inv, scale)
+    _load_table(table, weight, scale)
     table.process_weights_after_loading()
     ids = _make_ids(HEAD_SIZES, 9, seed=500 + group.rank_in_group)
     expected = _reference(weight.cuda(), scale.cuda(), ids)
@@ -371,8 +370,7 @@ def _check_fp8_batch(vllm_config):
         table = ParallelEngramEmbedding(
             sum(HEAD_SIZES), DIM, HEAD_SIZES, cpu_offload=True
         )
-        table.weight.weight_loader(table.weight, weight)
-        table.weight_scale_inv.weight_loader(table.weight_scale_inv, scale)
+        _load_table(table, weight, scale)
         staged = torch.empty(0, device="cuda")
         reference = (weight.cuda(), scale.cuda())
         layers.append(SimpleNamespace(embed_tokens=table, staged_rows=staged))
@@ -676,15 +674,8 @@ def _check_table(
             if multithread:
                 _load_shared_multithread(layer, weight, scale_inv, load_config)
             else:
-                # Only the leader has valid checkpoint payload in shared mode.
-                loader_weight = weight if not dp_shared_memory or dp_rank == 0 else None
-                loader_scale = (
-                    scale_inv if not dp_shared_memory or dp_rank == 0 else None
-                )
-                layer.weight.weight_loader(layer.weight, loader_weight)
-                layer.weight_scale_inv.weight_loader(
-                    layer.weight_scale_inv, loader_scale
-                )
+                # every rank writes its rows (the same ones, in shared mode)
+                _load_table(layer, weight, scale_inv)
             # As the model loader does: peers must not read rows still loading.
             layer.process_weights_after_loading()
             # Shared host tables and GPU peer reads look up only local tokens.
@@ -881,12 +872,20 @@ def _check_dummy_hash_model_forward(
     torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
 
+def _load_table(table, weight, scale_inv):
+    """The engram table's checkpoint tensors through the ops loader"""
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
+
+    load_with_ops(table, [("weight", weight), ("weight_scale_inv", scale_inv)])
+
+
 def _load_shared_multithread(layer, weight, scale_inv, load_config):
     """Opposite shard completion orders must leave every shared parameter ready."""
     from safetensors.torch import save_file
 
     from vllm.model_executor.model_loader import weight_utils
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
 
     tensors = {
         "weight": weight,
@@ -911,16 +910,17 @@ def _load_shared_multithread(layer, weight, scale_inv, load_config):
         source = DefaultModelLoader.Source(directory, revision=None)
         loaded = []
         for name, tensor in loader._get_weights_iterator(source):
-            param = getattr(layer, name)
-            param.weight_loader(param, tensor)
+            load_with_ops(layer, [(name, tensor)])
             loaded.append(name)
             first_loaded.set()
         assert loaded == order
+    # every rank of the group has written the shared tables
+    layer.process_weights_after_loading()
 
     # Check before any further collective could mask incomplete shared writes.
     for name, tensor in tensors.items():
         param = getattr(layer, name)
-        expected = tensor.narrow(0, param.engram_vocab_start, param.shape[0])
+        expected = tensor.narrow(0, param.row_start, param.shape[0])
         torch.testing.assert_close(
             param.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
         )

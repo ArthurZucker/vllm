@@ -179,8 +179,8 @@ def replace_parameter(
     existing one is an online requantization source (released after conversion).
 
     Custom attributes set on `new_tensor` (e.g. kernel dispatch flags such as
-    `is_shuffled`) are carried over to the parameter, except `weight_loader`,
-    which is always taken from the existing parameter, and the direct-reload
+    `is_shuffled`) are carried over to the parameter, except `weight_loader`
+    (loading writes through `ops_loader`, not per-param loaders), and the direct-reload
     attributes `_ckpt` and `fill_on_reload`, which belong to the parameter they
     were set on.
 
@@ -208,10 +208,8 @@ def replace_parameter(
 
     new_tensor_attrs = dict(new_tensor.__dict__)
 
-    # `weight_loader` is the only attribute not ported over from new_tensor,
-    # old_param.weight_loader only is supported. `_weight_loader` is
-    # `BasevLLMParameter`'s backing field for its `weight_loader` property, so
-    # a loader riding along under that name has to be dropped as well.
+    # a `weight_loader` riding along on new_tensor is not ported over (nor its
+    # `BasevLLMParameter` backing field `_weight_loader`).
     new_tensor_attrs.pop("weight_loader", None)
     new_tensor_attrs.pop("_weight_loader", None)
     # A checkpoint record belongs to the parameter it was recorded on (direct
@@ -255,10 +253,6 @@ def replace_parameter(
 
     for attr_name, attr in new_tensor_attrs.items():
         setattr(new_param, attr_name, attr)
-
-    if old_param is not None and hasattr(old_param, "weight_loader"):
-        weight_loader = old_param.weight_loader
-        set_weight_attrs(new_param, {"weight_loader": weight_loader})
 
     setattr(layer, param_name, new_param)
 

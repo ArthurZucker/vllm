@@ -184,3 +184,89 @@ class HeadPermute(ConversionOps):
                 for t in tensors
             ]
         return input_dict
+
+
+class RankChunk(ConversionOps):
+    """Rank `rank`'s chunk of `dim` out of `ranks`, for a tensor whose row count is
+    known only on read: with fewer rows than ranks (kv heads replicated), consecutive
+    ranks take the same row (FoPE's per-kv-head coefficients)"""
+
+    def __init__(self, rank: int, ranks: int, dim: int = 0):
+        self.rank, self.ranks, self.dim = rank, ranks, dim
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        def chunk(t):
+            ranks, rank = self.ranks, self.rank
+            if t.shape[self.dim] < ranks:
+                rank //= ranks // t.shape[self.dim]
+                ranks = t.shape[self.dim]
+            return t.chunk(ranks, self.dim)[rank]
+
+        return _each(input_dict, chunk)
+
+
+def _list(input_dict: dict) -> list[torch.Tensor]:
+    """The tensors of a single-source op, as a list (Transformers passes lists)"""
+    tensor = next(iter(input_dict.values()))
+    return tensor if isinstance(tensor, list) else [tensor]
+
+
+def _target(kwargs: dict) -> torch.Tensor:
+    return kwargs["model"].get_parameter(kwargs["full_layer_name"])
+
+
+class ViewAsParam(ConversionOps):
+    """The tensors' bytes as their target param's dtype, of the same width: ue8m0
+    scales (`float8_e8m0fnu`) or packed FP4 into a `uint8` param, which a cast would
+    convert by value. The param keeps the sent dtype (`keeps_sent_dtype`)"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        dtype = _target(kwargs).dtype
+
+        def view(t):
+            same_width = t.element_size() == dtype.itemsize
+            return t.view(dtype) if t.dtype != dtype and same_width else t
+
+        return _each(input_dict, view)
+
+
+class ParamRows(ConversionOps):
+    """The target param's rows of the tensor, from its `row_start` (default 0):
+    DeepSeek V4.1's engram heads, unevenly sized, each rank a contiguous range"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        param = _target(kwargs)
+        start = getattr(param, "row_start", 0)
+        return _each(input_dict, lambda t: t.narrow(0, start, param.shape[0]))
+
+
+class Narrow(ConversionOps):
+    """`[start, start + length)` of `dim`: a layer's own experts of the experts
+    stacked on disk (mega-MoE layers). With `full`, only a tensor that long on `dim`;
+    another is taken as narrowed already"""
+
+    def __init__(self, dim: int, start: int, length: int, full: int | None = None):
+        self.dim, self.start, self.length, self.full = dim, start, length, full
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        def narrow(t):
+            if self.full is not None and t.shape[self.dim] != self.full:
+                return t
+            return t.narrow(self.dim, self.start, self.length)
+
+        return {target_patterns[0]: [narrow(t) for t in _list(input_dict)]}
+
+
+class Refuse(ConversionOps):
+    """Raises instead of loading: a layer whose weights were transformed in place
+    for its kernel (Step5's mega-MoE), which a reload would corrupt"""
+
+    def __init__(self, message: str):
+        self.message = message
+
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        raise RuntimeError(self.message)

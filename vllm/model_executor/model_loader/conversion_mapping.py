@@ -31,12 +31,17 @@ from transformers.core_model_loading import (
 )
 
 from vllm.model_executor.model_loader.weight_ops import (
+    Affine,
     Deinterleave,
     ExpertRows,
     HeadPermute,
+    Narrow,
     OutputConcatenate,
+    ParamRows,
+    Refuse,
     RepeatLastSource,
     SwapHalves,
+    ViewAsParam,
     ZeroMissingSource,
 )
 
@@ -568,12 +573,91 @@ def _k3_context_kv(module: nn.Module) -> WeightConverter:
     )
 
 
+def _minicpm_moe(module: nn.Module) -> list[WeightTransform]:
+    """MiniCPM's experts (`experts.N.w{1,3,2}`) merged into its `ws` / `w2s`"""
+    return [
+        WeightConverter(
+            ["experts.*.w1.weight", "experts.*.w3.weight"],
+            "ws",
+            operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+        ),
+        WeightConverter(
+            "experts.*.w2.weight", "w2s", operations=[MergeModulelist(dim=0)]
+        ),
+    ]
+
+
+def _muse_spark_moe(module: nn.Module) -> list[WeightTransform]:
+    """The router output multiplier folded into the router weight as it loads"""
+    scale = module.router_output_multiplier
+    if scale is None:
+        return []
+    return [
+        WeightConverter("router.weight", "router.weight", operations=[Affine(scale)])
+    ]
+
+
+def _engram_table(module: nn.Module) -> list[WeightTransform]:
+    """An engram table's rows this rank holds (`row_start`), as their bytes"""
+    return [
+        WeightConverter(name, name, operations=[ViewAsParam(), ParamRows()])
+        for name in ("weight", "weight_scale_inv")
+    ]
+
+
+def _stacked_experts(
+    module: nn.Module, start: int, count: int, total: int, refuse: str | None = None
+) -> list[WeightTransform]:
+    """A mega-MoE layer's experts stacked on disk (`[total, ...]`, also named
+    `routed_experts.<param>`): the `count` of them from `start`, or `refuse`d"""
+    ops = [Refuse(refuse)] if refuse else [Narrow(0, start, count, full=total)]
+    return [
+        WeightConverter(rf"^(?:routed_experts\.)?{name}$", name, operations=ops)
+        for name, _ in module.named_parameters(recurse=False)
+    ]
+
+
+def _per_expert(module: nn.Module) -> list[WeightTransform]:
+    """A mega-MoE layer's experts stored one by one (`N.w1.weight`, its scales
+    alike): this rank's merged into `w13_weight` / `w2_weight`, as their bytes
+    (ue8m0 scales and packed FP4 into uint8)"""
+    return [
+        WeightConverter(
+            ["*.w1.weight", "*.w3.weight"],
+            "w13_weight",
+            operations=[ViewAsParam(), MergeModulelist(dim=0), Concatenate(dim=1)],
+        ),
+        WeightConverter(
+            "*.w2.weight",
+            "w2_weight",
+            operations=[ViewAsParam(), MergeModulelist(dim=0)],
+        ),
+    ]
+
+
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "K2HorizonAttention": _k2_horizon,
     "KimiGatedDeltaNetAttention": _kimi_kda,
     "KimiK3DeltaAttention": _kimi_kda,
+    "MiniCPMMoE": _minicpm_moe,
+    "MuseSparkMoE": _muse_spark_moe,
+    "ParallelEngramEmbedding": _engram_table,
+    "MuseSparkMegaMoEExperts": lambda m: _stacked_experts(
+        m, m.experts_start_idx, m.num_local_experts, m.num_experts
+    ),
+    "Step5MegaMoEExperts": lambda m: _stacked_experts(
+        m,
+        m.expert_start,
+        m.num_local_experts,
+        m.num_experts,
+        refuse="Reloading transformed MegaMoE weights is unsupported"
+        if m.ready
+        else None,
+    ),
+    "DeepseekV4AiterMegaMoEExperts": _per_expert,
+    "DeepseekV4MegaMoEExperts": _per_expert,
     "K2HorizonMoVAAttention": _k2_horizon,
     "MistralLarge4ForCausalLM": MISTRAL_LARGE4,
     "Gemma4Model": _gemma4,

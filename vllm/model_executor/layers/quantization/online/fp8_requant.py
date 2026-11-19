@@ -150,6 +150,12 @@ class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
             layer.register_parameter(name, meta)
         initialize_online_processing(layer)
 
+    def checkpoint_quantizer(self, layer: RoutedExperts):
+        """The FP8 experts load as `Fp8MoEMethod` loads them; the MXFP4
+        requantization runs after loading (see `create_weights`)."""
+        quantizer = getattr(self.fp8_method, "checkpoint_quantizer", None)
+        return None if quantizer is None else quantizer(layer)
+
     def _requant(self, weight: torch.Tensor, scale_inv: torch.Tensor):
         num_experts, n, k = weight.shape
         out = torch.empty(

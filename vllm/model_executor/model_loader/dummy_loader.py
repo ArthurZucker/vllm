@@ -6,10 +6,7 @@ from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.model_loader.reload.layerwise import (
-    _get_original_loader,
-    get_layerwise_info,
-)
+from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 from vllm.model_executor.model_loader.reload.meta import materialize_layer
 from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
 from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
@@ -57,9 +54,6 @@ class DummyModelLoader(BaseModelLoader):
 
         for name, tensor in get_layer_tensors(layer).items():
             initialize_single_dummy_weight(tensor, name=name)
-
-        for param in get_layer_tensors(layer).values():
-            param.weight_loader = _get_original_loader(param)
 
         quant_method = getattr(layer, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):

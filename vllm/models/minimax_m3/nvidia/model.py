@@ -498,7 +498,6 @@ class MiniMaxM3MoE(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(config.num_local_experts, dtype=torch.float32)
         )
-        self.e_score_correction_bias.weight_loader = MiniMaxM3MoE.ebias_weight_loader
 
         # Router weights are stored in fp32; GateLinear upcasts the bf16
         # activations and computes the gate in fp32 (fp32 router logits).
@@ -607,11 +606,6 @@ class MiniMaxM3MoE(nn.Module):
         )
         if not self.experts.has_fused_shared_experts:
             self.shared_experts = replicated_shared_experts()
-
-    @staticmethod
-    def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight.to(torch.float32))
 
     @property
     def ffn_all_reduce_deferred(self) -> bool:

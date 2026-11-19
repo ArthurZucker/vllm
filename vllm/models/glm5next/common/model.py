@@ -60,9 +60,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-)
 from vllm.model_executor.models.deepseek_v2 import _get_moe_router_dtype
 from vllm.model_executor.models.glm4_1v import (
     Glm4vForConditionalGeneration,
@@ -599,10 +596,8 @@ class Glm5NextDecoderLayer(nn.Module):
                     "GLM-5.3 mHC uses FlashInfer mega mHC from %d tokens per step.",
                     self.mega_mhc_min_tokens,
                 )
-                # Weight updates rewrite hc_*_fn in place through these loaders,
-                # which rewrite the BF16 pieces in place too.
-                self.hc_attn_fn.weight_loader = self._load_hc_attn_fn
-                self.hc_ffn_fn.weight_loader = self._load_hc_ffn_fn
+                # Every load and reload rewrites the BF16 pieces of hc_*_fn in
+                # place after (`split_hc_fns`, from process_weights_after_loading)
                 if vllm_config.kernel_config.enable_jit_warmup:
                     MEGA_MHC_KERNEL.register_warmup(
                         max_num_batched_tokens=(
@@ -657,17 +652,6 @@ class Glm5NextDecoderLayer(nn.Module):
                     hidden_size=self.hidden_size,
                     hc_mult=self.n,
                 )
-
-    def _load_hc_attn_fn(self, param: torch.Tensor, loaded_weight: torch.Tensor):
-        default_weight_loader(param, loaded_weight)
-        # Layerwise reload also runs loaders on meta tensors, to count them.
-        if self.hc_attn_fn_split is not None and not param.is_meta:
-            split_mhc_fn(param, out=self.hc_attn_fn_split)
-
-    def _load_hc_ffn_fn(self, param: torch.Tensor, loaded_weight: torch.Tensor):
-        default_weight_loader(param, loaded_weight)
-        if self.hc_ffn_fn_split is not None and not param.is_meta:
-            split_mhc_fn(param, out=self.hc_ffn_fn_split)
 
     def split_hc_fns(self) -> None:
         """Make, or rewrite in place, the BF16 pieces of hc_attn_fn and hc_ffn_fn."""

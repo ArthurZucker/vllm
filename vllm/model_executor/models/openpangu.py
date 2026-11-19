@@ -649,10 +649,7 @@ class OpenPanguSinkAttention(nn.Module):
             )
             set_weight_attrs(
                 self.param_sink_key,
-                {
-                    "output_dim": 1,
-                    "weight_loader": self.weight_loader,
-                },
+                {"shard_dim": 1},  # kv heads over the TP ranks
             )
 
             if self.param_sink_with_value:
@@ -669,10 +666,7 @@ class OpenPanguSinkAttention(nn.Module):
                 )
                 set_weight_attrs(
                     self.param_sink_value,
-                    {
-                        "output_dim": 1,
-                        "weight_loader": self.weight_loader,
-                    },
+                    {"shard_dim": 1},
                 )
             else:
                 self.register_buffer(
@@ -690,25 +684,6 @@ class OpenPanguSinkAttention(nn.Module):
                 )
         # To enable dummy run with out weight
         self.post_weight_load()
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        output_dim = getattr(param, "output_dim", None)
-
-        is_sharded_weight = getattr(param, "is_sharded_weight", False)
-
-        param_data = param.data
-        if output_dim is not None and not is_sharded_weight:
-            shard_size = param_data.shape[output_dim]
-            start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-        # Special case for loading scales off disk, which often do not
-        # have a shape (such as in the case of AutoFP8).
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
 
     def forward(
         self,
@@ -1053,7 +1028,6 @@ class OpenPanguModel(nn.Module):
                     continue
             yield name, loaded_weight
 
-
     def post_weight_load(self) -> None:
         for _, module in self.named_modules():
             if module is self:
@@ -1124,7 +1098,6 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
 
 
 class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):

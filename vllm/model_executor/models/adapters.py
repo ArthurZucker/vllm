@@ -75,7 +75,7 @@ def _load_st_projector(model_config: "ModelConfig") -> nn.Module | None:
 def _load_dense_weights(
     linear: nn.Linear, folder: str, model_config: "ModelConfig"
 ) -> bool:
-    """Load weights using vLLM's weight_loader pattern."""
+    """Load a Sentence-Transformers Dense layer's weights into `linear`."""
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
     for filename in ["model.safetensors", "pytorch_model.bin"]:
@@ -101,17 +101,12 @@ def _load_dense_weights(
 
             for weight_key in ["weight", "linear.weight", "dense.weight"]:
                 if weight_key in state_dict:
-                    weight_loader = getattr(
-                        linear.weight, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(linear.weight, state_dict[weight_key])
+                    # a plain `nn.Linear`: copied
+                    default_weight_loader(linear.weight, state_dict[weight_key])
 
                     bias_key = weight_key.replace("weight", "bias")
                     if linear.bias is not None and bias_key in state_dict:
-                        bias_loader = getattr(
-                            linear.bias, "weight_loader", default_weight_loader
-                        )
-                        bias_loader(linear.bias, state_dict[bias_key])
+                        default_weight_loader(linear.bias, state_dict[bias_key])
                     return True
         except Exception:
             logger.exception("Failed to load %s", filename)
@@ -486,9 +481,7 @@ def load_weights_using_from_2_way_softmax(
     ) - lm_head_weight.data[[false_id]].to(torch.float32)
 
     score_layer = language_model.score if using_vlm_head else model.score
-    param = score_layer.weight
-    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-    weight_loader(param, score_weight)
+    default_weight_loader(score_layer.weight, score_weight)  # replicated
 
     del language_model.lm_head
 
@@ -552,9 +545,7 @@ def load_weights_no_post_processing(model, weights: Iterable[tuple[str, torch.Te
     score_weight = language_model.lm_head.weight.data[token_ids]
 
     score_layer = language_model.score if using_vlm_head else model.score
-    param = score_layer.weight
-    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-    weight_loader(param, score_weight)
+    default_weight_loader(score_layer.weight, score_weight)  # replicated
 
     del language_model.lm_head
 

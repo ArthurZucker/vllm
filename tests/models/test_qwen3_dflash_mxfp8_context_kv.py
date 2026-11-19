@@ -101,10 +101,19 @@ def _build_model(mode: str, has_bias: bool) -> tuple[DFlashQwen3Model, list]:
     model._context_kv_proj = None
     if mode == "mxfp8":
         model._context_kv_proj = model._make_mxfp8_context_kv_proj(attentions)
-        for i, tensors in enumerate(checkpoint):
-            for name, tensor in tensors.items():
-                model._load_context_kv(i, "k", name, tensor[Q_SIZE : Q_SIZE + KV_SIZE])
-                model._load_context_kv(i, "v", name, tensor[Q_SIZE + KV_SIZE :])
+        stream = [
+            (f"layers.{i}.self_attn.{proj}_proj.{name}", tensor[rows])
+            for i, tensors in enumerate(checkpoint)
+            for name, tensor in tensors.items()
+            for proj, rows in (
+                ("k", slice(Q_SIZE, Q_SIZE + KV_SIZE)),
+                ("v", slice(Q_SIZE + KV_SIZE, None)),
+            )
+        ]
+        for name, tensor in model.stack_context_kv(stream):
+            if name.startswith("model._context_kv_proj."):
+                param = getattr(model._context_kv_proj, name.rpartition(".")[2])
+                param.data.copy_(tensor)
     return model, attentions
 
 

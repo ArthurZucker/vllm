@@ -6,6 +6,7 @@ rotation of linear-layer inputs."""
 import pytest
 import torch
 
+from tests.quantization.utils import load_online_quantized
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config.model import ModelConfig
 from vllm.model_executor.kernels.linear.mxfp4.aiter import AiterMxfp4LinearKernel
@@ -20,6 +21,7 @@ from vllm.model_executor.layers.quantization.input_hadamard import (
     block_hadamard_rotate,
     hadamard_matrix,
 )
+from vllm.model_executor.layers.quantization.online.base import _RotatedOnLoad
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
 )
@@ -30,7 +32,7 @@ from vllm.model_executor.model_loader.reload.layerwise import (
     record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -230,9 +232,11 @@ def _online_mxfp4(
         inner.kernel.out_dtype = torch.bfloat16
     method: LinearMethodBase = inner
     if hadamard_size is not None:
-        method = InputHadamardLinearMethod(inner, hadamard_size, rotate_weight=True)
+        # as `OnlineQuantizationConfig.get_quant_method` wraps it
+        method = _RotatedOnLoad(inner, hadamard_size, rotate_weight=True)
     layer = torch.nn.Module()
     layer.weight_loader = default_weight_loader
+    layer.params_dtype = torch.bfloat16
     method.create_weights(
         layer=layer,
         input_size_per_partition=input_size,
@@ -242,8 +246,8 @@ def _online_mxfp4(
         params_dtype=torch.bfloat16,
         weight_loader=default_weight_loader,
     )
-    replace_parameter(layer, "weight", weight.clone())
-    method.process_weights_after_loading(layer)
+    # the plan's quantize op (rotating first), then post-load processing
+    load_online_quantized(layer, {"weight": weight.clone()}, method)
     return layer, method.apply(layer, x)
 
 

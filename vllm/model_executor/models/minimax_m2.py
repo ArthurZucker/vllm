@@ -84,9 +84,6 @@ class MiniMaxM2MoE(nn.Module):
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.num_local_experts, dtype=torch.float32)
             )
-            self.e_score_correction_bias.weight_loader = (
-                MiniMaxM2MoE.ebias_weight_loader
-            )
         else:
             self.e_score_correction_bias = None
 
@@ -112,11 +109,6 @@ class MiniMaxM2MoE(nn.Module):
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
-
-    @staticmethod
-    def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight.to(torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

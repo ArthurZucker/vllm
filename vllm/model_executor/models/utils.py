@@ -231,10 +231,8 @@ class AutoWeightsLoader:
     the weights only once.
 
     The weight loading logic for individual modules can be overridden
-    by defining a `load_weights` method.
-
-    Similarly, the weight loading logic for individual parameters can be
-    overridden by defining a `weight_loader` method.
+    by defining a `load_weights` method; a parameter is copied as it is (its
+    sharding and conversions are the ops loader's, `ops_loader.load_with_ops`).
 
     Detailed weight loading information can be viewed by setting the
     environment variable `VLLM_LOGGING_LEVEL=DEBUG`.
@@ -347,8 +345,7 @@ class AutoWeightsLoader:
                     weight_data.dtype,
                     param.dtype,
                 )
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight_data)
+            default_weight_loader(param, weight_data)
 
             logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
 

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import inspect
 from collections.abc import Callable
 
 import torch
@@ -178,34 +177,16 @@ class CopyCounter(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def get_numel_loaded(
-    weight_loader: Callable, args: inspect.BoundArguments
-) -> tuple[int, object]:
-    """Determine how many elements would be loaded by a weight loader call.
+def get_numel_loaded(param: torch.Tensor, write: Callable[[], object]) -> int:
+    """How many elements of `param` `write()` loads, counted by its `copy_`s.
 
-    Args:
-        weight_loader: used to load weights
-        args: bound arguments to weight loader
-
-    Returns:
-        number of elements loaded by the weight loader, the return value of the
-        weight loader
-
+    A write fills a single destination parameter, so the count is capped at that
+    parameter's size: some layers' loaders copy into the parameter more than once
+    -- e.g. ``composed_weight_loader`` runs an in-place post-load transform
+    (``param.copy_(fn(param))``) on top of the initial copy. Over-counting would
+    finalize the layer before every parameter is loaded, silently dropping the
+    trailing parameter(s) (e.g. Mamba ``mixer.D``).
     """
     with CopyCounter() as counter:
-        return_value = weight_loader(*args.args, **args.kwargs)
-
-    # A weight loader fills a single destination parameter, so the number of
-    # loaded elements is at most that parameter's size. Some loaders copy into
-    # the parameter more than once -- e.g. ``composed_weight_loader`` runs an
-    # in-place post-load transform (``param.copy_(fn(param))``) on top of the
-    # initial copy -- which would make CopyCounter report twice the parameter
-    # size. Over-counting inflates the layer's loaded-element total and can
-    # finalize the layer before every parameter is loaded, silently dropping
-    # the trailing parameter(s) (e.g. Mamba ``mixer.D``). Cap the count at the
-    # destination size to keep the per-layer accounting correct.
-    numel = counter.copied_numel
-    param = args.arguments.get("param", None)
-    if isinstance(param, torch.Tensor):
-        numel = min(numel, get_tensor_load_numel(param))
-    return numel, return_value
+        write()
+    return min(counter.copied_numel, get_tensor_load_numel(param))

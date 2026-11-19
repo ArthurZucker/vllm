@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -66,14 +67,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
 )
-from vllm.model_executor.model_loader.reload.layerwise import (
-    initialize_online_processing,
-)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
-from vllm.utils.math_utils import round_up
+from vllm.utils.math_utils import cdiv, round_up
 
 # ---------------------------------------------------------------------------
 # Online FP8 Linear Methods
@@ -129,11 +129,19 @@ def _is_tp_sharded(layer: Module, *, reduces_output_dim: bool = True) -> bool:
 
 
 class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
-    """Shared base for online FP8 linear methods. Loads fp16/bf16 checkpoint
-    weights onto meta device and materializes them just-in-time."""
+    """Base for online linear methods quantizing a full-precision weight as it
+    loads.
 
-    uses_meta_device: bool = True
+    `create_quantized_weights` registers the quantized params, which the plan's
+    quantize op (`checkpoint_quantizer`) fills with `quantize_weight` after the
+    model's converter ops (e.g. the merged `qkv`). A requantization source keeps
+    its own params, and an lm_head (a padded vocab, tied to the embeddings, or a
+    drafter's copy) its full-precision weight: both are quantized after loading.
+    """
+
     activation_quant_key: QuantKey | None
+    scale_names: tuple[str, ...] = ("weight_scale",)
+    """The scales `quantize_weight` returns, in order."""
 
     def __init__(self):
         super().__init__()
@@ -182,19 +190,65 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
-                device="meta",  # materialized and processed during loading
-                dtype=params_dtype,
-            ),
-            input_dim=1,
-            output_dim=0,
-        )
+        shape = (output_size_per_partition, input_size_per_partition)
+        if isinstance(layer, ParallelLMHead):
+            layer.register_parameter("weight", _weight_param(shape, params_dtype))
+            return
+        (weight_dtype, packing), *scales = self.quantized_params(*shape)
+        weight = _weight_param((shape[0], shape[1] // packing), weight_dtype)
+        if packing > 1 and input_size_per_partition != input_size:
+            # packed along its TP-sharded dim: the loader shards the checkpoint's
+            # full-precision weight evenly, not by the param's (packed) width
+            weight.shard_even = True
         layer.register_parameter("weight", weight)
+        for name, (scale_shape, dtype) in zip(self.scale_names, scales):
+            scale = torch.nn.Parameter(
+                torch.empty(scale_shape, dtype=dtype), requires_grad=False
+            )
+            layer.register_parameter(name, scale)
+        # The quantize op's outputs are this rank's already: copied as they are
+        for name in ("weight", *self.scale_names):
+            getattr(layer, name).weight_loader = default_weight_loader
+        layer.quantizes_on_load = True
 
-        initialize_online_processing(layer)
+    def quantized_params(self, n: int, k: int) -> list[tuple]:
+        """The `[n, k]` weight's quantized params: `(dtype, values per element)`
+        of the weight, then `(shape, dtype)` of each scale in `scale_names`."""
+        raise NotImplementedError
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """`(values, *scales)` of this rank's full-precision `weight`."""
+        raise NotImplementedError
+
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """The plan's quantize op of the weight, after the model's converter ops"""
+        if self.requantization_source is not None:
+            return self.source_checkpoint_quantizer(layer)
+        if not getattr(layer, "quantizes_on_load", False):
+            return None  # an lm_head, quantized after loading
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmQuantizeQuantizer,
+        )
+
+        quantize = partial(self.quantize_weight, layer)
+        return VllmQuantizeQuantizer(
+            {"weight": (quantize, list(self.scale_names), True)}
+        )
+
+    def quantized_weight(self, layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
+        """`(weight, *scales)`: as loaded, else quantized now (a requantization
+        source's weight, an lm_head's)."""
+        if getattr(layer, "quantizes_on_load", False):
+            return (layer.weight, *(getattr(layer, n) for n in self.scale_names))
+        return self.quantize_weight(layer, self.get_weight_for_quantization(layer))
+
+
+def _weight_param(shape: tuple[int, int], dtype: torch.dtype) -> ModelWeightParameter:
+    return ModelWeightParameter(
+        data=torch.empty(shape, dtype=dtype), input_dim=1, output_dim=0
+    )
 
 
 class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
@@ -253,6 +307,19 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
         )
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
+    def quantized_params(self, n: int, k: int) -> list[tuple]:
+        return [(current_platform.fp8_dtype(), 1), ((1,), torch.float32)]
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        # one scale over the whole (TP-global) weight
+        amax = weight_amax(weight).reshape(1)
+        amax = amax_for_tp_weight_quant(amax, _is_tp_sharded(layer))
+        weight_scale = _fp8_scale(amax)
+        qweight, _ = ops.scaled_fp8_quant(weight, scale=weight_scale)
+        return qweight, weight_scale
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if is_weights_pre_processed():
             if not self.supports_pre_processed_weights:
@@ -267,11 +334,7 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
             return
 
         layer.input_scale = None
-        weight = self.get_weight_for_quantization(layer)
-        amax = weight_amax(weight).reshape(1)
-        amax = amax_for_tp_weight_quant(amax, _is_tp_sharded(layer))
-        weight_scale = _fp8_scale(amax)
-        qweight, _ = ops.scaled_fp8_quant(weight, scale=weight_scale)
+        qweight, weight_scale = self.quantized_weight(layer)
 
         # Update layer with new values.
         replace_parameter(layer, "weight", qweight.t().data)
@@ -322,6 +385,7 @@ class Fp8PerBlockOnlineLinearMethod(OnlineLinearBase):
     Loads fp16/bf16 weights and quantizes them per-block during loading."""
 
     activation_quant_key = kFp8Dynamic128Sym
+    scale_names = ("weight_scale_inv",)
 
     def __init__(self):
         super().__init__()
@@ -368,6 +432,18 @@ class Fp8PerBlockOnlineLinearMethod(OnlineLinearBase):
             module_name=self.__class__.__name__,
         )
 
+    def quantized_params(self, n: int, k: int) -> list[tuple]:
+        block_n, block_k = self.weight_block_size
+        blocks = (cdiv(n, block_n), cdiv(k, block_k))
+        return [(current_platform.fp8_dtype(), 1), (blocks, torch.float32)]
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return per_block_cast_to_fp8(
+            weight, block_size=self.weight_block_size, use_ue8m0=False
+        )
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if is_weights_pre_processed():
             if not self.supports_pre_processed_weights:
@@ -382,12 +458,7 @@ class Fp8PerBlockOnlineLinearMethod(OnlineLinearBase):
             return
 
         layer.input_scale = None
-        block_size = self.weight_block_size
-        weight = self.get_weight_for_quantization(layer)
-
-        qweight, weight_scale_inv = per_block_cast_to_fp8(
-            weight, block_size=block_size, use_ue8m0=False
-        )
+        qweight, weight_scale_inv = self.quantized_weight(layer)
 
         replace_parameter(layer, "weight", qweight.data)
         replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
@@ -511,6 +582,20 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
                 module_name=self.__class__.__name__,
             )
 
+    def quantized_params(self, n: int, k: int) -> list[tuple]:
+        return [(current_platform.fp8_dtype(), 1), ((n, 1), torch.float32)]
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        # a row's scale over its whole (TP-global) input
+        amax = weight_amax(weight, dim=-1, keepdim=True)
+        amax = amax_for_tp_weight_quant(
+            amax, _is_tp_sharded(layer, reduces_output_dim=False)
+        )
+        weight_scale = _fp8_channel_scale(amax)
+        return _fp8_quant_per_channel(weight, weight_scale), weight_scale
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if is_weights_pre_processed():
             if not self.supports_pre_processed_weights:
@@ -526,13 +611,7 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
             return
 
         layer.input_scale = None
-        weight = self.get_weight_for_quantization(layer)
-        amax = weight_amax(weight, dim=-1, keepdim=True)
-        amax = amax_for_tp_weight_quant(
-            amax, _is_tp_sharded(layer, reduces_output_dim=False)
-        )
-        weight_scale = _fp8_channel_scale(amax)
-        qweight = _fp8_quant_per_channel(weight, weight_scale)
+        qweight, weight_scale = self.quantized_weight(layer)
 
         replace_parameter(layer, "weight", qweight.t())
         replace_parameter(layer, "weight_scale", weight_scale)
@@ -569,8 +648,8 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
 
 
 class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
-    """Shared base for online FP8 MoE methods. Loads fp16/bf16 checkpoint
-    weights onto meta device and materializes them just-in-time."""
+    """Shared base for online FP8 MoE methods: fp8 experts, quantized from the
+    fp16/bf16 checkpoint as they load."""
 
     # Declared here for mypy; actual values are set in __init__.
     fp8_backend: "Fp8MoeBackend"
@@ -613,6 +692,58 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
             activation_key=activation_key,
             allow_vllm_cutlass=allow_vllm_cutlass,
         )
+
+    def expert_scale_names(self, prefix: str) -> list[str]:
+        return [f"{prefix}{self.weight_scale_name}"]
+
+    def quantized_params(
+        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        fp8 = current_platform.fp8_dtype()
+        params = []
+        for prefix, rows, cols in (
+            ("w13_", w13_rows, hidden),
+            ("w2_", hidden, intermediate),
+        ):
+            params.append((f"{prefix}weight", (num_experts, rows, cols), fp8))
+            params.append(
+                (
+                    f"{prefix}{self.weight_scale_name}",
+                    (num_experts, *self._scale_shape(rows, cols)),
+                    torch.float32,
+                )
+            )
+        return params
+
+    def _scale_shape(self, rows: int, cols: int) -> tuple[int, ...]:
+        """An expert's scales of its `[rows, cols]` weight"""
+        raise NotImplementedError
+
+    def _process_quantized(self, layer: Module) -> None:
+        """The loaded (or requantized) fp8 experts into the kernel's format"""
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        w13, w13_scale, w2, w2_scale = self.quantized_weights(layer)
+        # Activation quantization is dynamic (including in re-quantization)
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        if self.weight_block_size is not None:
+            layer.weight_block_size = self.weight_block_size
+        self._setup_kernel(
+            layer,
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+            w13_input_scale=None,
+            w2_input_scale=None,
+        )
+        self.release_requantization_source_weights(layer)
+        # Prevent duplicate processing (e.g., during weight reload)
+        layer._already_called_process_weights_after_loading = True
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        self._process_quantized(layer)
 
     def _setup_kernel(
         self,
@@ -714,50 +845,21 @@ class Fp8PerTensorOnlineMoEMethod(_Fp8OnlineMoEBase):
             activation_key=activation_key,
         )
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        # TODO(@ksayers): inplace fp8 quant kernel, initialize scales with ones
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
+    def _scale_shape(self, rows: int, cols: int) -> tuple[int, ...]:
+        return ()
 
-        w13_weight, w2_weight = self.get_weights_for_quantization(layer)
-
-        # If checkpoint is fp16, quantize in place.
-        fp8_dtype = current_platform.fp8_dtype()
-        w13 = torch.empty_like(w13_weight, dtype=fp8_dtype)
-        w2 = torch.empty_like(w2_weight, dtype=fp8_dtype)
-        layer.w13_input_scale = None
-        layer.w2_input_scale = None
-
-        moe_tp_size = self.moe.tp_size
-        w13_amax = weight_amax(w13_weight.flatten(1), dim=-1)
-        w13_amax = amax_for_moe_weight_quant(w13_amax, moe_tp_size)
-        w13_scale = _fp8_scale(w13_amax)
-        w2_amax = weight_amax(w2_weight.flatten(1), dim=-1)
-        w2_amax = amax_for_moe_weight_quant(w2_amax, moe_tp_size)
-        w2_scale = _fp8_scale(w2_amax)
-
-        for expert in range(layer.local_num_experts):
-            w13[expert, :, :], _ = ops.scaled_fp8_quant(
-                w13_weight[expert, :, :], scale=w13_scale[expert]
+    def quantize_experts(
+        self, layer: Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        # one scale per expert, over the whole (TP-global) expert
+        amax = weight_amax(weight.flatten(1), dim=-1)
+        scale = _fp8_scale(amax_for_moe_weight_quant(amax, self.moe.tp_size))
+        qweight = torch.empty_like(weight, dtype=current_platform.fp8_dtype())
+        for expert in range(weight.shape[0]):
+            qweight[expert], _ = ops.scaled_fp8_quant(
+                weight[expert], scale=scale[expert]
             )
-            w2[expert, :, :], _ = ops.scaled_fp8_quant(
-                w2_weight[expert, :, :], scale=w2_scale[expert]
-            )
-
-        # Shuffle weights to runtime format and setup kernel.
-        self._setup_kernel(
-            layer,
-            w13,
-            w2,
-            w13_scale,
-            w2_scale,
-            w13_input_scale=layer.w13_input_scale,
-            w2_input_scale=layer.w2_input_scale,
-        )
-        self.release_requantization_source_weights(layer)
-
-        # Prevent duplicate processing (e.g., during weight reload)
-        layer._already_called_process_weights_after_loading = True
+        return qweight, scale
 
 
 class Fp8PerBlockOnlineMoEMethod(_Fp8OnlineMoEBase):
@@ -794,74 +896,27 @@ class Fp8PerBlockOnlineMoEMethod(_Fp8OnlineMoEBase):
             round_up(intermediate_size_per_partition, block_size),
         )
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
+    def _scale_shape(self, rows: int, cols: int) -> tuple[int, ...]:
+        assert self.weight_block_size is not None
+        block_n, block_k = self.weight_block_size
+        return (cdiv(rows, block_n), cdiv(cols, block_k))
 
-        w13_weight, w2_weight = self.get_weights_for_quantization(layer)
-        self._zero_padding(layer, w13_weight, w2_weight)
-
-        fp8_dtype = current_platform.fp8_dtype()
-        w13 = torch.empty_like(w13_weight, dtype=fp8_dtype)
-        w2 = torch.empty_like(w2_weight, dtype=fp8_dtype)
-
-        block_size = self.weight_block_size
-        assert block_size is not None
-        block_n, block_k = block_size
-
-        # Create block-shaped scales (computed here rather than in
-        # create_weights because online quant doesn't need them until now).
-        num_experts = layer.local_num_experts
-        _, w13_out, w13_in = w13_weight.shape
-        _, w2_out, w2_in = w2_weight.shape
-
-        w13_scale = torch.ones(
+    def quantize_experts(
+        self, layer: Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        num_experts, rows, cols = weight.shape
+        qweight = torch.empty_like(weight, dtype=current_platform.fp8_dtype())
+        scale = torch.empty(
             num_experts,
-            (w13_out + block_n - 1) // block_n,
-            (w13_in + block_k - 1) // block_k,
+            *self._scale_shape(rows, cols),
             dtype=torch.float32,
-            device=w13.device,
+            device=weight.device,
         )
-        w2_scale = torch.ones(
-            num_experts,
-            (w2_out + block_n - 1) // block_n,
-            (w2_in + block_k - 1) // block_k,
-            dtype=torch.float32,
-            device=w2.device,
-        )
-
         for expert in range(num_experts):
-            w13[expert], w13_scale[expert] = per_block_cast_to_fp8(
-                w13_weight[expert],
-                block_size=block_size,
-                use_ue8m0=False,
+            qweight[expert], scale[expert] = per_block_cast_to_fp8(
+                weight[expert], block_size=self.weight_block_size, use_ue8m0=False
             )
-            w2[expert], w2_scale[expert] = per_block_cast_to_fp8(
-                w2_weight[expert],
-                block_size=block_size,
-                use_ue8m0=False,
-            )
-
-        layer.weight_block_size = block_size
-
-        # Activation quantization is dynamic (including in re-quantization)
-        layer.w13_input_scale = None
-        layer.w2_input_scale = None
-
-        # Shuffle weights to runtime format and setup kernel.
-        self._setup_kernel(
-            layer,
-            w13,
-            w2,
-            w13_scale,
-            w2_scale,
-            w13_input_scale=None,
-            w2_input_scale=None,
-        )
-        self.release_requantization_source_weights(layer)
-
-        # Prevent duplicate processing (e.g., during weight reload)
-        layer._already_called_process_weights_after_loading = True
+        return qweight, scale
 
 
 class Fp8PtpcOnlineMoEMethod(_Fp8OnlineMoEBase):
@@ -906,63 +961,35 @@ class Fp8PtpcOnlineMoEMethod(_Fp8OnlineMoEBase):
                 "per-output-channel weight scales."
             )
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
+    def _scale_shape(self, rows: int, cols: int) -> tuple[int, ...]:
+        return (rows, 1)
 
-        w13_weight, w2_weight = self.get_weights_for_quantization(layer)
-
-        fp8_dtype = current_platform.fp8_dtype()
-        w13 = torch.empty_like(w13_weight, dtype=fp8_dtype)
-        w2 = torch.empty_like(w2_weight, dtype=fp8_dtype)
-        layer.w13_input_scale = None
-        layer.w2_input_scale = None
-
-        use_torch_w13_quant = False
-        if current_platform.is_rocm():
-            from vllm.platforms.rocm import on_gfx942
-
-            use_torch_w13_quant = on_gfx942()
-
-        if use_torch_w13_quant:
-            # dynamic_per_token_scaled_fp8_quant can hard-crash on gfx942.
-            w13_amax = weight_amax(w13_weight, dim=-1, keepdim=True)
-            w13_scale = _fp8_channel_scale(w13_amax)
-        else:
-            # Scale's leading dim is taken from the fp8 weight tensor by
-            # construction, so it cannot drift from the weight's expert count
-            # under EP / padded MoE.
-            n_w13 = w13_weight.shape[1]
-            w13_scale = torch.ones(
-                w13.shape[0], n_w13, 1, device=w13.device, dtype=torch.float32
-            )
-
-        w2_amax = weight_amax(w2_weight, dim=-1, keepdim=True)
-        w2_amax = amax_for_moe_weight_quant(w2_amax, self.moe.tp_size)
-        w2_scale = _fp8_channel_scale(w2_amax)
-
-        for expert in range(layer.local_num_experts):
-            if use_torch_w13_quant:
-                w13[expert] = _fp8_quant_per_channel(
-                    w13_weight[expert], w13_scale[expert]
+    def quantize_experts(
+        self, layer: Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        qweight = torch.empty_like(weight, dtype=current_platform.fp8_dtype())
+        if name == "w13_weight" and not _rocm_gfx942():
+            # w13 is column parallel: a row's whole input is on this rank
+            scale = weight.new_ones(*weight.shape[:2], 1, dtype=torch.float32)
+            for expert in range(weight.shape[0]):
+                qweight[expert], scale[expert] = ops.scaled_fp8_quant(
+                    weight[expert], scale=None, use_per_token_if_dynamic=True
                 )
-            else:
-                w13[expert], w13_scale[expert] = ops.scaled_fp8_quant(
-                    w13_weight[expert],
-                    scale=None,
-                    use_per_token_if_dynamic=True,
-                )
-            w2[expert] = _fp8_quant_per_channel(w2_weight[expert], w2_scale[expert])
+            return qweight, scale
+        # dynamic_per_token_scaled_fp8_quant can hard-crash on gfx942; w2 is row
+        # parallel: a row's scale over its whole (TP-global) input
+        amax = weight_amax(weight, dim=-1, keepdim=True)
+        if name == "w2_weight":
+            amax = amax_for_moe_weight_quant(amax, self.moe.tp_size)
+        scale = _fp8_channel_scale(amax)
+        for expert in range(weight.shape[0]):
+            qweight[expert] = _fp8_quant_per_channel(weight[expert], scale[expert])
+        return qweight, scale
 
-        self._setup_kernel(
-            layer,
-            w13,
-            w2,
-            w13_scale,
-            w2_scale,
-            w13_input_scale=None,
-            w2_input_scale=None,
-        )
-        self.release_requantization_source_weights(layer)
 
-        layer._already_called_process_weights_after_loading = True
+def _rocm_gfx942() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx942
+
+    return on_gfx942()

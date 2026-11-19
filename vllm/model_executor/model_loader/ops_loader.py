@@ -17,9 +17,9 @@ sharded on read, before the ops: a fused `qkv_proj` concatenates this rank's q, 
 and v slices; a lazy safetensors slice reads only them.
 """
 
-import inspect
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from copy import deepcopy
 
 import torch
@@ -56,6 +56,7 @@ from vllm.model_executor.model_loader.weight_ops import (
     SwapHalves,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import storage_view
 from vllm.platforms import current_platform
 
 # ops reordering a whole tensor: the loader shards their output, not their input
@@ -266,12 +267,25 @@ class ShardOutputs(ConversionOps):
         return output
 
 
-def _load_into(param: torch.Tensor, value: torch.Tensor) -> None:
-    """`value` (this rank's, converted) into `param`. A same-size value is viewed at
-    the param's shape (a scalar scale into `[1]`); a layer's output padding (rows
-    after `weight_loader_numel`) stays zero. Then the param's loader when it takes
-    `(param, value)` (a layer sharding for itself, online quantization, layerwise
-    reload), else a copy: a shape mismatch raises."""
+def copy_into(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
+    """The default write: `value` (this rank's, converted) into `param`. A
+    same-size value is viewed at the param's shape (a scalar scale into `[1]`); a
+    layer's output padding (rows after `weight_loader_numel`) stays zero. Else a
+    copy: a shape mismatch raises. A param keeping the sent dtype (`keeps_sent_dtype
+    = (dtypes...)`, e.g. FP8 or BF16 as sent) is retyped to the value's dtype when
+    one of them, else to the last, on its own bytes when they fit."""
+    if isinstance(kept := getattr(param, "keeps_sent_dtype", None), tuple):
+        dtype = value.dtype if value.dtype in kept else kept[-1]
+        if param.dtype != dtype:
+            storage = param.untyped_storage()
+            fits = param.is_contiguous() and param.storage_offset() == 0
+            fits &= storage.nbytes() >= param.numel() * dtype.itemsize
+            param.data = (
+                storage_view(storage, 0, param.shape, param.stride(), dtype)
+                if fits
+                else torch.empty_like(param, dtype=dtype)
+            )
+        value = value.to(dtype)
     if value.shape != param.shape and value.numel() == param.numel():
         value = value.reshape(param.shape)
     elif getattr(param, "fill_on_reload", False) and value.dim() == param.dim():
@@ -283,12 +297,41 @@ def _load_into(param: torch.Tensor, value: torch.Tensor) -> None:
         for v, p in zip(value.chunk(segments, dim), param.data.chunk(segments, dim)):
             p[tuple(slice(0, n) for n in v.shape)].copy_(v)
         return
-    loader = getattr(param, "weight_loader", None)
+    default_weight_loader(param, value)
+
+
+# `load_into(name, param, value)`: writes one final value into its param
+LoadInto = Callable[[str, torch.Tensor, torch.Tensor], None]
+
+# writers installed around `load_with_ops` calls made by others (a model's own
+# `load_weights`): the last one installed writes (layerwise reload, an engine's)
+_INSTALLED: list[LoadInto] = []
+
+
+def current_load_into() -> LoadInto:
+    """The write `load_with_ops` uses when not given one: the last installed"""
+    return _INSTALLED[-1] if _INSTALLED else copy_into
+
+
+def install_load_into(load_into: LoadInto) -> None:
+    """Route the writes of later `load_with_ops` calls through `load_into` (once)"""
+    if load_into not in _INSTALLED:
+        _INSTALLED.append(load_into)
+
+
+def uninstall_load_into(load_into: LoadInto) -> None:
+    if load_into in _INSTALLED:
+        _INSTALLED.remove(load_into)
+
+
+@contextmanager
+def loading_into(load_into: LoadInto):
+    """`install_load_into` for the duration of a block"""
+    install_load_into(load_into)
     try:
-        inspect.signature(loader).bind(param, value)
-    except (TypeError, ValueError):
-        loader = default_weight_loader
-    loader(param, value)
+        yield
+    finally:
+        uninstall_load_into(load_into)
 
 
 def _padded_converters(model: nn.Module) -> list[WeightConverter]:
@@ -319,10 +362,13 @@ def load_with_ops(
     weights: Iterable[tuple[str, torch.Tensor]],
     conversions: list[WeightTransform] | None = None,
     hf_quantizer=None,
+    load_into: LoadInto | None = None,
 ) -> set[str]:
     """Load `weights` (tensors, or lazy safetensors slices: then each rank reads its
     bytes only) into `model` with `conversions` (default: the model's entries in
-    `conversion_mapping`). Returns the params loaded."""
+    `conversion_mapping`). Each final value is written by `load_into(name, param,
+    value)` (default: the installed one, else `copy_into`). Returns the params
+    loaded."""
     # functions of the whole stream, run first: a model's (Jina v5's task LoRA merged,
     # MiniMax M3's ROCm redirect), then the quant config's (pair scales, repack)
     stream = list(getattr(model, "checkpoint_transforms", []))
@@ -342,6 +388,16 @@ def load_with_ops(
     conversions = [*deepcopy(conversions), *_padded_converters(model)]
     # the live params: `state_dict()` (what Transformers passes) drops their attributes
     params = dict(model.named_parameters()) | dict(model.named_buffers())
+    write = load_into or current_load_into()
+    names = {id(p): (n, p) for n, p in params.items()}
+
+    def write_in_place(param: torch.Tensor, value: torch.Tensor) -> None:
+        named = names.get(id(param))
+        if named is None or named[1] is not param:  # replaced since (a reload)
+            live = dict(model.named_parameters()) | dict(model.named_buffers())
+            names.update({id(p): (n, p) for n, p in live.items()})
+            named = names.get(id(param), ("", param))
+        write(named[0], param, value)
 
     def get_sharding_op(target, _detached, converter, source_pattern):
         param = params.get(target)
@@ -381,7 +437,7 @@ def load_with_ops(
         device_map={"": device},
         hf_quantizer=hf_quantizer,
         get_sharding_op=get_sharding_op,
-        load_in_place=_load_into,
+        load_in_place=write_in_place,
     )
     info, _ = convert_and_load_state_dict_in_model(model, dict(weights), config)
     if info.conversion_errors or info.mismatched_keys:  # a tensor that can't load

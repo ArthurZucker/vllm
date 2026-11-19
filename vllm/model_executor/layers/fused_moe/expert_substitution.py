@@ -192,7 +192,6 @@ class ConstantExpertSubstitution(nn.Module):
             torch.full((len(substituted), hidden_size), torch.nan, dtype=params_dtype),
             requires_grad=False,
         )
-        self.values.weight_loader = self.weight_loader
 
     @property
     def num_logical_experts(self) -> int:
@@ -202,9 +201,8 @@ class ConstantExpertSubstitution(nn.Module):
         """Physical row of a retained expert, or -1 for a substituted one."""
         return max(self._routes[expert_id], -1)
 
-    def weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
-    ) -> None:
+    def load_value(self, expert_id: int, loaded_weight: torch.Tensor) -> None:
+        """The constant output of substituted expert `expert_id` into its row"""
         if not 0 <= expert_id < self.num_logical_experts or (
             self._routes[expert_id] >= 0
         ):
@@ -212,7 +210,7 @@ class ConstantExpertSubstitution(nn.Module):
                 f"expert {expert_id} of layer {self.layer_idx} is not listed in "
                 "approximate_experts"
             )
-        row = param.data[-1 - self._routes[expert_id]]
+        row = self.values.data[-1 - self._routes[expert_id]]
         if loaded_weight.shape != row.shape:
             raise ValueError(
                 f"approx_value for expert {expert_id} of layer {self.layer_idx} has "

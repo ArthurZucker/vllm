@@ -45,9 +45,10 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
     mixed-precision linear kernel (`choose_mp_linear_kernel`).
 
     A subclass sets the weight format and implements `quantize`. An untied
-    head loads its fp16/bf16 weight like any online linear layer and replaces
-    it with the quantized copy. A tied head shares the input embeddings'
-    weight, which stays unchanged: the quantized copy is added next to it.
+    head loads its fp16/bf16 weight as it is (a padded vocab pads it first) and
+    replaces it with the quantized copy after loading. A tied head shares the
+    input embeddings' weight, which stays unchanged: the quantized copy is added
+    next to it.
     """
 
     supports_lm_head = True
@@ -246,11 +247,6 @@ def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead
     # Never loaded: a new param sharing the source storage, never a copy of it.
     head.weight = torch.nn.Parameter(lm_head.weight.data, requires_grad=False)
     head.quant_method.process_weights_after_loading(head)
-    # The copy is never loaded. The online loader wrapper captures the layer,
-    # so keeping it would leave each copy to the cycle collector.
-    for param in head.parameters(recurse=False):
-        if hasattr(param, "weight_loader"):
-            del param.weight_loader
     return head
 
 

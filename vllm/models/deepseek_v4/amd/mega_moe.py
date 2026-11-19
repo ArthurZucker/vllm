@@ -96,12 +96,22 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         )
         self.prefix = prefix
 
+        # this rank's routed experts merged from the checkpoint's `experts.N.w*`,
+        # as their bytes (`conversion_mapping`); the fused shared expert's slot
+        # after them stays zero until `load_shared_expert`
         def make_param(rows: int, cols: int) -> nn.Parameter:
             param = nn.Parameter(
                 torch.zeros(self.num_local_experts, rows, cols, dtype=torch.uint8),
                 requires_grad=False,
             )
-            set_weight_attrs(param, {"weight_loader": self.weight_loader})
+            set_weight_attrs(
+                param,
+                {
+                    "expert_dim": 0,
+                    "keeps_sent_dtype": (torch.uint8,),
+                    "fill_on_reload": fuse_shared_expert,
+                },
+            )
             return param
 
         self.w13_weight = make_param(2 * intermediate_size, hidden_size // 2)
@@ -111,26 +121,9 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         # (max_tok_per_rank, runtime), ascending by capacity.
         self._runtimes: list[tuple[int, Any]] = []
 
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> bool | None:
-        local_expert_id = expert_id - self.experts_start_idx
-        if not 0 <= local_expert_id < self.num_routed_local_experts:
-            return False if return_success else None
-        expert_data = param.data[local_expert_id]
-        if shard_id in ("w1", "w3"):
-            shard_offset = 0 if shard_id == "w1" else self.intermediate_size
-            expert_data = expert_data.narrow(0, shard_offset, self.intermediate_size)
-        elif shard_id != "w2":
-            raise ValueError(f"Unsupported expert shard id: {shard_id}")
-        expert_data.copy_(loaded_weight.view(torch.uint8))
-        return True if return_success else None
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        local = expert_id - self.experts_start_idx
+        return local if 0 <= local < self.num_routed_local_experts else -1
 
     def load_shared_expert(self, shared_experts: nn.Module) -> None:
         quantize = ONLINE_SHARED_EXPERT_QUANTIZERS[kMxfp4Static]
@@ -280,9 +273,6 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         runtime.w2 = self.w2_weight
         runtime.w2_scale = self.w2_weight_scale
         return runtime.forward(hidden_states.contiguous(), topk_weights, topk_ids)
-
-
-DeepseekV4AiterMegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
 
 def finalize_mega_moe_weights(model: nn.Module) -> None:

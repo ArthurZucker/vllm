@@ -124,12 +124,20 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase, InputHadamardFusable):
             **extra_weight_attrs,
         )
 
+    def quantized_params(self, n: int, k: int) -> list[tuple]:
+        return [(torch.uint8, 2), ((n, k // MXFP4_BLOCK_SIZE), torch.uint8)]
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        weight_fp4, weight_scale = mxfp4_quantize(weight.contiguous())
+        return weight_fp4.view(torch.uint8), weight_scale.view(torch.uint8)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        weight = self.get_weight_for_quantization(layer)
-        weight_fp4, weight_scale = mxfp4_quantize(weight.contiguous())
+        weight_fp4, weight_scale = self.quantized_weight(layer)
 
         layer.input_scale = None
         replace_parameter(layer, "weight", weight_fp4.data)
@@ -242,6 +250,40 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
 
         layer.weight_block_size = [1, MXFP4_BLOCK_SIZE]
 
+    def quantized_params(
+        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        shapes = (("w13_", w13_rows, hidden), ("w2_", hidden, intermediate))
+        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:  # kept in full precision
+            dtype = self.moe.in_dtype
+            return [(f"{p}weight", (num_experts, r, c), dtype) for p, r, c in shapes]
+        params = []
+        for prefix, rows, cols in shapes:
+            params.append(
+                (f"{prefix}weight", (num_experts, rows, cols // 2), torch.uint8)
+            )
+            params.append(
+                (
+                    f"{prefix}weight_scale",
+                    (num_experts, rows, cols // MXFP4_BLOCK_SIZE),
+                    torch.uint8,
+                )
+            )
+        return params
+
+    def expert_scale_names(self, prefix: str) -> list[str]:
+        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+            return []
+        return [f"{prefix}weight_scale"]
+
+    def quantize_experts(
+        self, layer: Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+            return (weight,)
+        values, scales = _quantize_mxfp4_moe_weight(weight)
+        return values.view(torch.uint8), scales.view(torch.uint8)
+
     def _setup_kernel(
         self,
         layer: "RoutedExperts",
@@ -333,22 +375,16 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
             return
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
-            w13_weight, w2_weight = self.get_weights_for_quantization(layer)
-            self._zero_padding(layer, w13_weight, w2_weight)
+            w13, w2 = self.quantized_weights(layer)
+            replace_parameter(layer, "w13_weight", w13)
+            replace_parameter(layer, "w2_weight", w2)
+            self.release_requantization_source_weights(layer)
             layer._already_called_process_weights_after_loading = True
             return
 
         layer.w13_input_scale = None
         layer.w2_input_scale = None
-
-        def quantize(w13_weight: torch.Tensor, w2_weight: torch.Tensor):
-            self._zero_padding(layer, w13_weight, w2_weight)
-            return (
-                *_quantize_mxfp4_moe_weight(w13_weight),
-                *_quantize_mxfp4_moe_weight(w2_weight),
-            )
-
-        w13, w13_scale, w2, w2_scale = self.quantize_weights(layer, quantize)
+        w13, w13_scale, w2, w2_scale = self.quantized_weights(layer)
 
         self._setup_kernel(
             layer,

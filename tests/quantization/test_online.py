@@ -19,6 +19,7 @@ from tests.quantization.utils import (
     _test_online_quant_peak_mem_impl,
     is_quant_method_supported,
     load_model_without_vllm_runner,
+    load_online_quantized,
     quant_config_args,
 )
 from vllm import _custom_ops as ops
@@ -379,7 +380,7 @@ def test_online_nvfp4_weight_only_linear_matches_dequantized_weight(
             quant_config=config,
             prefix="linear",
         )
-    layer.weight.weight_loader(layer.weight, weight)
+    load_online_quantized(layer, {"weight": weight})
 
     packed, scales, global_scale = _quantize_nvfp4(weight, weight_amax(weight))
     dequantized = dequantize_to_dtype(
@@ -804,14 +805,7 @@ def test_online_prequantized_compatibility(
 
     layer = ColumnParallelLinear(**layer_kwargs)
     assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
-
-    if layer.weight.is_meta:
-        # Weight loading.
-        layer = layer.to_empty(device=DEVICE)
-        for parameter in layer.parameters():
-            parameter.zero_()
-    else:
-        layer = layer.to(device=DEVICE)
+    layer = layer.to(device=DEVICE)
 
     if raises_requantization_error:
         with pytest.raises(
@@ -824,12 +818,13 @@ def test_online_prequantized_compatibility(
 
     if isinstance(checkpoint_config, ModelOptMxFp8Config):
         assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
-        assert not layer.quant_method.uses_meta_device
+        assert not getattr(layer, "quantizes_on_load", False)
         assert isinstance(
             layer.quant_method.requantization_source, ModelOptLinearMethod
         )
     elif not raises_requantization_error:
-        assert layer.quant_method.uses_meta_device
+        # Unquantized checkpoint: the plan quantizes the weight as it loads.
+        assert layer.quantizes_on_load
         assert layer.quant_method.requantization_source is None
 
 
@@ -1303,10 +1298,10 @@ def test_online_requantized_moe_padding(
         message = "biases is unsupported" if has_bias else "cannot shrink weights"
         # Unsupported padding must fail explicitly rather than truncate weights.
         with pytest.raises(error, match=message):
-            method.get_weights_for_quantization(layer)
+            method.quantize_weights(layer, lambda w13, w2: (w13, w2))
         return
 
-    padded_w13, padded_w2 = method.get_weights_for_quantization(layer)
+    padded_w13, padded_w2 = method.quantize_weights(layer, lambda w13, w2: (w13, w2))
     if (target_hidden, target_intermediate) == (16, 32):
         # Unpadded w13 must not allocate a replacement tensor.
         assert padded_w13 is w13
@@ -3199,18 +3194,12 @@ def test_online_moe_tp_weight_quant_matches_ep(monkeypatch, scheme: str) -> None
 def test_online_int8_moe_w2_scale_matches_unsharded(monkeypatch) -> None:
     """Int8 MoE w2 reduces over the sharded intermediate dim."""
     torch.manual_seed(0)
-    w13 = torch.randn(2, 16, 8, dtype=torch.bfloat16)
     w2 = torch.randn(2, 8, 16, dtype=torch.bfloat16)
     w2[:, -1, -1] = 64.0
 
     def quantize(w2_in, moe_tp_size):
-        layer = torch.nn.Module()
-        layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_in.clone(), requires_grad=False)
-        layer.num_experts = layer.local_num_experts = w13.shape[0]
         method = SimpleNamespace(moe=SimpleNamespace(tp_size=moe_tp_size))
-        Int8OnlineMoEMethod._quantize_weights(method, layer)
-        return layer.w2_weight, layer.w2_scale
+        return Int8OnlineMoEMethod.quantize_experts(method, None, "w2_weight", w2_in)
 
     full_weight, full_scale = quantize(w2, 1)
 

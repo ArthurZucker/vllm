@@ -93,8 +93,8 @@ class BakeSink:
     """`copy_` sink for the dry-run bake: record how each slice would be fetched
     and where it would land, and move nothing.
 
-    `_install_recording_stamps` sets `current = (leaf_module, param_name)`
-    around each loader so `accept_copy` can attribute the copy. An unstamped
+    `_recording_load_into` sets `current = (leaf_module, param_name)`
+    around each write so `accept_copy` can attribute the copy. An unstamped
     `copy_` cannot be attributed and stays unrecorded, so its module fails the
     coverage gate and takes the plain load. `copies_by_layer` is keyed by module
     object, so iterating it yields each leaf module once.

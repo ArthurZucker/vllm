@@ -70,7 +70,6 @@ class OnlineRequantizationMixin:
     def set_requantization_source(self, source_method: QuantizeMethodBase) -> None:
         """Configure serialized-weight conversion before online quantization."""
         self.requantization_source = source_method
-        self.uses_meta_device = False
 
     def create_requantization_source_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
@@ -94,6 +93,12 @@ class OnlineRequantizationMixin:
             # `replace_parameter` then registers new params over these.
             parameter.requantization_source = True
         return True
+
+    def source_checkpoint_quantizer(self, layer: torch.nn.Module):
+        """The source's plan (its layout's load ops): its params load as they would
+        without requantization, which dequantizes and quantizes them after loading"""
+        quantizer = getattr(self.requantization_source, "checkpoint_quantizer", None)
+        return None if quantizer is None else quantizer(layer)
 
     def release_requantization_source_weights(self, layer: torch.nn.Module) -> None:
         """Release serialized parameters after successful requantization."""

@@ -94,8 +94,8 @@ def as_expert_substitution_model(model_cls: type[_T], model_config: Any) -> type
                     targets = (key,)
                 for layer_idx, expert_id in targets:
                     if layer_idx in self._expert_substitutions:
-                        values = self._expert_substitutions[layer_idx][1].values
-                        values.weight_loader(values, loaded_weight[...], expert_id)
+                        substitution = self._expert_substitutions[layer_idx][1]
+                        substitution.load_value(expert_id, loaded_weight[...])
 
         def process_weights_after_loading(self) -> None:
             for param_name, substitution in self._expert_substitutions.values():

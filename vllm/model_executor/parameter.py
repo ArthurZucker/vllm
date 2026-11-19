@@ -276,7 +276,6 @@ class SharedWeightParameter(BasevLLMParameter):
 
         # create associated model parameter
         partition = ModelWeightParameter(data=data, **self.kwargs)  # type: ignore[arg-type]
-        partition.weight_loader = self._fake_weight_loader
         self.partitions[index] = partition
 
         # hold local reference, since ModelWeightParameter does not
@@ -295,18 +294,6 @@ class SharedWeightParameter(BasevLLMParameter):
             "Accessing `data` of a `SharedWeightParameter` is not allowed. "
             "Instead, use `get_partition` to get the weight of "
             "the particular partition you want to access"
-        )
-
-    def _fake_weight_loader(
-        self,
-        param: BasevLLMParameter,
-        loaded_weight: torch.Tensor,
-        loaded_weight_shard_id: str | int | None,
-    ):
-        raise ValueError(
-            "When loading partition weights of "
-            f"{self.__class__.__name__}, use methods provided by "
-            f"{self.__class__.__name__}, not partition loader"
         )
 
 

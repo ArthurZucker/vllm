@@ -35,7 +35,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
@@ -256,16 +255,16 @@ class MuseSparkMoE(nn.Module):
 
         self.route_scale = config.routed_scaling_factor
 
+        # folded into the router weight as it loads (`conversion_mapping`'s Affine)
         self.router_output_multiplier = config.output_multiplier
-        self._router_multiplier_folded = False
-        self.router.weight.weight_loader = self._load_router_weight
+        self._router_multiplier_folded = True  # read by the mono decoder's checks
 
         self.moe_router = MuseSparkRouter(
             top_k=config.num_experts_per_tok,
             num_experts=config.num_local_experts,
             expert_bias=self.expert_bias,
             route_scale=self.route_scale,
-            router_output_multiplier=self.router_output_multiplier,
+            router_output_multiplier=None,
             router_score_normalization="sigmoid",
             router_score_division_eps=1e-15,
         )
@@ -337,22 +336,9 @@ class MuseSparkMoE(nn.Module):
             reduce_results=not self.defer_reduce,
         )
 
-    def _load_router_weight(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor
-    ) -> None:
-        default_weight_loader(param, loaded_weight)  # replicated
-        self._router_multiplier_folded = False
-
     def fold_router_output_multiplier(self) -> None:
-        """Fold the router output multiplier and split the bf16x3 planes."""
-        if (
-            not self._router_multiplier_folded
-            and self.router_output_multiplier is not None
-        ):
-            with torch.no_grad():
-                self.router.weight.mul_(self.router_output_multiplier)
-            self._router_multiplier_folded = True
-            self.moe_router.router_output_multiplier = None
+        """Split the router weight (its output multiplier folded in as it loaded)
+        into the bf16x3 planes."""
         weight = self.router.weight.data
         if (
             _supports_router_bf16x3_device()

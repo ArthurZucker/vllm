@@ -1719,10 +1719,6 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
     for mod_name, mod in model.named_modules():
         for pname in get_layer_tensors(mod):
             param_name_of[(id(mod), pname)] = f"{mod_name}.{pname}".lstrip(".")
-    loaders_before = {}
-    for mod in model.modules():
-        for pname, tensor in get_layer_tensors(mod).items():
-            loaders_before[(id(mod), pname)] = getattr(tensor, "weight_loader", None)
 
     # ---- bake ---------------------------------------------------------------
     eng = ShardedRDTWeightTransferEngine(
@@ -1745,17 +1741,14 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
     assert eng._live_names, "bake recorded no live names"
     n_modules = len({id(v) for v in eng._name_to_plan.values()})
 
-    # (2) every intermediate change to model state was undone
+    # (2) every intermediate change to model state was undone: no write left
+    # installed (recording or reload buffering), nothing on meta
+    from vllm.model_executor.model_loader import ops_loader
+
+    assert ops_loader.current_load_into() is ops_loader.copy_into
     for mod in model.modules():
         for pname, tensor in get_layer_tensors(mod).items():
             key = (id(mod), pname)
-            loader = getattr(tensor, "weight_loader", None)
-            assert not hasattr(loader, "_rdt_stamp_inner"), (
-                f"recording stamp left on {param_name_of.get(key, key)}"
-            )
-            assert loader is loaders_before[key], (
-                f"weight_loader not restored on {param_name_of.get(key, key)}"
-            )
             assert not tensor.is_meta, (
                 f"{param_name_of.get(key, key)} left on meta after the dry run"
             )

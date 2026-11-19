@@ -3,7 +3,6 @@
 """Linear layers that a checkpoint stores in FP8 and the model runs in BF16."""
 
 from collections.abc import Callable
-from types import MethodType
 
 import torch
 
@@ -16,7 +15,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import (
     _in_own_storage,
     is_weights_pre_processed,
@@ -126,46 +124,14 @@ def _dequantize(layer: torch.nn.Module) -> torch.Tensor:
     return weight.to(torch.float32).mul_(scale).to(layer.params_dtype)
 
 
-def _view_as(param: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
-    """`param`'s storage viewed in `dtype` with its shape, if it fits."""
-    storage = param.untyped_storage()
-    if (
-        param.is_contiguous()
-        and param.storage_offset() == 0
-        and storage.nbytes() >= param.numel() * dtype.itemsize
-    ):
-        return storage_view(storage, 0, param.shape, param.stride(), dtype)
-    return None
-
-
 def _load_weight_in_sent_dtype(layer: torch.nn.Module) -> None:
     """Keep a whole weight in the dtype it is sent in: FP8, or BF16 (no scale
-    needed), on storage sized for BF16. The loader is bound to the layer, so
-    layerwise reload's metadata does not keep the layer alive
-    (`sanitize_layer_refs`)."""
+    needed), on storage sized for BF16. `keeps_sent_dtype` lists the dtypes the
+    loader keeps (another is cast to the last): it views the param's storage in
+    the value's dtype (`ops_loader`)."""
     param = layer.weight
     bf16 = torch.empty(param.shape, dtype=layer.params_dtype, device=param.device)
     param.data = storage_view(
         bf16.untyped_storage(), 0, param.shape, param.stride(), param.dtype
     )
-    layer.checkpoint_weight_loader = (
-        getattr(param, "weight_loader", None) or default_weight_loader
-    )
-    param.weight_loader = MethodType(_weight_loader_in_sent_dtype, layer)
-    param.keeps_sent_dtype = True  # not cast on read: its loader picks the dtype
-
-
-def _weight_loader_in_sent_dtype(
-    layer: torch.nn.Module,
-    param: torch.Tensor,
-    loaded_weight: torch.Tensor,
-    *args,
-    **kwargs,
-):
-    """View the parameter in the sent dtype (on its storage when it fits)."""
-    fp8 = loaded_weight.dtype == torch.float8_e4m3fn
-    dtype = torch.float8_e4m3fn if fp8 else layer.params_dtype
-    if param.dtype != dtype:
-        view = _view_as(param, dtype)
-        param.data = torch.empty_like(param, dtype=dtype) if view is None else view
-    return layer.checkpoint_weight_loader(param, loaded_weight, *args, **kwargs)
+    param.keeps_sent_dtype = (torch.float8_e4m3fn, layer.params_dtype)

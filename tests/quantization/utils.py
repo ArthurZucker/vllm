@@ -25,6 +25,29 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.platforms import current_platform
 
 
+def load_online_quantized(
+    layer: torch.nn.Module,
+    tensors: dict[str, torch.Tensor],
+    method: Any = None,
+) -> None:
+    """Load this rank's full-precision `tensors` (param name -> converted tensor,
+    e.g. merged `[E, N, K]` experts) into an online-quantized `layer` as the
+    loader does: the plan's quantize op, each output into its param. Then
+    post-load processing."""
+    from vllm.model_executor.model_loader.ops_loader import _load_into
+
+    method = layer.quant_method if method is None else method
+    root = torch.nn.Module()
+    root.layer = layer
+    op = method.checkpoint_quantizer(layer).get_quantize_ops()
+    for name, tensor in tensors.items():
+        key = f"layer.{name}"
+        out = op.convert({key: [tensor]}, [], [], full_layer_name=key, model=root)
+        for target, value in out.items():
+            _load_into(root.get_parameter(target), value)
+    method.process_weights_after_loading(layer)
+
+
 def quant_spec(**kwargs: Any) -> QuantSpec:
     """Build a `QuantSpec` from user-facing names such as `"mxfp8"`."""
     return TypeAdapter(QuantSpec).validate_python(kwargs)

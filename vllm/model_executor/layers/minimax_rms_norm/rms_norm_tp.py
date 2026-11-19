@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from functools import partial
 
 import torch
 from torch import nn
@@ -298,11 +297,10 @@ class MiniMaxText01RMSNormTP(CustomOp):
         )
 
         self.weight = nn.Parameter(torch.ones(hidden_size // self.weight_shard_world))
-        self.weight.weight_loader = partial(
-            self.weight_loader,
-            shard_world_size=self.weight_shard_world,
-            shard_rank=self.weight_shard_rank,
-        )
+        # this rank's slice of the checkpoint's norm; fewer shards than ranks (kv
+        # heads replicated) give consecutive ranks the same one
+        self.weight.shard_dim = 0
+        self.weight.shard_replicas = max(1, self.tp_world // self.weight_shard_world)
         self.variance_epsilon = eps
 
         self.workspace = None
@@ -332,22 +330,6 @@ class MiniMaxText01RMSNormTP(CustomOp):
                     e,
                 )
                 self.workspace = None
-
-    @staticmethod
-    def weight_loader(
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        shard_world_size: int | None = None,
-        shard_rank: int | None = None,
-    ) -> None:
-        if shard_world_size is None:
-            shard_world_size = get_tensor_model_parallel_world_size()
-        if shard_rank is None:
-            shard_rank = get_tensor_model_parallel_rank()
-
-        shard_size = loaded_weight.shape[0] // shard_world_size
-        shard = slice(shard_rank * shard_size, (shard_rank + 1) * shard_size)
-        param.data.copy_(loaded_weight[shard])
 
     def _forward(
         self,
