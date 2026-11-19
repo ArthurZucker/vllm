@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
+from transformers.core_model_loading import ConversionOps
 
 import vllm.utils.humming as _hm
 from vllm import envs
@@ -151,6 +152,51 @@ def compressed_tensors_get_config(config: dict[str, Any], key: str):
     elif config["quant_method"] == "modelopt":
         target_group_config["quant_algo"] = config["quant_algo"]
     return target_group_config
+
+
+class HummingLoadedWeight(ConversionOps):
+    """A checkpoint tensor in its Humming schema's layout
+    (`process_loaded_weight`, e.g. BitNet's 2-bit repack). Whole, on each
+    source (one expert, one of q / k / v): sharded after. A full precision `weight`
+    stays as it is, for the param's loader (online quantization, or a layer the
+    checkpoint left unquantized)"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        self.quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        name = kwargs["full_layer_name"]
+        model = kwargs["model"]
+        schema = model.get_submodule(name.rpartition(".")[0]).quant_method.weight_schema
+        param_name = model.get_parameter(name).param_name
+
+        def process(tensor: torch.Tensor) -> torch.Tensor:
+            if param_name == "weight" and tensor.dtype in _FLOAT_DTYPES:
+                return tensor
+            return schema.process_loaded_weight(tensor=tensor, name=param_name)
+
+        return {p: [process(t) for t in v] for p, v in input_dict.items()}
+
+
+_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _loaded_weight_quantizer(schema, layer: torch.nn.Module):
+    """`HummingLoadedWeight` on the layer's Humming params, unless its schema
+    takes the checkpoint's tensors as they are"""
+    if type(schema).process_loaded_weight is _hm.BaseWeightSchema.process_loaded_weight:
+        return None
+    from vllm.model_executor.models.transformers.conversion import (
+        VllmLayoutQuantizer,
+    )
+
+    names = [
+        n for n, p in layer.named_parameters(recurse=False) if hasattr(p, "param_name")
+    ]
+    return VllmLayoutQuantizer(HummingLoadedWeight, names)
 
 
 class HummingConfig(QuantizationConfig):
@@ -380,6 +426,10 @@ class HummingLinearMethod(LinearMethodBase):
         self.is_online_quant = self.quant_config.is_online_quant
 
     def prepare_weight_loader(self, layer: torch.nn.Module, weight_loader: Callable):
+        """A full precision `weight`: quantized online, or the layer falls back to
+        unquantized. Not a tensor transform: it fills other params / swaps the
+        method, so it stays the param's loader"""
+
         def new_weight_loader(
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
@@ -433,20 +483,15 @@ class HummingLinearMethod(LinearMethodBase):
                     set_weight_attrs(layer.weight, extra_weight_attrs)
 
                 param = layer.weight
-                if shard_id is not None:
-                    return weight_loader(param, loaded_weight, shard_id)
-                return weight_loader(param, loaded_weight)
-
-            # weight processing logic for specific quantization schema
-            loaded_weight = self.weight_schema.process_loaded_weight(
-                tensor=loaded_weight,
-                name=name,
-            )
+            # quantized: already in the schema's layout (`HummingLoadedWeight`)
             if shard_id is not None:
                 return weight_loader(param, loaded_weight, shard_id)
             return weight_loader(param, loaded_weight)
 
         return new_weight_loader
+
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        return _loaded_weight_quantizer(self.weight_schema, layer)
 
     def create_weights(
         self,
@@ -652,61 +697,8 @@ class HummingMoEMethod(FusedMoEMethodBase):
             activation_key=activation_key,
         )
 
-    def prepare_weight_loader(self, layer, weight_loader):
-        def new_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int | None = None,
-            return_success: bool = False,
-        ):
-            name = param.param_name
-            float_dtypes = [torch.float16, torch.bfloat16, torch.float32]
-            is_unquantized = name == "weight" and loaded_weight.dtype in float_dtypes
-            # online quant (fp16/bf16 -> quant_type)
-            if is_unquantized:
-                assert isinstance(self.weight_schema, _hm.HummingWeightSchema)
-                tensors = self.weight_schema.quant_tensor(
-                    loaded_weight.to(param.device),
-                    self.weight_schema,
-                    layer.param_dtype,
-                )
-
-                success = True
-                for key, tensor in tensors.items():
-                    if tensor is None or tensor.nelement() == 0:
-                        continue
-                    sublayer_name = "w2" if shard_id == "w2" else "w13"
-
-                    param = getattr(layer, sublayer_name + "_" + key)
-                    part_success = param.weight_loader(
-                        param=param,
-                        loaded_weight=tensor.cpu(),
-                        weight_name=shard_id + "_" + key,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=return_success,
-                    )
-                    success = success and part_success
-
-                return success if return_success else None
-
-            # weight processing logic for specific quantization schema
-            loaded_weight = self.weight_schema.process_loaded_weight(
-                tensor=loaded_weight,
-                name=name,
-            )
-            return weight_loader(
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-                return_success=return_success,
-            )
-
-        return new_weight_loader
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        return _loaded_weight_quantizer(self.weight_schema, layer)
 
     def create_weights(
         self,
@@ -732,9 +724,6 @@ class HummingMoEMethod(FusedMoEMethodBase):
                     shape_k=shape_k,
                 )
                 setattr(self, name, schema)
-        extra_weight_attrs["weight_loader"] = self.prepare_weight_loader(
-            layer, default_weight_loader
-        )
 
         # sublayer: a layer contains multiple sets of weights for quantized GEMM
         # (e.g., weight, weight_scale, etc.).

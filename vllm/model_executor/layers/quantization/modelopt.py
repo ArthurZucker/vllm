@@ -8,6 +8,7 @@ from fnmatch import fnmatch
 from typing import Any, cast
 
 import torch
+from transformers.core_model_loading import ConversionOps
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
@@ -116,7 +117,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
@@ -2376,6 +2376,11 @@ class QuantKeyScheme:
     def process(self, layer, role) -> None:
         pass
 
+    def checkpoint_op(self, ctx) -> tuple[type, list[str]] | None:
+        """The op (a `ConversionOps`) converting the checkpoint's tensors of these
+        params into the scheme's layout, when the checkpoint stores another"""
+        return None
+
     @staticmethod
     def reject(role) -> None:
         raise NotImplementedError(
@@ -2383,12 +2388,8 @@ class QuantKeyScheme:
         )
 
     @staticmethod
-    def register_params(
-        layer, name, shape, dtype, cls, *, init=None, loader=None, **dims
-    ):
+    def register_params(layer, name, shape, dtype, cls, *, init=None, **dims):
         p = cls(data=torch.empty(shape, dtype=dtype), **dims)
-        if loader is not None:
-            p.weight_loader = loader
         if init is not None:
             p.data.fill_(init)
         layer.register_parameter(name, p)
@@ -2683,21 +2684,19 @@ class KMxfp8Static(QuantKeyScheme):
     key = kMxfp8Static
 
     @staticmethod
-    def get_scale_weight_loader(ctx: CkptCtx) -> Callable | None:
+    def scale_block_rows(ctx: CkptCtx) -> int:
+        """Rows sharing one stored scale (the checkpoint's `(rows, 32)` blocks)"""
         block_rows, block_cols = ctx.scale_block_size or (1, MXFP8_BLOCK_SIZE)
         if block_rows < 1 or block_cols != MXFP8_BLOCK_SIZE:
             raise NotImplementedError(
                 f"MXFP8 checkpoint scale block {ctx.scale_block_size} is unsupported"
             )
+        return block_rows
 
-        def scaled_loader(param, loaded_weight, *args, **kwargs):
-            assert loaded_weight.dtype in (torch.uint8, torch.float8_e8m0fnu)
-            loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
-                block_rows, dim=0
-            )
-            default_weight_loader(param, loaded_weight)
-
-        return scaled_loader if block_rows > 1 else None
+    def checkpoint_op(self, ctx) -> tuple[type, list[str]] | None:
+        if self.scale_block_rows(ctx) > 1:
+            return Mxfp8ScaleExpand, ["weight_scale"]
+        return None
 
     def create_weights(self, layer, role, ctx, shapes) -> None:
         if role is not WEIGHT:
@@ -2716,7 +2715,7 @@ class KMxfp8Static(QuantKeyScheme):
             input_dim=1,
             output_dim=0,
         )
-        scale_loader = self.get_scale_weight_loader(ctx)
+        self.scale_block_rows(ctx)  # an unsupported block fails here
         self.register_params(
             layer,
             "weight_scale",
@@ -2726,7 +2725,6 @@ class KMxfp8Static(QuantKeyScheme):
             ),
             MXFP8_SCALE_DTYPE,
             ModelWeightParameter,
-            loader=scale_loader,
             input_dim=1,
             output_dim=0,
         )
@@ -2752,8 +2750,8 @@ class KInt8Static(QuantKeyScheme):
     """Symmetric int8 weight with a scale per `ctx.group_size` input elements
     (INT8_PB_WO). Weight-role only.
 
-    The checkpoint stores int8 `[out, in]`; the loader repacks it into the
-    WNA16 kernels' layout: uint8b128 (`q + 128`), four per int32 along the
+    The checkpoint stores int8 `[out, in]`; `Int8PbWoRepack` repacks it into
+    the WNA16 kernels' layout: uint8b128 (`q + 128`), four per int32 along the
     input dim.
     """
 
@@ -2769,20 +2767,12 @@ class KInt8Static(QuantKeyScheme):
                 f"INT8_PB_WO requires input size per partition ({in_}) divisible "
                 f"by 4 and by group_size ({group_size})"
             )
-
-        def weight_loader(param, loaded_weight, *args, **kwargs):
-            if loaded_weight.dtype != torch.int8:
-                raise ValueError(f"expected an int8 weight, got {loaded_weight.dtype}")
-            packed = loaded_weight.contiguous().view(torch.uint8) ^ 0x80
-            default_weight_loader(param, packed.view(torch.int32))
-
         self.register_params(
             layer,
             "weight",
             (out, in_ // 4),
             torch.int32,
             PackedvLLMParameter,
-            loader=weight_loader,
             input_dim=1,
             output_dim=0,
             packed_dim=1,
@@ -2800,6 +2790,9 @@ class KInt8Static(QuantKeyScheme):
             init=float("nan"),
         )
 
+    def checkpoint_op(self, ctx) -> tuple[type, list[str]] | None:
+        return Int8PbWoRepack, ["weight"]
+
     def process(self, layer, role) -> None:
         if role is not WEIGHT:
             self.reject(role)
@@ -2809,6 +2802,49 @@ class KInt8Static(QuantKeyScheme):
                 "was never loaded; the checkpoint does not store this layer as "
                 "INT8_PB_WO."
             )
+
+
+class Mxfp8ScaleExpand(ConversionOps):
+    """MXFP8 scales stored one per `(rows, 32)` block, as one uint8 per `(1, 32)`:
+    each stored row repeated. Whole: sharded after, by the param's rows (the
+    checkpoint's are fewer)"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        self.quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        name = kwargs["full_layer_name"]
+        layer = kwargs["model"].get_submodule(name.rpartition(".")[0])
+        rows = KMxfp8Static.scale_block_rows(layer.quant_method.ctx)
+
+        def expand(tensor: torch.Tensor) -> torch.Tensor:
+            assert tensor.dtype in (torch.uint8, torch.float8_e8m0fnu)
+            return tensor.view(torch.uint8).repeat_interleave(rows, dim=0)
+
+        return {p: [expand(t) for t in v] for p, v in input_dict.items()}
+
+
+class Int8PbWoRepack(ConversionOps):
+    """INT8_PB_WO's int8 `[out, in]` weight as uint8b128 (`q + 128`), four per
+    int32 along the input dim. Whole: sharded after, by the packed param (a row
+    parallel layer's input dim is packed)"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        self.quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        def repack(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.dtype != torch.int8:
+                raise ValueError(f"expected an int8 weight, got {tensor.dtype}")
+            return (tensor.contiguous().view(torch.uint8) ^ 0x80).view(torch.int32)
+
+        return {p: [repack(t) for t in v] for p, v in input_dict.items()}
 
 
 class KDynamicNoParam(QuantKeyScheme):
@@ -3134,6 +3170,17 @@ class ModelOptLinearMethod(LinearMethodBase):
                 refill_derived(layer, name, src.detach().clone())
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         self.kernel.process_weights_after_loading(layer)
+
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """A weight scheme storing another layout on disk loads through its op
+        (`checkpoint_op`), on each source before the model's concat"""
+        if (op := self.wkey.checkpoint_op(self.ctx)) is None:
+            return None
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmLayoutQuantizer,
+        )
+
+        return VllmLayoutQuantizer(*op)
 
     def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
         """Reconstruct serialized weights for online requantization."""
