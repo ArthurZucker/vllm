@@ -63,6 +63,9 @@ class VllmFormatQuantizer(HfQuantizer):
     def is_trainable(self):
         return False
 
+    def get_weight_conversions(self):
+        return []  # the model's converters read the tensors
+
 
 class VllmLayoutQuantizer(VllmFormatQuantizer):
     """A format vLLM loads into its own layout: `op` (a `ConversionOps` taking the
@@ -78,9 +81,6 @@ class VllmLayoutQuantizer(VllmFormatQuantizer):
 
     def get_load_operations(self):
         return {"deserialize": self.op}
-
-    def get_weight_conversions(self):
-        return []  # the model's converters read the tensors
 
 
 class QuantizeOnLoad(ConversionOps):
@@ -191,9 +191,6 @@ class VllmRequantizeQuantizer(VllmQuantizeQuantizer):
 
     def get_load_operations(self):
         return {"deserialize": DequantizeOnLoad}  # what the plan reads, pre-quantized
-
-    def get_weight_conversions(self):
-        return []  # the model's converters read the tensors
 
 
 class ReadAlong(WeightConverter):
