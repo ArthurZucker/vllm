@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from functools import partial
 from typing import Any
 
 import torch
@@ -59,52 +58,22 @@ def _quantize_fp8_per_channel(weight: torch.Tensor) -> tuple:
     return online_fp8._fp8_quant_per_channel(weight, scale), scale
 
 
-def _nvfp4_on_load(layer: torch.nn.Module, method: Any) -> None:
-    """w1 and w3 of an expert share one global scale: the first waits."""
-    pending: dict[int, tuple[str, torch.Tensor, torch.Event]] = {}
-
-    def loader(load, param, loaded_weight, weight_name, shard_id, expert_id, **kw):
-        if layer._map_global_expert_id_to_local_expert_id(expert_id) == -1:
-            return False
-        weight = loaded_weight.to(param.device, layer.params_dtype, copy=True)
-        shards = [(shard_id, weight)]
-        if shard_id in ("w1", "w3") and layer.moe_config.is_act_and_mul:
-            first = pending.pop(expert_id, None)
-            if first is None or first[0] == shard_id:
-                copied = torch.Event()
-                copied.record()
-                pending[expert_id] = (shard_id, weight, copied)
-                return True
-            first_id, first_weight, copied = first
-            # held from another load, which may have run on another stream
-            copied.wait()
-            first_weight.record_stream(torch.accelerator.current_stream())
-            shards.insert(0, (first_id, first_weight))
-        stacked = torch.cat([w for _, w in shards])[None]
-        values, scales, scale_2 = _quantize_moe_weight_to_nvfp4(stacked)
-        n = len(shards)
-        for (shard, _), v, s in zip(shards, values[0].chunk(n), scales[0].chunk(n)):
-            ret = load(param, (v, s, scale_2), weight_name, shard, expert_id, **kw)
-        return ret
-
+def _nvfp4_on_load(layer: torch.nn.Module) -> None:
+    """The loader's stacked experts (this rank's, gate and up together) quantized
+    at once: one global scale per expert, shared by its gate and up halves"""
     for p in ("w13_", "w2_"):
         names = (f"{p}weight", f"{p}weight_scale", f"{p}weight_scale_2")
-        load = _load_quantized(layer, *names)
-        getattr(layer, names[0]).weight_loader = partial(loader, load)
+        load, scale_2 = _load_quantized(layer, *names), getattr(layer, names[2])
 
-    process = method.process_weights_after_loading
+        def loader(param, loaded_weight, load=load, scale_2=scale_2):
+            weight = loaded_weight.to(param.device, layer.params_dtype)
+            values, scales, global_scale = _quantize_moe_weight_to_nvfp4(weight)
+            # one per expert, in each of the param's slots (w13: gate, up)
+            shape = (-1, *([1] * (scale_2.dim() - 1)))
+            global_scale = global_scale.view(shape).expand(scale_2.shape)
+            return load(param, (values, scales, global_scale.contiguous()))
 
-    def process_weights_after_loading(layer: torch.nn.Module) -> None:
-        if pending:
-            experts = sorted(pending)
-            pending.clear()
-            raise RuntimeError(
-                f"{layer.layer_name}: NVFP4 experts {experts} got only one of "
-                "w1/w3; both must be loaded in the same update"
-            )
-        process(layer)
-
-    method.process_weights_after_loading = process_weights_after_loading
+        getattr(layer, names[0]).weight_loader = loader
 
 
 def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
@@ -170,7 +139,7 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
     def create_weights_quantized_on_load(layer, *args, **kwargs):
         create_weights(layer, *args, **kwargs)
         if weight == qu.kNvfp4Static:
-            return _nvfp4_on_load(layer, method)
+            return _nvfp4_on_load(layer)
         for p in ("w13_", "w2_") if is_moe else ("",):
             quantize_on_load(layer, f"{p}weight", quantize, f"{p}{scale}")
 
