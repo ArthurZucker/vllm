@@ -19,9 +19,9 @@ _requantization_source: ContextVar[bool] = ContextVar(
 def skip_checkpoint_backend_selection() -> Generator[None]:
     """Skip backend selection for checkpoint quantization methods in this scope.
 
-    Covers checkpoint methods used as requantization sources (their weights are
-    only dequantized) and unquantized checkpoint methods discarded when an online
-    target replaces them, so oracles need not probe a compute backend.
+    Covers checkpoint methods used as requantization sources (only their
+    dequantize op is used) and unquantized checkpoint methods discarded when an
+    online target replaces them, so oracles need not probe a compute backend.
     """
     token = _requantization_source.set(True)
     try:
@@ -34,8 +34,11 @@ def is_requantization_source() -> bool:
     return _requantization_source.get()
 
 
-class OnlineRequantizationMixin:
-    """Shared lifecycle for converting serialized weights before quantization."""
+class OnlineQuantMixin:
+    """An online method's activation key, and its requantization source: a
+    checkpoint method whose weights it requantizes as they load (the source's
+    `dequantize_op` on each checkpoint weight before the model's ops, this
+    method's quantize op after them)."""
 
     # Only the MXFP4 and FP8 per-channel (PTPC) online linear methods honor an
     # activation override for now.
@@ -65,44 +68,17 @@ class OnlineRequantizationMixin:
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.requantization_source: QuantizeMethodBase | None = None
-        self.requantization_source_parameters: dict[str, torch.nn.Parameter] = {}
 
     def set_requantization_source(self, source_method: QuantizeMethodBase) -> None:
-        """Configure serialized-weight conversion before online quantization."""
         self.requantization_source = source_method
 
-    def create_requantization_source_weights(
-        self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
-    ) -> bool:
-        """Delegate weight creation to the source and track its parameters."""
-        if self.requantization_source is None:
-            return False
+    def requantizing(self, layer: torch.nn.Module, targets: dict[str, tuple]):
+        """The plan's quantizer of `targets` (this method's quantize ops), the
+        source's dequantize op before them"""
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmRequantizeQuantizer,
+        )
 
-        existing_parameter_names = set(layer._parameters)
-        # Schemes may select kernels in `create_weights`: skip them for sources.
-        with skip_checkpoint_backend_selection():
-            self.requantization_source.create_weights(
-                layer, *weight_args, **extra_weight_attrs
-            )
-        self.requantization_source_parameters = {
-            name: parameter
-            for name, parameter in layer._parameters.items()
-            if name not in existing_parameter_names and parameter is not None
-        }
-        for parameter in self.requantization_source_parameters.values():
-            # `replace_parameter` then registers new params over these.
-            parameter.requantization_source = True
-        return True
-
-    def source_checkpoint_quantizer(self, layer: torch.nn.Module):
-        """The source's plan (its layout's load ops): its params load as they would
-        without requantization, which dequantizes and quantizes them after loading"""
-        quantizer = getattr(self.requantization_source, "checkpoint_quantizer", None)
-        return None if quantizer is None else quantizer(layer)
-
-    def release_requantization_source_weights(self, layer: torch.nn.Module) -> None:
-        """Release serialized parameters after successful requantization."""
-        for name, source_parameter in self.requantization_source_parameters.items():
-            if layer._parameters.get(name) is source_parameter:
-                delattr(layer, name)
-        self.requantization_source_parameters.clear()
+        assert self.requantization_source is not None
+        dequantize, names, dropped = self.requantization_source.dequantize_op(layer)
+        return VllmRequantizeQuantizer(targets, dequantize, names, dropped)

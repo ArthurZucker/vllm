@@ -23,9 +23,11 @@
 # limitations under the License.
 """Inference-only Erine VL model compatible with HuggingFace weights."""
 
+from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
+import regex as re
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
@@ -79,6 +81,25 @@ class Ernie4_5_VLMoeMLP(Ernie4_5_MoeMLP):
             return self.shared_experts(x) + super().forward(x)
         else:
             return super().forward(x)
+
+
+_EXPERT = re.compile(r"\.mlp\.experts\.(\d+)\.")
+
+
+def split_text_vision_experts(
+    num_text_experts: int, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The checkpoint's experts (`mlp.experts.N`): the text experts first, then the
+    vision ones, each into its own experts (`text_experts.N`, `vision_experts.N`)"""
+
+    def one(match: re.Match) -> str:
+        n = int(match.group(1))
+        if n < num_text_experts:
+            return f".mlp.text_experts.{n}."
+        return f".mlp.vision_experts.{n - num_text_experts}."
+
+    for name, weight in weights:
+        yield _EXPERT.sub(one, name), weight
 
 
 class Ernie4_5_VLMoeAttention(nn.Module):
@@ -633,4 +654,3 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

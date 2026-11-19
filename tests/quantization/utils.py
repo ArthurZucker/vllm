@@ -34,7 +34,7 @@ def load_online_quantized(
     e.g. merged `[E, N, K]` experts) into an online-quantized `layer` as the
     loader does: the plan's quantize op, each output into its param. Then
     post-load processing."""
-    from vllm.model_executor.model_loader.ops_loader import _load_into
+    from vllm.model_executor.model_loader.ops_loader import copy_into
 
     method = layer.quant_method if method is None else method
     root = torch.nn.Module()
@@ -44,7 +44,7 @@ def load_online_quantized(
         key = f"layer.{name}"
         out = op.convert({key: [tensor]}, [], [], full_layer_name=key, model=root)
         for target, value in out.items():
-            _load_into(root.get_parameter(target), value)
+            copy_into(target, root.get_parameter(target), value)
     method.process_weights_after_loading(layer)
 
 

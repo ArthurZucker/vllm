@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -90,6 +91,16 @@ def _zero_mean_tensor(t: torch.Tensor) -> torch.Tensor:
     if t.numel() == 0:
         return t
     return t - t.mean()
+
+
+def _normalized_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The stream, the router's per-expert score bias zero-meaned"""
+    for name, w in weights:
+        if _is_gate_expert_bias_name(name):
+            w = _zero_mean_tensor(w if isinstance(w, torch.Tensor) else w[...])
+        yield name, w
 
 
 class SarvamMLAAttention(nn.Module):
@@ -640,6 +651,7 @@ class SarvamMLAForCausalLM(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.checkpoint_transforms = [_normalized_weights]
 
         self.tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         if get_pp_group().is_last_rank:
@@ -708,4 +720,6 @@ class SarvamMLAForCausalLM(
 class SarvamMoEForCausalLM(BailingMoeForCausalLM):
     """Same as BailingMoeForCausalLM, but normalizes gate expert_bias pre-load."""
 
-    pass
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.checkpoint_transforms = [_normalized_weights, self._normalize_lm_head]

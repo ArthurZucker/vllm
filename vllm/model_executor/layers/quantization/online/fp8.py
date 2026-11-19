@@ -47,7 +47,7 @@ from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
 from vllm.model_executor.layers.quantization.online.requantization import (
-    OnlineRequantizationMixin,
+    OnlineQuantMixin,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -127,15 +127,16 @@ def _is_tp_sharded(layer: Module, *, reduces_output_dim: bool = True) -> bool:
     return is_row_parallel or (reduces_output_dim and is_column_parallel)
 
 
-class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
+class OnlineLinearBase(OnlineQuantMixin, LinearMethodBase):
     """Base for online linear methods quantizing a full-precision weight as it
     loads.
 
     `create_quantized_weights` registers the quantized params, which the plan's
     quantize op (`checkpoint_quantizer`) fills with `quantize_weight` after the
-    model's converter ops (e.g. the merged `qkv`). A requantization source keeps
-    its own params, and an lm_head (a padded vocab, tied to the embeddings, or a
-    drafter's copy) its full-precision weight: both are quantized after loading.
+    model's converter ops (e.g. the merged `qkv`); a requantization source's
+    dequantize op runs on each checkpoint weight before them. An lm_head (a padded
+    vocab, tied to the embeddings, or a drafter's copy) keeps its full-precision
+    weight, quantized after loading.
     """
 
     activation_quant_key: QuantKey | None
@@ -153,14 +154,6 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
             "the lm_head from quantization_config.targets."
         )
 
-    def get_weight_for_quantization(self, layer: torch.nn.Module) -> torch.Tensor:
-        if self.requantization_source is None:
-            return layer.weight
-        weight = self.requantization_source.dequantize_weight(layer)
-        if not isinstance(weight, torch.Tensor):
-            raise TypeError("Linear requantization requires a single weight tensor.")
-        return weight
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -171,17 +164,6 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if self.create_requantization_source_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        ):
-            return
-
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
@@ -219,9 +201,8 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
         raise NotImplementedError
 
     def checkpoint_quantizer(self, layer: torch.nn.Module):
-        """The plan's quantize op of the weight, after the model's converter ops"""
-        if self.requantization_source is not None:
-            return self.source_checkpoint_quantizer(layer)
+        """The plan's quantize op of the weight, after the model's converter ops
+        (and a requantization source's dequantize op before them)"""
         if not getattr(layer, "quantizes_on_load", False):
             return None  # an lm_head, quantized after loading
         from vllm.model_executor.models.transformers.conversion import (
@@ -229,16 +210,16 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
         )
 
         quantize = partial(self.quantize_weight, layer)
-        return VllmQuantizeQuantizer(
-            {"weight": (quantize, list(self.scale_names), True)}
-        )
+        targets = {"weight": (quantize, list(self.scale_names), True)}
+        if self.requantization_source is not None:
+            return self.requantizing(layer, targets)
+        return VllmQuantizeQuantizer(targets)
 
     def quantized_weight(self, layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
-        """`(weight, *scales)`: as loaded, else quantized now (a requantization
-        source's weight, an lm_head's)."""
+        """`(weight, *scales)`: as loaded, else quantized now (an lm_head's)."""
         if getattr(layer, "quantizes_on_load", False):
             return (layer.weight, *(getattr(layer, n) for n in self.scale_names))
-        return self.quantize_weight(layer, self.get_weight_for_quantization(layer))
+        return self.quantize_weight(layer, layer.weight)
 
 
 def _weight_param(shape: tuple[int, int], dtype: torch.dtype) -> ModelWeightParameter:
@@ -339,7 +320,6 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
         self.fp8_linear.process_weights_after_loading(layer)
-        self.release_requantization_source_weights(layer)
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
@@ -459,11 +439,7 @@ class Fp8PerBlockOnlineLinearMethod(OnlineLinearBase):
         replace_parameter(layer, "weight", qweight.data)
         replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
 
-        if self.requantization_source is not None and hasattr(layer, "weight_scale"):
-            del layer.weight_scale
-
         self.fp8_linear.process_weights_after_loading(layer)
-        self.release_requantization_source_weights(layer)
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
@@ -614,7 +590,6 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
 
         self.fp8_linear.process_weights_after_loading(layer)
         expose_input_quant_key(layer, self.fp8_linear)
-        self.release_requantization_source_weights(layer)
 
         layer._already_called_process_weights_after_loading = True
 
@@ -734,7 +709,6 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
             w13_input_scale=None,
             w2_input_scale=None,
         )
-        self.release_requantization_source_weights(layer)
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
 

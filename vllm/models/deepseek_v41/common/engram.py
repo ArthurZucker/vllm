@@ -821,8 +821,8 @@ def _allow_any_numa_node(address: int, num_bytes: int) -> None:
 
 
 class DPSharedEngramStorage:
-    """Host weights shared by a node-local DP group, each rank writing the same
-    rows: host-NUMA cuMem where FABRIC handles work, else a registered /dev/shm
+    """Host weights shared by a node-local DP group with one writer (the group's
+    leader): host-NUMA cuMem where FABRIC handles work, else a registered /dev/shm
     mapping."""
 
     def __init__(
@@ -1122,6 +1122,16 @@ class ParallelEngramEmbedding(nn.Module):
             set_weight_attrs(
                 param, {"row_start": row_start, "keeps_sent_dtype": (param.dtype,)}
             )
+        # a DP-shared host table is written by its group's leader alone: the others
+        # drop its tensors (`conversion_mapping`) and wait for it after loading
+        shared = self._shared_memory
+        self.leader_written: tuple[str, ...] = (
+            ("weight", "weight_scale_inv")
+            if shared is not None and shared.group.rank_in_group != 0
+            else ()
+        )
+        for name in self.leader_written:
+            getattr(self, name).loaded_at_init = True
         if cpu_offload and not self.weight.is_meta:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
@@ -1235,9 +1245,9 @@ class ParallelEngramEmbedding(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Serve only once every rank sharing this table has written it (DP-shared
-        host memory: each writes the same rows), or every GPU of the peer group has
-        loaded its own (peers read those rows directly)."""
+        """Serve only once the leader of the ranks sharing this table has written it
+        (DP-shared host memory), or every GPU of the peer group has loaded its own
+        (peers read those rows directly)."""
         if self._shared_memory is not None:
             torch.distributed.barrier(group=self._shared_memory.group.cpu_group)
         if not self.peer_rows:

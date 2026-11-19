@@ -97,6 +97,26 @@ def _pad_dense_mlp_weight(
     return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
 
 
+def pad_dense_mlp_weights(
+    weight_block_size: list[int] | None,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    prefix: str = "",
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """The stream with its dense MLPs' and shared experts' tensors (under `prefix`)
+    zero-padded to whole quant blocks on each TP rank, as their params are"""
+    projections = (".gate_proj.", ".up_proj.", ".down_proj.")
+    for name, weight in weights:
+        if (
+            weight_block_size is not None
+            and name.startswith(prefix)
+            and ".mlp.experts." not in name
+            and any(proj in name for proj in projections)
+        ):
+            weight = weight if isinstance(weight, torch.Tensor) else weight[...]
+            weight = _pad_dense_mlp_weight(name, weight, weight_block_size)
+        yield name, weight
+
+
 class Dots3NoteMoE(DeepseekV2MoE):
     """DeepSeek MoE with NOTE's block-padded shared expert."""
 
@@ -653,7 +673,6 @@ class Dots3NoteModel(DeepseekV32Model):
                     ):
                         continue
             yield name, _pad_dense_mlp_weight(name, weight, self._weight_block_size)
-
 
 
 class Dots3NoteLanguageModelForCausalLM(DeepseekV32ForCausalLM):

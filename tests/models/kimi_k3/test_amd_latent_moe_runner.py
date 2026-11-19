@@ -23,6 +23,7 @@ from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.fused_moe.runner import moe_runner
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.models.kimi_k3.amd import latent_moe_runner
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.linear import KimiRoutedOutputTransform
@@ -62,7 +63,7 @@ def _build_transform(
             params_dtype=DTYPE,
             prefix="routed_expert_up_proj",
         ).to(device=device)
-        up_proj.weight_loader(up_proj.weight, full_weight)
+        load_with_ops(up_proj, iter([("weight", full_weight)]))  # this rank's rows
     else:
         up_proj = ReplicatedLinear(
             LATENT_SIZE,

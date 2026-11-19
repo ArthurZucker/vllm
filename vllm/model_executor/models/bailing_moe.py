@@ -512,6 +512,7 @@ class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.checkpoint_transforms = [self._normalize_lm_head]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -541,6 +542,7 @@ class BailingMoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         norm_head = getattr(self.config, "norm_head", False)
         for name, loaded_weight in weights:
             if norm_head and "lm_head.weight" in name:
+                loaded_weight = loaded_weight[...]  # all of it (a lazy slice)
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
             yield name, loaded_weight
 

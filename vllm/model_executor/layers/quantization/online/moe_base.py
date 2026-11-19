@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import abstractmethod
-from collections.abc import Callable, Iterator
 from functools import partial
 
 import torch
@@ -16,7 +15,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import triton_weight
 from vllm.model_executor.layers.quantization.online.requantization import (
-    OnlineRequantizationMixin,
+    OnlineQuantMixin,
 )
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -34,13 +33,13 @@ def _zero_padded(
     return padded
 
 
-class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
+class OnlineMoEMethodBase(OnlineQuantMixin, FusedMoEMethodBase):
     """Base for MoE methods quantizing full-precision experts as they load.
 
     `create_quantized_weights` registers the quantized params, which the plan's
     quantize op (`checkpoint_quantizer`) fills from the merged `[E, N, K]` experts
-    with `quantize_experts`, after the model's converter ops. A requantization
-    source keeps its own params instead, quantized after loading.
+    with `quantize_experts`, after the model's converter ops; a requantization
+    source's dequantize op runs on each checkpoint expert before them.
     """
 
     def __init__(self, moe: FusedMoEConfig):
@@ -55,24 +54,9 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # Target conversion needs this metadata even when the source creates weights.
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
-
-        if self.requantization_source is not None:
-            # In case FSE is used, shared experts slots are initialized on RoutedExperts
-            # online quant method, the source only holds the routed experts.
-            self.create_requantization_source_weights(
-                layer,
-                num_experts - layer.expert_map_manager.num_fused_shared_experts,
-                layer.moe_config.hidden_dim_unpadded,
-                layer.moe_config.intermediate_size_per_partition_unpadded,
-                params_dtype,
-                **extra_weight_attrs,
-            )
-            layer.num_experts = num_experts
-            return
 
         w13_rows = self.moe.w13_num_shards * intermediate_size_per_partition
         for name, shape, dtype in self.quantized_params(
@@ -124,23 +108,23 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
         raise NotImplementedError
 
     def checkpoint_quantizer(self, layer: torch.nn.Module):
-        """The plan's quantize op of each expert weight, after the experts merge"""
-        if self.requantization_source is not None:
-            return self.source_checkpoint_quantizer(layer)
+        """The plan's quantize op of each expert weight, after the experts merge
+        (and a requantization source's dequantize op on each expert before it)"""
         from vllm.model_executor.models.transformers.conversion import (
             VllmQuantizeQuantizer,
         )
 
-        return VllmQuantizeQuantizer(
-            {
-                f"{prefix}weight": (
-                    partial(self._quantize_on_load, layer, f"{prefix}weight"),
-                    self.expert_scale_names(prefix),
-                    True,
-                )
-                for prefix in ("w13_", "w2_")
-            }
-        )
+        targets = {
+            f"{prefix}weight": (
+                partial(self._quantize_on_load, layer, f"{prefix}weight"),
+                self.expert_scale_names(prefix),
+                True,
+            )
+            for prefix in ("w13_", "w2_")
+        }
+        if self.requantization_source is not None:
+            return self.requantizing(layer, targets)
+        return VllmQuantizeQuantizer(targets)
 
     def _quantize_on_load(
         self, layer: torch.nn.Module, name: str, weight: torch.Tensor
@@ -156,151 +140,28 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
         return self.quantize_experts(layer, name, _zero_padded(weight, shape, segments))
 
     def quantized_weights(self, layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
-        """`(w13, *w13 scales, w2, *w2 scales)`: as loaded, or the requantization
-        source's, quantized now."""
-        if self.requantization_source is None:
-            return tuple(
-                getattr(layer, name)
-                for prefix in ("w13_", "w2_")
-                for name in (f"{prefix}weight", *self.expert_scale_names(prefix))
-            )
-        return self.quantize_weights(
-            layer,
-            lambda w13, w2: (
-                *self.quantize_experts(layer, "w13_weight", w13),
-                *self.quantize_experts(layer, "w2_weight", w2),
-            ),
+        """`(w13, *w13 scales, w2, *w2 scales)`, as loaded."""
+        return tuple(
+            getattr(layer, name)
+            for prefix in ("w13_", "w2_")
+            for name in (f"{prefix}weight", *self.expert_scale_names(prefix))
         )
 
-    def iter_weights_for_quantization(
-        self, layer: torch.nn.Module
-    ) -> Iterator[tuple[slice, torch.Tensor, torch.Tensor]]:
-        """Yield `(experts, w13, w2)` for groups of experts to quantize.
-
-        The source dequantizes in chunks to bound staging memory. Without a source,
-        all routed experts are yielded at once. Fused shared experts come last.
-        """
-        num_shared = layer.expert_map_manager.num_fused_shared_experts
-        num_routed = layer.local_num_experts - num_shared
-
-        source = self.requantization_source
-        if source is None:
-            # These include the fused shared experts slots, never staged here.
-            yield slice(0, num_routed), layer.w13_weight, layer.w2_weight
-        else:
-            chunks = source.dequantize_weight(layer)
-            if isinstance(chunks, torch.Tensor):
-                raise TypeError("MoE requantization requires w13 and w2 weights.")
-            for experts, w13, w2 in chunks:
-                yield (
-                    experts,
-                    *self._pad_requantized_weights(
-                        layer, w13, w2, experts.stop - experts.start
-                    ),
-                )
-
-        if num_shared > 0:
-            loader = layer.shared_expert_online_loader
-            shared_w13, shared_w2 = loader.dequantize_staging(layer)
-            loader.release_staging(layer)
-            yield (
-                slice(num_routed, num_routed + num_shared),
-                *self._pad_requantized_weights(
-                    layer,
-                    shared_w13.to(layer.orig_dtype),
-                    shared_w2.to(layer.orig_dtype),
-                    num_shared,
-                ),
-            )
-
-    def quantize_weights(
-        self,
-        layer: torch.nn.Module,
-        quantize: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, ...]],
-    ) -> tuple[torch.Tensor, ...]:
-        """Quantize the layer's weights one group of experts at a time.
-
-        Args:
-            layer: Layer to quantize.
-            quantize: Maps `(w13, w2)` of a group of experts to tensors, e.g.
-                `(w13, w13_scale, w2, w2_scale)`.
-
-        Returns:
-            The `quantize` outputs for all local experts.
-
-        """
+    def quantize_shared_experts(
+        self, layer: torch.nn.Module, w13: torch.Tensor, w2: torch.Tensor
+    ) -> None:
+        """Quantize the fused shared experts (staged, dequantized after loading by
+        `OnlineSharedExpertLoader`) into their slots, after the routed experts."""
         num_experts = layer.local_num_experts
-        outputs: list[torch.Tensor] | None = None
-        for experts, w13, w2 in self.iter_weights_for_quantization(layer):
-            quantized = quantize(w13, w2)
-            if outputs is None:
-                if w13.shape[0] == num_experts:
-                    return quantized
-                outputs = [t.new_empty((num_experts, *t.shape[1:])) for t in quantized]
-            for output, tensor in zip(outputs, quantized):
-                output[experts] = tensor
-        assert outputs is not None
-        return tuple(outputs)
-
-    def _pad_requantized_weights(
-        self,
-        layer: torch.nn.Module,
-        w13: torch.Tensor,
-        w2: torch.Tensor,
-        num_experts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        config = layer.moe_config
-        hidden_size = config.hidden_dim_unpadded
-        intermediate_size = config.intermediate_size_per_partition_unpadded
-        target_hidden_size = config.hidden_dim
-        target_intermediate_size = config.intermediate_size_per_partition
-
-        num_shards = self.moe.w13_num_shards
-
-        if w13.shape != (num_experts, num_shards * intermediate_size, hidden_size):
-            raise ValueError("Requantization requires unpadded source w13 weights.")
-        if w2.shape != (num_experts, hidden_size, intermediate_size):
-            raise ValueError("Requantization requires unpadded source w2 weights.")
-
-        if (
-            target_hidden_size < hidden_size
-            or target_intermediate_size < intermediate_size
-        ):
-            raise ValueError("Requantization target dimensions cannot shrink weights.")
-
-        # No padding required.
-        if (hidden_size, intermediate_size) == (
-            target_hidden_size,
-            target_intermediate_size,
-        ):
-            return w13, w2
-
-        if any(
-            getattr(layer, name, None) is not None for name in ("w13_bias", "w2_bias")
-        ):
-            raise NotImplementedError(
-                "Padded requantization with biases is unsupported."
-            )
-
-        def pad_moe_weights(
-            w13: torch.Tensor, w2: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            padded_w13 = w13.new_zeros(
-                (num_experts, num_shards * target_intermediate_size, target_hidden_size)
-            )
-            padded_w2 = w2.new_zeros(
-                (num_experts, target_hidden_size, target_intermediate_size)
-            )
-            for shard in range(num_shards):
-                source_start = shard * intermediate_size
-                target_start = shard * target_intermediate_size
-                padded_w13[
-                    :, target_start : target_start + intermediate_size, :hidden_size
-                ] = w13[:, source_start : source_start + intermediate_size, :]
-            padded_w2[:, :hidden_size, :intermediate_size] = w2
-            return padded_w13, padded_w2
-
-        return pad_moe_weights(w13, w2)
+        shared = slice(num_experts - w13.shape[0], num_experts)
+        for prefix, weight in (("w13_", w13), ("w2_", w2)):
+            name = f"{prefix}weight"
+            quantized = self._quantize_on_load(layer, name, weight.to(layer.orig_dtype))
+            for param_name, tensor in zip(
+                (name, *self.expert_scale_names(prefix)), quantized
+            ):
+                slot = getattr(layer, param_name).data[shared]
+                slot.copy_(tensor.reshape(slot.shape))
 
     @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

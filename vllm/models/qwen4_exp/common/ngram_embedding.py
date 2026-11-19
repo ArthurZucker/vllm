@@ -867,6 +867,20 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._shared_group = group
         self._shared_ptrs: set[int] = set()
         super().__init__(*args, **kwargs)
+        # a shared table is written by the group's leader alone: the others drop its
+        # tensors (`conversion_mapping`) and wait for it after loading
+        self.leader_written: tuple[str, ...] = tuple(
+            name
+            for name, param in self.named_parameters(recurse=False)
+            if param.data_ptr() in self._shared_ptrs and group.rank_in_group != 0
+        )
+        for name in self.leader_written:
+            getattr(self, name).loaded_at_init = True
+
+    def process_weights_after_loading(self) -> None:
+        """Serve only once the group's leader has written the shared tables"""
+        if self._shared_ptrs:
+            torch.distributed.barrier(group=self._shared_group.cpu_group)
 
     def allocate_embedding_weight(
         self,

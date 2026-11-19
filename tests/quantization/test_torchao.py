@@ -129,7 +129,7 @@ def test_online_quant_config_dict_json(vllm_runner, enable_pickle):
             model_loader = get_model_loader(load_config)
             assert isinstance(model_loader, DefaultModelLoader)
             weights_iterator = model_loader.get_all_weights(model_config, model)
-            model.load_weights(weights_iterator)
+            load_weights(model, weights_iterator)
 
         llm.apply_model(load_weights)
 

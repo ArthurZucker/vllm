@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Bailing MoE v3 MTP model."""
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 from transformers.configuration_utils import PreTrainedConfig
@@ -16,6 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
+from vllm.model_executor.models.bailing_moe_mtp import lm_head_into_shared_heads
 from vllm.model_executor.models.bailing_moe_v3 import (
     BailingMoeV3MLAAttention,
     BailingMoeV3MoE,
@@ -233,6 +236,7 @@ class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
             prefix=maybe_prefix(prefix, "model"),
         )
         self.lm_head: nn.Module | None = None
+        self.checkpoint_transforms = [partial(lm_head_into_shared_heads, self)]
 
     def embed_input_ids(
         self,

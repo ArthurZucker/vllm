@@ -12,6 +12,7 @@ import vllm.device_allocator.cumem as cumem
 import vllm.envs as envs
 from vllm import LLM, AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
 
@@ -404,7 +405,7 @@ def _load_weights(worker) -> None:
     # Not reload_weights(): its layerwise finalize re-derives the KV scales.
     model = worker.model_runner.get_model()
     loader = get_model_loader(worker.load_config)
-    model.load_weights(loader.get_all_weights(worker.model_config, model))
+    load_weights(model, loader.get_all_weights(worker.model_config, model))
 
 
 def _attn_kv_scales(model) -> dict[str, list[float]]:

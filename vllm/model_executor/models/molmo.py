@@ -1314,6 +1314,7 @@ class MolmoForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.checkpoint_transforms = [_get_weights_with_merged_embedding]
 
     def _parse_and_validate_image_input(
         self,
@@ -1413,9 +1414,9 @@ def _get_weights_with_merged_embedding(
     embedding_weights = {}
     for name, weight in weights:
         if "wte.embedding" in name:
-            embedding_weights["embedding"] = weight
+            embedding_weights["embedding"] = weight[...]  # a lazy slice: read
         elif "wte.new_embedding" in name:
-            embedding_weights["new_embedding"] = weight
+            embedding_weights["new_embedding"] = weight[...]
         else:
             yield (name, weight)
     # this is compatible with most of quantization,

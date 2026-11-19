@@ -533,6 +533,9 @@ class DFlash2BeamForCausalLM(nn.Module):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+        # aliased to the target's after loading, not in the checkpoint
+        for param in (self.model.embed_tokens.weight, self.lm_head.weight):
+            param.loaded_at_init = True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

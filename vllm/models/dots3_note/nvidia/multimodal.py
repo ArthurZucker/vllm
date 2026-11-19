@@ -3,6 +3,7 @@
 """vLLM composition layer for Dots3Note image and audio encoders."""
 
 from contextlib import contextmanager
+from functools import partial
 
 import torch
 from torch import nn
@@ -35,7 +36,7 @@ from ..common.processor import (
     load_note_config_section,
 )
 from .audio import Dots3NoteAudioConfig, Dots3NoteAudioModel
-from .model import Dots3NoteLanguageModelForCausalLM
+from .model import Dots3NoteLanguageModelForCausalLM, pad_dense_mlp_weights
 from .vision import DotsMoEVitConfig, DotsMoEVitModel
 
 
@@ -81,6 +82,14 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.quant_config = vllm_config.quant_config
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
+        # the language model's dense MLPs padded to whole blocks a rank
+        self.checkpoint_transforms = [
+            partial(
+                pad_dense_mlp_weights,
+                getattr(self.quant_config, "weight_block_size", None),
+                prefix="model.",
+            )
+        ]
 
         added_tokens = get_hf_file_to_dict(
             "added_tokens.json",

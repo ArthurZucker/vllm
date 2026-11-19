@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.reload import weight_update_active
 from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
@@ -24,6 +26,8 @@ from .model import (
     MiniMAXGemmaRMSNorm,
     MiniMaxM3DecoderLayer,
 )
+
+EMBED = "model.embed_tokens.weight"
 
 
 class MiniMaxM3MultiTokenPredictorLayer(nn.Module):
@@ -143,6 +147,7 @@ class MiniMaxM3MTP(nn.Module):
         if self._tracks_own_embed:
             # Preserve embeddings from loaders that bypass load_weights.
             self.has_own_embed_tokens = vllm_config.load_config.load_format != "dummy"
+            self.checkpoint_transforms = [self._track_own_embed]
 
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -185,6 +190,21 @@ class MiniMaxM3MTP(nn.Module):
             self.lm_head, mtp_layer.final_layernorm(hidden_states)
         )
 
+    def _track_own_embed(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream as is; whether it ships the input embedding decides
+        `has_own_embed_tokens` (a partial weight update keeps the last answer)"""
+        own = False
+        for name, weight in weights:
+            own = own or name.removeprefix("language_model.") == EMBED
+            yield name, weight
+        if own:
+            self.has_own_embed_tokens = True
+        elif not weight_update_active():
+            # A complete checkpoint without embeddings borrows the target's.
+            self.has_own_embed_tokens = False
+
     def _map_checkpoint_name(self, name: str) -> str | None:
         """Map a full checkpoint key to this MTP module's parameter name.
 
@@ -210,4 +230,3 @@ class MiniMaxM3MTP(nn.Module):
             # Strip "mtp" from prefix.
             return name.replace(".mtp.", ".")
         return None
-

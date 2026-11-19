@@ -12,6 +12,7 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.model_executor.layers.mamba.mamba_mixer2 import Mixer2RMSNormGated
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
@@ -101,7 +102,7 @@ def mixer2_gated_norm_tensor_parallel(
             full_hidden_size=hidden_size,
             full_n_groups=n_groups,
         )
-    mixer.weight.weight_loader(mixer.weight, weight)  # load
+    load_with_ops(mixer, iter([("weight", weight)]))  # load, this rank's slice
 
     # create gated-norm without TP to compute reference
     # - utilize mock patching to disable TP when

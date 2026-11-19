@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterable
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -15,7 +17,7 @@ from vllm.v1.worker.gpu.spec_decode.xpress import kernels
 from vllm.v1.worker.gpu.spec_decode.xpress.config import XPressSpeculatorConfig
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
-from .utils import maybe_prefix
+from .utils import maybe_prefix, observe_eagle_weights
 
 logger = init_logger(__name__)
 
@@ -323,10 +325,29 @@ class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
                 "is defined over the target vocabulary)."
             )
         self.draft_id_to_target_id = None
+        self.checkpoint_transforms = [
+            partial(observe_eagle_weights, self),
+            self._fold_raw_mixer,
+        ]
+
+    def _fold_raw_mixer(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The checkpoint, its raw mixer (`xpress_head.mix.L`, as trained) folded
+        into the head's serving form (`mix_L`, see `fold_from_raw_`)"""
+        head = self.model.xpress_head
+        for name, tensor in weights:
+            if name == "xpress_head.mix_L":  # not the trained one: skipped
+                continue
+            if name == "xpress_head.mix.L":
+                raw = tensor[...].to(head.mix_L.dtype)
+                ones = torch.ones(head.block_size, head.block_size, dtype=raw.dtype)
+                name = "xpress_head.mix_L"
+                tensor = raw * torch.tril(ones) + torch.eye(len(ones), dtype=raw.dtype)
+            yield name, tensor
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)
-

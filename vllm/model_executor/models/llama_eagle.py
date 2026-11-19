@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -22,6 +23,7 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from .utils import (
     get_draft_quant_config,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -146,6 +148,7 @@ class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=logit_scale
         )
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

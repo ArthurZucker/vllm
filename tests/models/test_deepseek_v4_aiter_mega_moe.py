@@ -7,13 +7,11 @@ import pytest
 import torch
 
 from vllm.config.quantization import QuantizationConfigArgs
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     is_shared_expert_quant_fse_compatible,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.models.deepseek_v4.amd import mega_moe as mega_moe_module
 from vllm.models.deepseek_v4.amd.mega_moe import (
     DeepseekV4AiterMegaMoEExperts,
@@ -65,14 +63,6 @@ def test_experts_load_into_local_slots(monkeypatch):
     model.ffn = torch.nn.Module()
     model.ffn.experts = _make_experts(monkeypatch, ep_rank=1, ep_size=2, num_experts=4)
     params = dict(model.named_parameters())
-    mapping = fused_moe_make_expert_params_mapping(
-        model,
-        ckpt_gate_proj_name="w1",
-        ckpt_down_proj_name="w2",
-        ckpt_up_proj_name="w3",
-        num_experts=4,
-        routed_experts_prefix="",
-    )
 
     shapes = {
         ("w1", "weight"): (INTER, HIDDEN // 2),
@@ -83,31 +73,16 @@ def test_experts_load_into_local_slots(monkeypatch):
         ("w2", "weight_scale"): (HIDDEN, INTER // 32),
     }
     shard_value = {"w1": 1, "w3": 2, "w2": 3}
-    loaded = {}
-    for expert in range(4):
-        for (shard, suffix), shape in shapes.items():
-            name = f"ffn.experts.{expert}.{shard}.{suffix}"
-            weight = torch.full(
-                shape, 10 * expert + shard_value[shard], dtype=torch.uint8
-            )
-            for param_name, weight_name, expert_id, shard_id in mapping:
-                if weight_name not in name:
-                    continue
-                mapped = name.replace(weight_name, param_name)
-                param = params[mapped]
-                if param.weight_loader(
-                    param,
-                    weight,
-                    mapped,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                    return_success=True,
-                ):
-                    loaded[name] = mapped
-                    break
+    checkpoint = [
+        (
+            f"ffn.experts.{expert}.{shard}.{suffix}",
+            torch.full(shape, 10 * expert + shard_value[shard], dtype=torch.uint8),
+        )
+        for expert in range(4)
+        for (shard, suffix), shape in shapes.items()
+    ]
 
-    assert sorted({n.split(".")[2] for n in loaded}) == ["2", "3"]
-    assert len(loaded) == 2 * len(shapes)
+    assert load_with_ops(model, iter(checkpoint)) == set(params)
     for slot, expert in enumerate((2, 3)):
         for suffix in ("weight", "weight_scale"):
             w13 = params[f"ffn.experts.w13_{suffix}"][slot]

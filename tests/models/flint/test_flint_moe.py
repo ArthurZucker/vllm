@@ -7,6 +7,7 @@ and route exactly like sigmoid top-k."""
 import pytest
 import torch
 
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.models.flint.gguf_nvfp4 import dequantize_nvfp4
 from vllm.models.flint.ops import moe
 from vllm.platforms import current_platform
@@ -217,8 +218,8 @@ def test_moe_matches_reference(weights, flint_weights, num_tokens: int):
 
 @torch.inference_mode()
 def test_experts_module_loads_per_expert_tensors(weights, flint_weights):
-    """FlintNvfp4Experts assembles per-expert checkpoint tensors correctly and
-    repacks only once every distinct tensor is loaded."""
+    """FlintNvfp4Experts assembles per-expert checkpoint tensors correctly
+    (its `conversion_mapping` entry) and repacks after loading."""
     layer = moe.FlintNvfp4Experts(E, H, INTER, TOPK).cuda()
 
     def ckpt(experts):
@@ -234,10 +235,10 @@ def test_experts_module_loads_per_expert_tensors(weights, flint_weights):
             yield f"{e}.down_proj.weight_scale", weights["s2"][e]
             yield f"{e}.down_proj.weight_scale_2", weights["gs2"][e]
 
-    # Duplicates of expert 0 must not count towards completion.
-    layer.load_weights(ckpt([0] * E))
-    assert layer.weights is None
-    layer.load_weights(ckpt(range(E)))
+    loaded = load_weights(layer, ckpt(range(E)))
+    assert {n for n, _ in layer.named_parameters()} <= loaded
+    assert layer.weights is None  # repacked after loading, not as tensors arrive
+    layer.process_weights_after_loading()
     assert layer.weights is not None and not list(layer.parameters())
     x, shared = _inputs(4)
     torch.testing.assert_close(

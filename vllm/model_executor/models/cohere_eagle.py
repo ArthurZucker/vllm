@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,7 @@ from vllm.model_executor.models.commandr import (
 from .utils import (
     get_draft_quant_config,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -149,6 +151,7 @@ class EagleCohereForCausalLM(CohereForCausalLM):
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
         )
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(

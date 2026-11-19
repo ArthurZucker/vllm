@@ -9,8 +9,8 @@ M2N runtime and multiple GPUs, so it is exercised separately.
 
 import logging
 from contextlib import contextmanager
-from functools import cached_property, wraps
-from types import MethodType, SimpleNamespace
+from functools import cached_property
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pybase64 as base64
@@ -65,9 +65,9 @@ from vllm.distributed.weight_transfer.nccl_common import (
 )
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 
@@ -1134,7 +1134,8 @@ def _m2n_trainer_send(
     class Tiny(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = torch.nn.Parameter(
+            self.proj = torch.nn.Module()
+            self.proj.weight = torch.nn.Parameter(
                 torch.arange(
                     SHAPE[0] * SHAPE[1], dtype=torch.float32, device=device
                 ).reshape(SHAPE)
@@ -1228,7 +1229,7 @@ def _m2n_worker_receive(
             self.received: list[tuple[str, torch.Tensor]] = []
             self.received_by_name: dict[str, torch.Tensor] = {}
             if not mixed_layout and world_size > 2:
-                self.weight = torch.nn.Parameter(
+                weight = torch.nn.Parameter(
                     torch.zeros(
                         SHAPE[0] // (world_size - 1),
                         SHAPE[1],
@@ -1236,11 +1237,8 @@ def _m2n_worker_receive(
                         device=device,
                     )
                 )
-                self.weight.output_dim = 0
-                self.weight.weight_loader = MethodType(
-                    ColumnParallelLinear.weight_loader,
-                    Mock(tp_size=world_size - 1),
-                )
+                weight.output_dim = 0
+                self.proj = _tp_linear(ColumnParallelLinear, weight, world_size - 1)
 
         def load_weights(self, weights):
             for name, tensor in weights:
@@ -1275,8 +1273,8 @@ def _m2n_worker_receive(
         names = [param.name for param in params]
         dst_mesh_dims = [2, 1]
     else:
-        params = [M2NWireParam("weight", DTYPE, tuple(SHAPE), (1, 1), REPLICATED)]
-        names = ["weight"]
+        params = [M2NWireParam("proj.weight", DTYPE, tuple(SHAPE), (1, 1), REPLICATED)]
+        names = ["proj.weight"]
         dst_mesh_dims = [1, num_workers]
     engine.init_transfer_engine(
         M2NWeightTransferInitInfo(
@@ -1311,7 +1309,7 @@ def _m2n_worker_receive(
     name: str | None
     got: torch.Tensor | None
     if direct:
-        name, got = "weight", recorder.weight
+        name, got = "proj.weight", recorder.proj.weight
         expected = full.chunk(num_workers, dim=0)[worker_rank]
     else:
         name, got = recorder.received[0] if recorder.received else (None, None)
@@ -1369,7 +1367,7 @@ def test_m2n_weight_transfer_between_processes(data_plane):
 
     assert trainer_ok, "trainer engine did not complete"
     assert result["count"] == 1, f"expected one parameter, got {result['count']}"
-    assert result["name"] == "weight"
+    assert result["name"] == "proj.weight"
     assert result["shape"] == SHAPE
     assert result["exact"], "resharded tensor does not match what the trainer sent"
 
@@ -1397,7 +1395,7 @@ def test_m2n_weight_transfer_to_tp2_shards():
     assert trainer_ok, "trainer engine did not complete"
     for rank, result in enumerate(results):
         assert result["count"] == 0, f"worker {rank} unexpectedly called load_weights"
-        assert result["name"] == "weight"
+        assert result["name"] == "proj.weight"
         assert result["shape"] == [SHAPE[0] // 2, SHAPE[1]]
         assert result["direct"]
         assert result["exact"], f"worker {rank} received the wrong shard"
@@ -1449,6 +1447,15 @@ def test_m2n_transfer_with_per_parameter_source_meshes():
         }
 
 
+def _tp_linear(cls, weight: torch.nn.Parameter, tp_size: int = 2) -> torch.nn.Module:
+    """A `cls` layer owning `weight`, as built at `tp_size` (no TP group needed)"""
+    layer = cls.__new__(cls)
+    torch.nn.Module.__init__(layer)
+    layer.tp_size = tp_size
+    layer.weight = weight
+    return layer
+
+
 class _Model(torch.nn.Module):
     """Stand-in for a TP=2 shard of a tiny model.
 
@@ -1459,30 +1466,23 @@ class _Model(torch.nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.column = torch.nn.Parameter(torch.zeros(8, 16))
-        self.column.output_dim = 0
-        self.column.weight_loader = MethodType(
-            ColumnParallelLinear.weight_loader, Mock(tp_size=2)
-        )
-        self.row = torch.nn.Parameter(torch.zeros(16, 8))
-        self.row.input_dim = 1
-        self.row.weight_loader = MethodType(
-            RowParallelLinear.weight_loader, Mock(tp_size=2)
-        )
-        self.norm = torch.nn.Parameter(torch.zeros(16))
-        self.norm.weight_loader = default_weight_loader
-        self.fused = torch.nn.Parameter(torch.zeros(24, 16))
+        column = torch.nn.Parameter(torch.zeros(8, 16))
+        column.output_dim = 0
+        self.column = _tp_linear(ColumnParallelLinear, column)
+        row = torch.nn.Parameter(torch.zeros(16, 8))
+        row.input_dim = 1
+        self.row = _tp_linear(RowParallelLinear, row)
+        self.norm = _tp_linear(ReplicatedLinear, torch.nn.Parameter(torch.zeros(16)))
+        self.fused = torch.nn.Module()
+        self.fused.weight = torch.nn.Parameter(torch.zeros(24, 16))
 
 
 class _MixedModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.proj = torch.nn.Module()
-        self.proj.weight = torch.nn.Parameter(torch.zeros(16, 8))
-        self.proj.weight.input_dim = 1
-        self.proj.weight.weight_loader = MethodType(
-            RowParallelLinear.weight_loader, Mock(tp_size=2)
-        )
+        weight = torch.nn.Parameter(torch.zeros(16, 8))
+        weight.input_dim = 1
+        self.proj = _tp_linear(RowParallelLinear, weight)
         self.proj.bias = torch.nn.Parameter(torch.zeros(16))
 
 
@@ -1495,7 +1495,7 @@ def _resolve(names, dtypes, shapes, **kwargs):
 class TestDestinationResolution:
     @pytest.mark.parametrize(
         "name,expected_dim",
-        [("column", 0), ("row", 1)],
+        [("column.weight", 0), ("row.weight", 1)],
     )
     def test_sharded_parameter_resolves_to_its_tp_dim(self, name, expected_dim):
         [destination] = _resolve([name], [torch.float32], [(16, 16)])
@@ -1505,7 +1505,7 @@ class TestDestinationResolution:
     def test_replicated_parameter_needs_no_placement(self):
         """A parameter every rank holds in full is REPLICATED, so it works
         whatever way the inference mesh happens to be factored."""
-        [destination] = _resolve(["norm"], [torch.float32], [(16,)])
+        [destination] = _resolve(["norm.weight"], [torch.float32], [(16,)])
         assert destination.direct
         assert destination.placements is REPLICATED
 
@@ -1513,14 +1513,14 @@ class TestDestinationResolution:
         model = _Model()
         [destination] = resolve_parameter_destinations(
             model,
-            ["column"],
+            ["column.weight"],
             [torch.float32],
             [(16, 16)],
             num_workers=2,
             shard_axis_size=2,
             allow_direct=True,
         )
-        assert destination.tensor.data_ptr() == model.column.data_ptr()
+        assert destination.tensor.data_ptr() == model.column.weight.data_ptr()
 
     def test_known_transforming_model_submodule_falls_back(self):
         class GPT2Model(_Model):
@@ -1531,7 +1531,7 @@ class TestDestinationResolution:
         model.transforming = GPT2Model()
         [destination] = resolve_parameter_destinations(
             model,
-            ["transforming.row"],
+            ["transforming.row.weight"],
             [torch.float32],
             [(16, 16)],
             num_workers=2,
@@ -1564,59 +1564,12 @@ class TestDestinationResolution:
 
         assert not any(destination.direct for destination in destinations)
 
-    def test_unknown_loader_falls_back_despite_matching_name_and_shape(self):
-        model = _Model()
-        model.norm.weight_loader = lambda param, weight: param.data.copy_(weight)
-        [destination] = resolve_parameter_destinations(
-            model,
-            ["norm"],
-            [torch.float32],
-            [(16,)],
-            num_workers=2,
-            shard_axis_size=2,
-            allow_direct=True,
-        )
-        assert not destination.direct
-
-    def test_missing_loader_is_not_assumed_to_be_a_plain_copy(self):
-        model = _Model()
-        del model.norm.weight_loader
-        [destination] = resolve_parameter_destinations(
-            model,
-            ["norm"],
-            [torch.float32],
-            [(16,)],
-            num_workers=2,
-            shard_axis_size=2,
-            allow_direct=True,
-        )
-        assert not destination.direct
-
-    def test_wrapped_known_loader_falls_back(self):
-        model = _Model()
-
-        @wraps(default_weight_loader)
-        def wrapped_loader(param, weight):
-            default_weight_loader(param, weight)
-
-        model.norm.weight_loader = wrapped_loader
-        [destination] = resolve_parameter_destinations(
-            model,
-            ["norm"],
-            [torch.float32],
-            [(16,)],
-            num_workers=2,
-            shard_axis_size=2,
-            allow_direct=True,
-        )
-        assert not destination.direct
-
     def test_replicated_loader_with_transform_metadata_falls_back(self):
         model = _Model()
-        model.norm.is_transposed = True
+        model.norm.weight.is_transposed = True
         [destination] = resolve_parameter_destinations(
             model,
-            ["norm"],
+            ["norm.weight"],
             [torch.float32],
             [(16,)],
             num_workers=2,
@@ -1627,10 +1580,10 @@ class TestDestinationResolution:
 
     def test_packed_dim_zero_falls_back(self):
         model = _Model()
-        model.column.packed_dim = 0
+        model.column.weight.packed_dim = 0
         [destination] = resolve_parameter_destinations(
             model,
-            ["column"],
+            ["column.weight"],
             [torch.float32],
             [(16, 16)],
             num_workers=2,
@@ -1641,10 +1594,10 @@ class TestDestinationResolution:
 
     def test_loader_declared_dim_wins_over_shape_guessing(self):
         model = _Model()
-        model.column.output_dim = 1
+        model.column.weight.output_dim = 1
         [destination] = resolve_parameter_destinations(
             model,
-            ["column"],
+            ["column.weight"],
             [torch.float32],
             [(16, 16)],
             num_workers=2,
@@ -1654,18 +1607,18 @@ class TestDestinationResolution:
         assert not destination.direct
 
     def test_shape_the_tp_factor_cannot_explain_falls_back(self):
-        [destination] = _resolve(["fused"], [torch.float32], [(16, 16)])
+        [destination] = _resolve(["fused.weight"], [torch.float32], [(16, 16)])
         assert not destination.direct
 
     def test_dtype_mismatch_falls_back(self):
         """A parameter stored in a different dtype than the wire dtype means a
         quantized or otherwise transformed layout — never write into it."""
-        [destination] = _resolve(["column"], [torch.bfloat16], [(16, 16)])
+        [destination] = _resolve(["column.weight"], [torch.bfloat16], [(16, 16)])
         assert not destination.direct
 
     def test_allow_direct_false_forces_every_parameter_to_fall_back(self):
         destinations = _resolve(
-            ["column", "norm"],
+            ["column.weight", "norm.weight"],
             [torch.float32] * 2,
             [(16, 16), (16,)],
             allow_direct=False,
@@ -1679,7 +1632,7 @@ class TestDestinationResolution:
             logger="vllm.distributed.weight_transfer.m2n_layout",
         ):
             _resolve(
-                ["norm", "missing_fused_weight"],
+                ["norm.weight", "missing_fused_weight"],
                 [torch.float32, torch.bfloat16],
                 [(16,), (1024, 1024)],
             )

@@ -80,7 +80,7 @@ def _normalize_expert_bias(
     """
     for name, w in weights:
         if _is_expert_bias_name(name):
-            w = _zero_mean_tensor(w)
+            w = _zero_mean_tensor(w if isinstance(w, torch.Tensor) else w[...])
         yield name, w
 
 
@@ -603,6 +603,7 @@ class Param2MoEForCausalLM(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.checkpoint_transforms = [_normalize_expert_bias]
 
         self.tie_word_embeddings: bool = getattr(config, "tie_word_embeddings", False)
         if get_pp_group().is_last_rank:

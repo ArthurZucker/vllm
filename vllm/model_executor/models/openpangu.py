@@ -733,6 +733,9 @@ class OpenPanguSinkAttention(nn.Module):
 
         self.attn.update_sink_kv(param_sink_key, self.param_sink_value)
 
+    def process_weights_after_loading(self) -> None:
+        self.post_weight_load()  # the sinks from the loaded weights
+
 
 class OpenPanguDecoderLayer(nn.Module):
     def __init__(

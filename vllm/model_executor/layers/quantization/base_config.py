@@ -3,7 +3,7 @@
 
 import inspect
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -87,22 +87,15 @@ class QuantizeMethodBase(ABC):
         """
         return
 
-    def dequantize_weight(
-        self, layer: nn.Module
-    ) -> torch.Tensor | Iterator[tuple[slice, torch.Tensor, torch.Tensor]]:
-        """Materialize a serialized quantized weight for requantization.
-
-        Args:
-            layer: Layer holding the serialized weights.
-
-        Returns:
-            The dequantized weight for linear layers. For MoE layers, an
-            iterator of `(experts, w13, w2)` over groups of experts.
-
+    def dequantize_op(self, layer: nn.Module) -> tuple[Callable, list[str], list[str]]:
+        """How a requantization (an online method's source) dequantizes each
+        checkpoint weight as it loads, before the model's ops (e.g. the experts'
+        merge): `(dequantize(weight, *scales), [weight name, *scale names],
+        [other names read along and dropped, if stored])`.
         """
         raise NotImplementedError(
             f"The quantization method {type(self)} does not implement "
-            "dequantize_weight, so re-quantization from this checkpoint is "
+            "dequantize_op, so re-quantization from this checkpoint is "
             "not supported. Please open an issue."
         )
 

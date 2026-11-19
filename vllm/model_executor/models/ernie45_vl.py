@@ -77,7 +77,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .ernie45_vl_moe import Ernie4_5_VLMoeForCausalLM
+from .ernie45_vl_moe import Ernie4_5_VLMoeForCausalLM, split_text_vision_experts
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsEncoderCudaGraph,
@@ -1408,6 +1408,9 @@ class Ernie4_5_VLMoeForConditionalGeneration(
 
         self.config = config
         self.multimodal_config = multimodal_config
+        self.checkpoint_transforms = [
+            partial(split_text_vision_experts, config.moe_num_experts[0])
+        ]
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.vision_model = Ernie4_5_VisionTransformer(

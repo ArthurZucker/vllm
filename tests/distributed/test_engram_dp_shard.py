@@ -538,7 +538,11 @@ def _check_ple_shared_table(shm_fits):
         )
     # Every rank offers different rows; a shared table holds the leader's.
     offered = torch.full((8, DIM), group.rank_in_group + 1.0, dtype=torch.bfloat16)
-    embedding.weight_loader(embedding.weight, offered)
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
+
+    load_with_ops(embedding, [("weight", offered)])
+    # as the model loader does: the leader's writes are visible to its peers
+    embedding.process_weights_after_loading()
     expected = 1.0 if shm_fits else group.rank_in_group + 1.0
     assert embedding.weight.is_pinned()
     assert torch.all(embedding.weight == expected)
@@ -674,7 +678,7 @@ def _check_table(
             if multithread:
                 _load_shared_multithread(layer, weight, scale_inv, load_config)
             else:
-                # every rank writes its rows (the same ones, in shared mode)
+                # every rank loads its rows (a shared table: the leader alone)
                 _load_table(layer, weight, scale_inv)
             # As the model loader does: peers must not read rows still loading.
             layer.process_weights_after_loading()
@@ -914,7 +918,7 @@ def _load_shared_multithread(layer, weight, scale_inv, load_config):
             loaded.append(name)
             first_loaded.set()
         assert loaded == order
-    # every rank of the group has written the shared tables
+    # the group's leader has written the shared tables
     layer.process_weights_after_loading()
 
     # Check before any further collective could mask incomplete shared writes.

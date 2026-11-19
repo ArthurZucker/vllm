@@ -3,6 +3,7 @@
 
 import io
 from collections.abc import Iterable
+from functools import partial
 
 import regex as re
 import torch
@@ -54,6 +55,7 @@ from .utils import (
     get_draft_quant_config,
     map_draft_quant_config,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -868,7 +870,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
-        self.checkpoint_transforms = [self._with_mask_embedding]
+        self.checkpoint_transforms = [
+            partial(observe_eagle_weights, self),
+            self._with_mask_embedding,
+        ]
         if getattr(self.model, "_context_kv_proj", None) is not None:
             self.checkpoint_transforms.append(self.model.stack_context_kv)
 

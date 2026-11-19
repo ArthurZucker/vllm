@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Bailing MoE v2.5 MTP model."""
 
+from collections.abc import Iterable
+from functools import partial
+
 import torch
 import torch.nn as nn
 from transformers.configuration_utils import PreTrainedConfig
@@ -21,6 +24,18 @@ from vllm.model_executor.models.bailing_moe_linear import (
 from vllm.sequence import IntermediateTensors
 
 from .utils import maybe_prefix
+
+
+def lm_head_into_shared_heads(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The checkpoint, its `lm_head` as every MTP layer's `shared_head.head`"""
+    for name, tensor in weights:
+        if name != "lm_head.weight":
+            yield name, tensor
+            continue
+        for layer in model.model.layers:
+            yield f"model.layers.{layer}.shared_head.head.weight", tensor
 
 
 def _get_draft_hf_config(vllm_config: VllmConfig) -> PreTrainedConfig:
@@ -197,6 +212,7 @@ class BailingMoeV25MTPModel(nn.Module):
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.checkpoint_transforms = [partial(lm_head_into_shared_heads, self)]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

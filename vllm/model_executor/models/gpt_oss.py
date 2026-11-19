@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
+from collections.abc import Iterable
 
 import torch
 import torch.distributed as dist
@@ -364,10 +365,23 @@ class GptOssModel(nn.Module, EagleModelMixin):
         return x
 
 
+def transpose_bf16_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Unquantized experts as Transformers stores them (`gate_up_proj` `[E, H, 2I]`,
+    `down_proj` `[E, I, H]`) in vLLM's layout (`[E, 2I, H]`, `[E, H, I]`)"""
+    for name, weight in weights:
+        if name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+            weight = weight if isinstance(weight, torch.Tensor) else weight[...]
+            weight = weight.transpose(1, 2).contiguous()
+        yield name, weight
+
+
 class GptOssForCausalLM(
     nn.Module, SupportsPP, SupportsEagle, SupportsEagle3, SupportsLoRA
 ):
     is_3d_moe_weight: typing.ClassVar[bool] = True
+    checkpoint_transforms = [transpose_bf16_experts]
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
     def __init__(

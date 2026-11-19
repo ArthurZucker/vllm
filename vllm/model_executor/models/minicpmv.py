@@ -1295,6 +1295,10 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
         self.resampler.to(current_platform.device_type)
         self._resampler_moved = True
 
+    def process_weights_after_loading(self) -> None:
+        if hasattr(self, "_resampler_moved"):  # a vision tower is built
+            self._ensure_resampler_device()
+
     def _parse_and_validate_vision_input(
         self,
         modality: str,

@@ -10,6 +10,11 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
     QuantizationType,
 )
+from transformers.core_model_loading import (
+    Concatenate,
+    MergeModulelist,
+    WeightConverter,
+)
 
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     WNA16MoEBackend,
@@ -25,6 +30,8 @@ from vllm.model_executor.layers.quantization.moe_wna16 import (
     MoeWNA16Config,
     MoeWNA16Method,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
+from vllm.model_executor.models.transformers.conversion import checkpoint_plan
 from vllm.platforms import current_platform
 
 
@@ -602,20 +609,35 @@ def test_moe_wna16_w13_qzeros_shard_split_int8_asym_gptq(monkeypatch):
         2 * intermediate,
         hidden // group_size,
     )
-    loader = layer.w13_qzeros.weight_loader
-
     # Raw GPTQ 8-bit qzeros per shard: int32 (num_groups, intermediate // 4);
-    # the loader views them as uint8 -> (num_groups, intermediate), then
-    # transposes and offsets by 1.
+    # the plan's load op views them as uint8 -> (num_groups, intermediate), then
+    # transposes and offsets by 1, before the experts merge.
     num_groups = hidden // group_size
     raw_w1 = torch.arange(num_groups * (intermediate // 4), dtype=torch.int32).reshape(
         num_groups, intermediate // 4
     )
     raw_w3 = raw_w1 + 1000
 
+    layer.quant_method = method
+    root = torch.nn.Module()
+    root.layer = layer
+    plan = checkpoint_plan(root)
+    conversions = [
+        WeightConverter(
+            ["layer.*.gate_proj.qzeros", "layer.*.up_proj.qzeros"],
+            "layer.w13_qzeros",
+            operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+        )
+    ]
+    weights = [
+        (f"layer.{expert}.{projection}.qzeros", raw)
+        for expert in range(num_experts)
+        for projection, raw in (("gate_proj", raw_w1), ("up_proj", raw_w3))
+    ]
     # Must not raise (old code raised a shape mismatch here for 8-bit).
-    loader(layer.w13_qzeros, raw_w1, "w13_qzeros", "w1", 0, False)
-    loader(layer.w13_qzeros, raw_w3, "w13_qzeros", "w3", 0, False)
+    load_with_ops(
+        root, weights, plan.update_weight_conversions(conversions, root), plan
+    )
 
     expected_w1 = raw_w1.view(torch.uint8).T + 1
     expected_w3 = raw_w3.view(torch.uint8).T + 1

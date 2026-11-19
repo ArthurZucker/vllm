@@ -2347,6 +2347,8 @@ class Molmo2ForConditionalGeneration(
             )
 
         self.img_patch_id = config.image_patch_id
+        # the embedding is two tables on disk (`wte.embedding`, `wte.new_embedding`)
+        self.checkpoint_transforms = [_get_weights_with_merged_embedding]
 
         if hasattr(config, "text_config"):
             hf_text_config = config.text_config
@@ -2629,7 +2631,8 @@ def _get_weights_with_merged_embedding(
         )
 
     embedding_weights = torch.cat(
-        [embedding_weights["embedding"], embedding_weights["new_embedding"]],
+        # read, if lazy safetensors slices
+        [embedding_weights[k][...] for k in ("embedding", "new_embedding")],
         dim=0,
     )
     yield ("model.embed_tokens.weight", embedding_weights)

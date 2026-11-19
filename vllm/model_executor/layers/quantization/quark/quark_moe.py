@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterator
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -82,7 +82,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_VALUE_DTYPE,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    dequantize_nvfp4_moe_weights,
+    dequantize_nvfp4_tensor,
 )
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     _ACTIVATION_QUANT_KEY_MAP,
@@ -2271,20 +2271,19 @@ class QuarkNvfp4MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w2_input_scale_2", w2_input_scale_2)
         set_weight_attrs(w2_input_scale_2, extra_weight_attrs)
 
-    def dequantize_weight(
-        self, layer: torch.nn.Module
-    ) -> Iterator[tuple[slice, torch.Tensor, torch.Tensor]]:
-        """Yield `(experts, w13, w2)` dequantized Quark NVFP4 experts."""
-        return dequantize_nvfp4_moe_weights(
-            layer.w13_weight,
-            layer.w13_weight_scale,
-            layer.w13_weight_scale_2,
-            layer.w2_weight,
-            layer.w2_weight_scale,
-            layer.w2_weight_scale_2,
-            layer.params_dtype,
+    def dequantize_op(self, layer: torch.nn.Module):
+        """Each NVFP4 checkpoint expert as it loads, for requantization: its
+        `weight_scale_2` the decode multiplier"""
+        dequantize = partial(
+            dequantize_nvfp4_tensor,
+            dtype=layer.params_dtype,
             group_size=self.group_size,
-            invert_global_scales=False,
+            invert_global_scale=False,
+        )
+        return (
+            dequantize,
+            ["weight", "weight_scale", "weight_scale_2"],
+            ["input_scale_2"],
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:

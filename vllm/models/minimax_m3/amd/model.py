@@ -1941,6 +1941,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # MiniMax-M3.1 TP4 glue paths (glue/): None where they do not apply
         self.m3_glue = M3Glue.create(self, vllm_config)
 
+    def process_weights_after_loading(self) -> None:
+        if self.m3_glue is not None:
+            self.m3_glue.after_load_weights()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 

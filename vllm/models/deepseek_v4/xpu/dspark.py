@@ -8,6 +8,7 @@ XPU MTP path, and uses the XPU Triton-based qnorm_rope_kv_fp8_insert for
 context KV precomputation.
 """
 
+from collections.abc import Iterable
 
 import regex as re
 import torch
@@ -242,6 +243,19 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.checkpoint_transforms = [self._confidence_head_if_shipped]
+
+    def _confidence_head_if_shipped(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream as is; a confidence head the checkpoint does not ship is
+        dropped (adaptive verification then runs without it)"""
+        shipped = False
+        for name, weight in weights:
+            shipped = shipped or "confidence_head." in name
+            yield name, weight
+        if not shipped:
+            self.model.confidence_head = None
 
     # --- Hooks used by the speculator ---
 
@@ -296,7 +310,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
     # --- Weight loading ---
-
 
     def process_weights_after_loading(self) -> None:
         for layer in self.model.layers:

@@ -14,7 +14,11 @@ checkpoint key ─▶ plan: the layer's quantizer
 from functools import partial
 
 import torch
-from transformers.core_model_loading import ConversionOps
+from transformers.core_model_loading import (
+    Concatenate,
+    ConversionOps,
+    WeightConverter,
+)
 from transformers.quantizers import (
     HfQuantizer,
     register_quantization_config,
@@ -133,8 +137,9 @@ class VllmQuantizeQuantizer(VllmFormatQuantizer):
 
 class DequantizeOnLoad(ConversionOps):
     """A quantized checkpoint tensor to full precision as it loads, before the
-    model's ops (e.g. the experts' merge): each weight with its scales, read along,
-    by its quantizer's `dequantize_tensor(weight, *scales)`. The scales are dropped"""
+    model's ops (e.g. the experts' merge): each weight with its scales, read along
+    (`ReadAlong`), by its quantizer's `dequantize_tensor(weight, *scales)`. The
+    scales, and the tensors its quantizer drops (e.g. static input scales), go"""
 
     def __init__(self, hf_quantizer: "VllmRequantizeQuantizer"):
         self.hf_quantizer = hf_quantizer  # its tensors are read as stored
@@ -142,18 +147,21 @@ class DequantizeOnLoad(ConversionOps):
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
         weight, *scales = self.hf_quantizer.serialized_names["weight"]
+        dropped = (*scales, *self.hf_quantizer.dropped_names)
         dequantize = self.hf_quantizer.dequantize_tensor
         out = {}
         for key, value in input_dict.items():
             stem = key.removesuffix(weight)
-            if stem != key and all(stem + s in input_dict for s in scales):
+            if stem != key:
+                if missing := [s for s in scales if stem + s not in input_dict]:
+                    raise ValueError(f"{key}: no {missing} to dequantize it with")
                 ss = [input_dict[stem + s] for s in scales]
                 out[key] = (
                     [dequantize(*t) for t in zip(value, *ss)]
                     if isinstance(value, list)
                     else dequantize(value, *ss)
                 )
-            elif not key.endswith(tuple(scales)):
+            elif not key.endswith(dropped):
                 out[key] = value  # not quantized, e.g. a bias
         return out
 
@@ -161,22 +169,103 @@ class DequantizeOnLoad(ConversionOps):
 class VllmRequantizeQuantizer(VllmQuantizeQuantizer):
     """A quantized checkpoint requantized as it loads: `dequantize(weight, *scales)`
     on each checkpoint weight before the model's ops (`names`: the weight's, then
-    its scales', read along), `targets` quantizing the params after them"""
+    its scales'; `dropped`: other tensors of it read along and dropped, if stored),
+    `targets` quantizing the params after them"""
 
     requantize = True
+    load_before_model_ops = True  # the scales are read along by `ReadAlong`
 
-    def __init__(self, targets: dict[str, tuple], dequantize, names: list[str]):
+    def __init__(
+        self,
+        targets: dict[str, tuple],
+        dequantize,
+        names: list[str],
+        dropped: list[str] | tuple[str, ...] = (),
+    ):
         super().__init__(targets)
         self.pre_quantized, self.dequantize_tensor = True, dequantize
-        self.quantization_config.dequantize = True  # the plan reads the scales along
+        self.dropped_names = tuple(dropped)
         # the params the plan's ops fill, and the checkpoint's names
         self.serialized_names = {t: [t] for t in targets} | {"weight": list(names)}
 
     def get_load_operations(self):
-        return {"dequantize": DequantizeOnLoad}
+        return {"deserialize": DequantizeOnLoad}  # what the plan reads, pre-quantized
 
     def get_weight_conversions(self):
         return []  # the model's converters read the tensors
+
+
+class ReadAlong(WeightConverter):
+    """A model converter widened to read each weight's checkpoint tensors along
+    (`along` of them a source: the weight's, its scales', ...) into the weight's
+    target, for the requantized layers `modules` only: a fused `qkv_proj`
+    dequantizes q, k and v each with its own scales before their concat. Another
+    layer's key falls through to the model's own converter"""
+
+    __slots__ = ("modules", "along", "shards")
+
+    def rename_source_key(self, source_key: str) -> tuple[str, str | None]:
+        renamed, pattern = super().rename_source_key(source_key)
+        if pattern is None or renamed.rpartition(".")[0] in self.modules:
+            return renamed, pattern
+        return source_key, None
+
+
+def read_scales_along(conversions: list, hf_quantizer) -> list:
+    """The model's converters, each widened to read a weight's scales along
+    (`ReadAlong`) for the layers requantized as they load, first; and one for such
+    a layer without a converter (its weight renamed only, e.g. an `o_proj`)::
+
+        self_attn.q_proj (fused)      -> qkv_proj.weight  [q.weight, q.weight_scale,
+                                                            k.weight, ...] -> concat
+        o_proj.weight, .weight_scale  -> o_proj.weight    dequantized alone
+        experts.*.gate_proj.weight    -> w13_weight       each expert with its scales
+
+    The sources start with `(?:)`: Transformers finds a converter by its source
+    strings, which must not be the model converter's own."""
+    from vllm.model_executor.model_loader.conversion_mapping import Fused
+
+    along: dict[str, None] = {}  # every requantizing format's names, in order
+    modules: set[str] = set()
+    for name, quantizer in hf_quantizer.quantizers.items():
+        if getattr(quantizer, "requantize", False):
+            names = (*quantizer.serialized_names["weight"], *quantizer.dropped_names)
+            along |= dict.fromkeys(names)
+            # an unprefixed checkpoint key names the module without its body
+            modules.update((name, name.partition(".")[2]) if "." in name else (name,))
+    if not modules:
+        return conversions
+
+    def read_along(sources, targets, operations, converter=None) -> ReadAlong:
+        new = ReadAlong(sources, targets, operations=operations)
+        new.modules, new.along = modules, len(along)
+        new.shards = getattr(converter, "shards", None)
+        if converter is not None:
+            new.scope_prefix = converter.scope_prefix
+            new.base_model_prefix = converter.base_model_prefix
+            new.force_cpu = converter.force_cpu
+        return new
+
+    widened = []
+    for converter in conversions:
+        if not isinstance(converter, WeightConverter):
+            continue
+        sources = converter._original_source_patterns
+        targets = converter._original_target_patterns
+        if isinstance(converter, Fused):  # module names: into the fused weight
+            sources = [rf"(?:){s}\.{n}" for s in sources for n in along]
+            targets = [f"{t}.weight" for t in targets]
+        elif all(s.endswith("weight") for s in sources):
+            sources = [
+                f"(?:){s.removesuffix('weight')}{n}" for s in sources for n in along
+            ]
+        else:
+            continue
+        ops = list(converter.operations)
+        widened.append(read_along(sources, targets, ops, converter))
+    alone = [rf"(?<![^.]){n}" for n in along]  # `.weight`, not `.q_proj_weight`
+    widened.append(read_along(alone, "weight", [Concatenate(dim=0)]))
+    return [*widened, *conversions]
 
 
 def checkpoint_plan(model) -> HfQuantizer | None:

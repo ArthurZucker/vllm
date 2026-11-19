@@ -31,6 +31,7 @@ from vllm.config import (
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.models.muse_spark.common.layers import (
     MuseSparkRMSNorm,
     MuseSparkRMSNormWithInputScale,
@@ -236,9 +237,10 @@ def test_megamoe_bf16_nvfp4_shared_buffer(
             else:
                 w1 = torch.randn_like(layer.w13_weight) * 0.1
                 w2 = torch.randn_like(layer.w2_weight) * 1e-5
-                assert set(
-                    layer.load_weights([("w13_weight", w1), ("w2_weight", w2)])
-                ) == {"w13_weight", "w2_weight"}
+                assert load_weights(layer, [("w13_weight", w1), ("w2_weight", w2)]) == {
+                    "w13_weight",
+                    "w2_weight",
+                }
             layer.finalize_weights()
             layers.append(layer)
         bf16, nvfp4 = layers
@@ -485,7 +487,7 @@ def test_megamoe_trtllm_weight_layout_matches_native(dist_init, workspace_init):
                 prefix=f"shared_layout.{layout}",
             ).cuda()
             assert layer.weight_layout == layout
-            assert set(layer.load_weights(ckpt.items())) == set(ckpt)
+            assert load_weights(layer, ckpt.items()) == set(ckpt)
             layer.finalize_weights()
             layers.append(layer)
     native, shared = layers

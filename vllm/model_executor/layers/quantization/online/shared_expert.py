@@ -9,7 +9,7 @@ import torch
 from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.online.requantization import (
-    OnlineRequantizationMixin,
+    OnlineQuantMixin,
 )
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_checkpoint_quant_keys,
@@ -34,8 +34,8 @@ class OnlineSharedExpertLoader:
 
     The shared experts are loaded as stored in temporary slots
     (`online_w{13,2}_weight[_scale]`), dequantized after loading, and quantized
-    into the routed experts slots: with the routed experts when they are
-    requantized, else by `finalize` (with `quantizer`).
+    into the routed experts slots by `finalize`: with the routed experts' own
+    quantize op when they are requantized, else with `quantizer`.
     """
 
     def __init__(
@@ -52,7 +52,7 @@ class OnlineSharedExpertLoader:
         self.num_fused_shared_experts = num_fused_shared_experts
         # The routed experts are requantized online from their checkpoint format.
         self.routed_requantized = (
-            isinstance(quant_method, OnlineRequantizationMixin)
+            isinstance(quant_method, OnlineQuantMixin)
             and quant_method.requantization_source is not None
         )
         # Requantized routed experts quantize the staged shared experts with them.
@@ -199,12 +199,16 @@ class OnlineSharedExpertLoader:
         """Quantize the staged shared experts into the pre-quantized routed experts
         slots. To call after loading, before the routed experts' processing.
 
-        Requantized routed experts quantize the staged shared experts themselves.
+        Requantized routed experts quantize them with their own quantize op.
         """
-        if self.routed_requantized or not self.staging_parameters:
+        if not self.staging_parameters:
+            return
+        shared_w13, shared_w2 = self.dequantize_staging(layer)
+        if self.routed_requantized:
+            layer.quant_method.quantize_shared_experts(layer, shared_w13, shared_w2)
+            self.release_staging(layer)
             return
         assert self.quantizer is not None
-        shared_w13, shared_w2 = self.dequantize_staging(layer)
         for shared_id in range(self.num_fused_shared_experts):
             expert_id = layer._map_global_expert_id_to_local_expert_id(
                 self.num_logical_experts + shared_id

@@ -125,7 +125,15 @@ class VllmShard:
     rank's slice, `None` if the rank holds none of it (another rank's expert)."""
 
     def __init__(
-        self, model, name, param, sources: int, index: int, expert: bool, shards=None
+        self,
+        model,
+        name,
+        param,
+        sources: int,
+        index: int,
+        expert: bool,
+        shards=None,
+        read_along: bool = False,
     ):
         self.param, self.sources, self.index, self.expert = (
             param,
@@ -134,6 +142,9 @@ class VllmShard:
             expert,
         )
         self.covers = shards  # shards each source fills (`conversion_mapping.Fused`)
+        # a requantized checkpoint's tensor (`conversion.ReadAlong`): its layout is
+        # not the param's, sharded in proportion
+        self.read_along = read_along
         self.layer = model.get_submodule(name.rpartition(".")[0])
 
     def shard_tensor(self, source, tensor_idx=None, device=None, dtype=None):
@@ -150,7 +161,12 @@ class VllmShard:
                 ep = layer.moe_config.moe_parallel_config.ep_rank
                 source = _read(source, 0, ep * target[0], target[0])
                 shape = _shape(source)
-        if len(shape) != len(target) and dim is not None and dim < len(target):
+        if (
+            len(shape) != len(target)
+            and dim is not None
+            and dim < len(target)
+            and not self.read_along  # its own layout, e.g. a per-tensor scale
+        ):
             # stored at another rank (an old 4D `A_log`, a 2D conv1d): viewed at the
             # param's, the full length on the sharded dim
             full = list(target)
@@ -172,6 +188,8 @@ class VllmShard:
         # invalid there, in a forked worker)
         if getattr(param, "keeps_sent_dtype", False):
             dtype = None  # FP8 or BF16 as sent (`dequant_linear`)
+        elif param.dtype == torch.float32:
+            dtype = torch.float32  # an fp32 param (a router bias) is not rounded first
         tensor = tensor.to(device=device).to(dtype=dtype)
         for op in getattr(param, "load_ops", ()):  # e.g. A_log's `-exp`
             out = next(iter(op.convert({"t": [tensor]}, ["t"], ["t"]).values()))
@@ -192,7 +210,10 @@ class VllmShard:
         if self.covers:  # each source's first shard
             shards = [shards[sum(self.covers[:i])] for i in range(len(self.covers))]
         replicas = 1
-        if getattr(self.param, "shard_even", False):  # the source evenly, e.g. sinks
+        # the source evenly: e.g. sinks, or a requantized checkpoint's tensor
+        if getattr(self.param, "shard_even", False) or (
+            self.read_along and self.sources == 1
+        ):
             local = shape[dim] // size
         elif self.sources == 1:  # the param's own range, e.g. a padded vocab
             local = target[dim]
@@ -348,10 +369,14 @@ def load_weights(
     """Load `weights` into `model`. Returns the params loaded."""
     if (custom := getattr(model, "load_weights", None)) is not None:
         return custom(weights)  # the Transformers backend: its own conversions first
-    from vllm.model_executor.models.transformers.conversion import checkpoint_plan
+    from vllm.model_executor.models.transformers.conversion import (
+        checkpoint_plan,
+        read_scales_along,
+    )
 
     conversions, plan = get_conversion_mapping(model), checkpoint_plan(model)
-    if plan is not None:  # e.g. a dequantization reads the scales along
+    if plan is not None:  # a requantization reads the scales along
+        conversions = read_scales_along(conversions, plan)
         conversions = plan.update_weight_conversions(conversions, model)
     return load_with_ops(model, weights, conversions, plan)
 
@@ -414,8 +439,19 @@ def load_with_ops(
             index, expert = sources.index(source_pattern), "*" in source_pattern
         else:
             sources, index, expert = [source_pattern], 0, False
+        # read along (`conversion.ReadAlong`): each weight source, then its scales
+        along = getattr(converter, "along", 1)
         shards = getattr(converter, "shards", None)
-        return VllmShard(model, target, param, len(sources), index, expert, shards)
+        return VllmShard(
+            model,
+            target,
+            param,
+            len(sources) // along,
+            index // along,
+            expert,
+            shards,
+            read_along=along > 1,
+        )
 
     if not hasattr(model, "base_model_prefix"):
         # The module holding the model's body (e.g. `transformer`, else `model`):

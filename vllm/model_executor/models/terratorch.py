@@ -17,7 +17,7 @@
 # limitations under the License.
 """Wrapper around `Terratorch` models."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
 from typing import Any
 
@@ -261,6 +261,24 @@ class Terratorch(nn.Module, IsAttentionFree, SupportsMultiModal):
         self.model = self.inference_runner.model
 
         self.pooler = IdentityPooler()
+        self.checkpoint_transforms = [self._flat_state_dict]
+
+    def _flat_state_dict(
+        self, weights: Iterable[tuple[str, Any]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream, a Lightning checkpoint's `state_dict` (a dict) flattened: its
+        tensors the inference runner's (`_timm_module.` dropped from their names,
+        the computed `pos_embed` not loaded); a bare tensor the model's"""
+        for key, value in weights:
+            if isinstance(value, dict):
+                if key == "state_dict":
+                    for name, weight in value.items():
+                        if "pos_embed" not in name:
+                            name = f"inference_runner.{name}"
+                            yield name.replace("_timm_module.", ""), weight
+                    return
+            elif isinstance(value, torch.Tensor):
+                yield f"inference_runner.model.{key}", value
 
     def embed_input_ids(
         self,
@@ -287,4 +305,3 @@ class Terratorch(nn.Module, IsAttentionFree, SupportsMultiModal):
         with gpu_sync_allowed():
             model_output = self.inference_runner.forward(**kwargs)
         return model_output.output
-

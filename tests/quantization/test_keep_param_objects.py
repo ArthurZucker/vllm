@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PWAL keeps the parameter objects (class and loader attributes) it converts."""
+"""PWAL keeps the parameter objects (class and attributes) it converts."""
 
 from collections.abc import Callable
 
@@ -37,7 +37,6 @@ from vllm.model_executor.model_loader.reload.direct import (
 )
 from vllm.model_executor.model_loader.reload.meta import materialize_meta_tensor
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_humming
 
@@ -103,7 +102,6 @@ def _online_linear():
         input_size=SIZE,
         output_size=SIZE,
         params_dtype=torch.bfloat16,
-        weight_loader=default_weight_loader,
     )
     return layer, method
 
@@ -131,7 +129,6 @@ def _online_moe():
         hidden_size=SIZE,
         intermediate_size_per_partition=SIZE,
         params_dtype=torch.bfloat16,
-        weight_loader=layer.weight_loader,
     )
     return layer, method
 
@@ -214,7 +211,6 @@ def _check_keeps_param_objects(build: Callable, vllm_config) -> None:
         assert attrs <= param.__dict__.keys(), name
         # The loader shards by these on reload, so they keep the checkpoint layout.
         assert _dims(param) == dims, name
-        assert callable(getattr(param, "weight_loader", None)), name
         # Online quantization frees the high-precision source by design.
         if not method.uses_meta_device:
             kept = after[name]

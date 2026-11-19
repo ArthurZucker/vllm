@@ -3,6 +3,7 @@
 """NVIDIA multi-token predictor for Dots3Note."""
 
 from collections.abc import Iterable, Iterator
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -28,7 +29,7 @@ from vllm.models.deepseek_v32.nvidia.mtp import (
     DeepseekV32MultiTokenPredictor,
 )
 
-from .model import Dots3NoteDecoderLayer, _pad_dense_mlp_weight
+from .model import Dots3NoteDecoderLayer, _pad_dense_mlp_weight, pad_dense_mlp_weights
 
 
 class Dots3NoteMultiTokenPredictorLayer(nn.Module):
@@ -166,6 +167,12 @@ class Dots3NoteMTP(DeepseekV32MTP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.set_moe_parameters()
+        self.checkpoint_transforms = [
+            partial(
+                pad_dense_mlp_weights,
+                getattr(self.quant_config, "weight_block_size", None),
+            )
+        ]
 
     def _adapt_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -186,4 +193,3 @@ class Dots3NoteMTP(DeepseekV32MTP):
                     getattr(self.quant_config, "weight_block_size", None),
                 ),
             )
-

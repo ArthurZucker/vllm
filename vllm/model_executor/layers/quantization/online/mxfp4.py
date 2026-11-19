@@ -144,7 +144,6 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase, InputHadamardFusable):
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
         self.kernel.process_weights_after_loading(layer)
-        self.release_requantization_source_weights(layer)
 
         layer._already_called_process_weights_after_loading = True
 
@@ -378,7 +377,6 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
             w13, w2 = self.quantized_weights(layer)
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
-            self.release_requantization_source_weights(layer)
             layer._already_called_process_weights_after_loading = True
             return
 
@@ -395,6 +393,5 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
             getattr(layer, "w13_bias", None),
             getattr(layer, "w2_bias", None),
         )
-        self.release_requantization_source_weights(layer)
 
         layer._already_called_process_weights_after_loading = True

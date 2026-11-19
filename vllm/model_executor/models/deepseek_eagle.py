@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 
@@ -18,7 +20,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV3ForCausalLM,
 )
 
-from .utils import maybe_prefix
+from .utils import maybe_prefix, observe_eagle_weights
 
 
 @support_torch_compile
@@ -90,7 +92,6 @@ class DeepseekV2Model(nn.Module):
         return hidden_states, hidden_states
 
 
-
 class EagleDeepseekV3ForCausalLM(DeepseekV3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -119,6 +120,7 @@ class EagleDeepseekV3ForCausalLM(DeepseekV3ForCausalLM):
         # Set MoE hyperparameters
         self.num_moe_layers = self.config.num_hidden_layers
         self.set_moe_parameters()
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -142,4 +144,3 @@ class EagleDeepseekV3ForCausalLM(DeepseekV3ForCausalLM):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

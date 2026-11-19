@@ -37,7 +37,9 @@ from vllm.model_executor.model_loader.weight_ops import (
     EqualSources,
     ExpertRows,
     Gather,
+    GroupedQKV,
     HeadPermute,
+    MergeLora,
     Narrow,
     OutputConcatenate,
     ParamRows,
@@ -244,6 +246,8 @@ MISTRAL_LARGE4 = [
 ]
 # Draft models' vocabulary maps (EAGLE-3, DFlash, DSpark): `t2d` is training only
 DRAFT_VOCAB = [rename("^d2t$", "draft_id_to_target_id"), drop("^t2d$")]
+# A draft checkpoint saved without its body's `model.` prefix (EAGLE, DFlash, DSpark)
+DRAFT_MODEL_PREFIX = rename(r"^(?!lm_head\.|draft_id_to_target_id$|model\.)", "model.")
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
@@ -475,6 +479,121 @@ def _deepseek_v4(
     return out
 
 
+# DeepSeek V4's fused projections; not the routed experts' `w1` / `w3` (their own)
+DEEPSEEK_V4_LAYER = [
+    fused("attn.fused_wqa_wkv", "attn.wq_a", "attn.wkv"),
+    fused(".shared_experts.gate_up_proj", ".shared_experts.w1", ".shared_experts.w3"),
+]
+
+
+def _deepseek_v4_draft_layers(module: nn.Module) -> list[WeightTransform]:
+    """A DeepSeek V4 draft's layers, in its target's checkpoint: `.scale` as the
+    experts' (by their dtype) or the linears' quant method's scale (Quark's
+    `weight_scale` as `weight_scale_inv` where only that is registered)"""
+    fp4 = getattr(module.config, "expert_dtype", "fp4") == "fp4"
+    expert_scale = "weight_scale" if fp4 else "weight_scale_inv"
+    linear_scale = getattr(module, "linear_scale_name", "weight_scale_inv")
+    names = [n for n, _ in getattr(module, "named_parameters", list)()]
+    inv_only = any(n.endswith(".weight_scale_inv") for n in names) and not any(
+        n.endswith(".weight_scale") and ".experts." not in n for n in names
+    )
+    return [
+        rename(r"(\.experts\.\d+\.w[123])\.scale$", rf"\1.{expert_scale}"),
+        rename(r"\.scale$", f".{linear_scale}"),
+        *(
+            [
+                rename(
+                    r"^(?!.*\.experts\.\d+\.)(.*)\.weight_scale$",
+                    r"\1.weight_scale_inv",
+                )
+            ]
+            if inv_only
+            else []
+        ),
+        rename(".shared_experts.w2.", ".shared_experts.down_proj."),
+        rename(".ffn.gate.bias$", ".ffn.gate.e_score_correction_bias"),
+        *DEEPSEEK_V4_LAYER,
+    ]
+
+
+def _deepseek_v4_dspark(module: nn.Module) -> list[WeightTransform]:
+    """DeepSeek V4 / V4.1 DSpark's draft: the target checkpoint's `mtp.N.` as layer
+    N, the head stack's tensors at model level (V4.1's Markov factors `embed` /
+    `head` as `markov_w1` / `markov_w2`), the rest dropped. Its cross-layer
+    `context_wkv_proj` concatenates every layer's `attn.wkv`, duplicated on the
+    stream (`context_wkv_sources`)"""
+    model = module.model
+    heads = ["main_proj", "main_norm", "norm", "markov_head", "confidence_head"]
+    if hasattr(model, "hc_head_fn"):  # V4's, at model level (V4.1's per layer)
+        heads.append(r"hc_head_\w+")
+    out = [
+        drop(r"^(?!mtp\.|context_wkv_proj_src\.)"),
+        *(
+            [drop(r"^mtp\.\d+\.confidence_head\.")]
+            if model.confidence_head is None
+            else []
+        ),
+        rename(r"^mtp\.\d+\.markov_head\.embed\.", "model.markov_head.markov_w1."),
+        rename(r"^mtp\.\d+\.markov_head\.head\.", "model.markov_head.markov_w2."),
+        rename(rf"^mtp\.\d+\.((?:{'|'.join(heads)})(?:\.|$))", r"model.\1"),
+        rename(r"^mtp\.(\d+)\.", r"model.layers.\1."),
+        *_deepseek_v4_draft_layers(module),
+    ]
+    if hasattr(model, "context_wkv_proj"):
+        layers = len(model.layers)
+        sources = (f"context_wkv_proj_src.{i}." for i in range(layers))
+        out.append(fused("model.context_wkv_proj.", *sources))
+    return out
+
+
+def _deepseek_v4_mtp(module: nn.Module) -> list[WeightTransform]:
+    """DeepSeek V4's MTP draft: the target checkpoint's `mtp.N.` as layer
+    `num_hidden_layers + N`, its decoder block under `mtp_block.`, its head and
+    norm under `shared_head.`; the rest dropped"""
+    config = module.config
+    start = config.num_hidden_layers
+    layer = r"^(model\.layers\.\d+)\."
+    own = r"enorm|hnorm|e_proj|h_proj|shared_head|hc_head_\w+"
+    return [
+        *(
+            rename(rf"^mtp\.{i}\.", f"model.layers.{start + i}.")
+            for i in range(config.num_nextn_predict_layers)
+        ),
+        drop(r"^(?!model\.layers\.)"),
+        # shared by the MTP layers: the first one's
+        rename(rf"^model\.layers\.{start}\.emb\.tok_emb\.", "model.embed_tokens."),
+        drop(r"\.emb\.tok_emb\."),
+        rename(layer + r"head\.weight$", r"\1.shared_head.head.weight"),
+        rename(layer + r"norm\.weight$", r"\1.shared_head.norm.weight"),
+        rename(layer + rf"(?!(?:{own})(?:\.|$))", r"\1.mtp_block."),
+        *_deepseek_v4_draft_layers(module),
+    ]
+
+
+# MiniMax M3's attention: in the param's shard order
+# (`MinimaxM3QKVParallelLinearWithIndexer`)
+MINIMAX_M3_QKV = fused(
+    ".qkv_proj", ".q_proj", ".k_proj", ".v_proj", ".index_q_proj", ".index_k_proj"
+)
+
+
+def _minimax_m3_mtp(module: nn.Module) -> list[WeightTransform]:
+    """MiniMax M3's MTP draft: the checkpoint's MTP layers and the embeddings it
+    shares, the rest dropped; the block scales (`weight_scale_inv`) as
+    `weight_scale` when its layers name them so (ModelOpt MXFP8)"""
+    names = [n for n, _ in module.named_parameters()]
+    scale_inv = any(n.endswith("weight_scale_inv") for n in names)
+    return [
+        rename("^language_model.", ""),
+        drop(
+            r"^(?!model\.mtp\.layers\.|model\.embed_tokens\.weight$|lm_head\.weight$)"
+        ),
+        rename("^model.mtp.layers.", "model.layers."),
+        *([] if scale_inv else [rename(r"\.weight_scale_inv$", ".weight_scale")]),
+        MINIMAX_M3_QKV,
+    ]
+
+
 def _gemma4(module: nn.Module) -> list[WeightTransform]:
     """`attention_k_eq_v` full-attention layers ship `k_proj` only: K is loaded into
     both the K and V shards. KV-shared layers only have `q_proj`, kept as is"""
@@ -602,11 +721,46 @@ def _muse_spark_moe(module: nn.Module) -> list[WeightTransform]:
     ]
 
 
+def _leader_written(module: nn.Module) -> list[WeightTransform]:
+    """A host table DP replicas share (`leader_written`): written by the group's
+    leader alone, dropped on the others"""
+    return [drop(rf"^{name}$") for name in getattr(module, "leader_written", ())]
+
+
 def _engram_table(module: nn.Module) -> list[WeightTransform]:
-    """An engram table's rows this rank holds (`row_start`), as their bytes"""
+    """An engram table's rows this rank holds (`row_start`), as their bytes; a
+    DP-shared one only on the group's leader"""
     return [
-        WeightConverter(name, name, operations=[ViewAsParam(), ParamRows()])
-        for name in ("weight", "weight_scale_inv")
+        *_leader_written(module),
+        *(
+            WeightConverter(name, name, operations=[ViewAsParam(), ParamRows()])
+            for name in ("weight", "weight_scale_inv")
+        ),
+    ]
+
+
+def _flint_experts(module: nn.Module) -> list[WeightTransform]:
+    """Flint's NVFP4 experts stored one by one (`N.{gate,up,down}_proj.<tensor>`):
+    merged, gate rows then up rows; gate and up share one global scale"""
+    kinds = ("weight", "weight_scale", "weight_scale_2")
+    return [
+        *(
+            WeightConverter(
+                [f"*.gate_proj.{kind}", f"*.up_proj.{kind}"],
+                f"w13_{kind}",
+                operations=[
+                    MergeModulelist(dim=0),
+                    EqualSources() if kind == "weight_scale_2" else Concatenate(dim=1),
+                ],
+            )
+            for kind in kinds
+        ),
+        *(
+            WeightConverter(
+                f"*.down_proj.{kind}", f"w2_{kind}", operations=[MergeModulelist(dim=0)]
+            )
+            for kind in kinds
+        ),
     ]
 
 
@@ -658,7 +812,8 @@ def _mega_moe_experts(module: nn.Module) -> list[WeightTransform]:
     layout as their bytes. Experts stored one by one (`N.{w1,gate_proj}.<tensor>`, up
     and down alike) are merged, gate rows then up rows, into this rank's slots (EPLB's
     redundant ones repeat a logical expert); experts stacked on disk (`w13_weight`,
-    also `routed_experts.`) are gathered into them. Compressed-tensors' global scales
+    also `routed_experts.`, or Transformers v5's fused `gate_up_proj` / `down_proj`)
+    are gathered into them. Compressed-tensors' global scales
     load as their reciprocals, NVFP4's `w1` / `w3` `weight_scale_2` as one; a fused
     shared expert (`shared_experts.*`) into `shared_l{1,2}_*`. Projections are renamed
     first (`N.gate.`, ...), so a model's own `.w1` converters do not take them"""
@@ -687,11 +842,24 @@ def _mega_moe_experts(module: nn.Module) -> list[WeightTransform]:
         rename(r"^shared_experts\.gate_up_proj\.", "shared_gate_up."),
         rename(r"^shared_experts\.(?:w2|down_proj)\.", "shared_down."),
         rename(r"\.weight_packed$", ".weight"),
+        drop(r"^gate_up_proj\.input_(?:global_)?scale$"),
     ]
     for suffix, param_suffix, ops in _MEGA_MOE_TENSORS:
-        for param, projs in (("w13", ("gate", "up")), ("w2", ("down",))):
+        for param, projs, fused_name in (
+            ("w13", ("gate", "up"), "gate_up_proj"),
+            ("w2", ("down",), "down_proj"),
+        ):
             if (target := f"{param}_{param_suffix}") not in params:
                 continue
+            # Transformers v5's experts fused on disk (`[E, ...]`, gate rows then
+            # up, one global scale per expert): this rank's slots gathered
+            out.append(
+                WeightConverter(
+                    rf"^{fused_name}\.{suffix}$",
+                    target,
+                    operations=[ViewAsParam(), stacked, *ops],
+                )
+            )
             one = param_suffix == "weight_scale_2"  # one L1 scale per expert
             gate_up = EqualSources() if one else Concatenate(dim=1)
             out.append(
@@ -748,6 +916,285 @@ def _mega_moe_shared_expert(module: nn.Module) -> list[WeightTransform]:
     return [rename("^shared_experts.", "experts.shared_experts.")]
 
 
+def _fused_shared_expert(module: nn.Module) -> list[WeightTransform]:
+    """A MoE block whose AITER experts fuse its shared expert
+    (`is_fused_shared_expert_enabled`): the shared expert loads as the routed
+    experts' extra one, `experts.<n_routed_experts>`"""
+    if not getattr(module, "is_fused_shared_expert_enabled", False):
+        return []
+    if getattr(module, "n_shared_experts", 1) != 1:
+        raise NotImplementedError("AITER fused shared experts: one shared expert only")
+    new = f"experts.{module.n_routed_experts}."
+    return [rename(rf"^{name}\.", new) for name in ("shared_expert", "shared_experts")]
+
+
+def _deepseek_v4_moe(module: nn.Module) -> list[WeightTransform]:
+    """A DeepSeek V4 MoE block's shared expert: the routed experts' extra one where
+    AITER fuses it (`_fused_shared_expert`), else its `w2` as `down_proj` (which
+    the model leaves as is when any layer fuses), into fused MegaMoE experts"""
+    if getattr(module, "is_fused_shared_expert_enabled", False):
+        return _fused_shared_expert(module)
+    return [
+        rename(r"^shared_experts\.w2\.", "shared_experts.down_proj."),
+        *_mega_moe_shared_expert(module),
+    ]
+
+
+def _step5_attention(module: nn.Module) -> list[WeightTransform]:
+    """Step 5's attention: on AMD the sparse indexer's tensors are its `indexer`'s;
+    on NVIDIA q, k, v (and the indexer's q, k, z, the gate) fused per layer type"""
+    out: list[WeightTransform] = []
+    if hasattr(getattr(module, "indexer", None), "sparse_indexer_q"):
+        out.append(rename("^sparse_indexer_", "indexer.sparse_indexer_"))
+    if getattr(module, "qkv_indexer_proj", None) is not None:
+        indexer = ("sparse_indexer_q", "sparse_indexer_k", "sparse_indexer_z")
+        out.append(
+            fused("qkv_indexer_proj", "q_proj", "k_proj", "v_proj", *indexer, "g_proj")
+        )
+    elif getattr(module, "qkvg_proj", None) is not None:
+        out.append(fused("qkvg_proj", "q_proj", "k_proj", "v_proj", "g_proj"))
+    return out
+
+
+def _mistral(module: nn.Module) -> list[WeightTransform]:
+    """Mistral's consolidated checkpoint (`--load-format mistral`): its names, and q
+    and k's rows from Meta's interleaved rope pairs into vLLM's halves"""
+    config = module.config
+    head_dim = getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
+    qkv = fused(
+        ".self_attn.qkv_proj", ".attention.wq", ".attention.wk", ".attention.wv"
+    )
+    pairs = torch.arange(head_dim).view(-1, 2).t().reshape(-1)
+    qkv.operations = [HeadPermute(pairs, head_dim, (0, 1)), *qkv.operations]
+    return [
+        *(
+            rename(rf"\.attention\.{name}_fake_quantizer\.qscale_act$", new)
+            for name, new in (
+                ("kv", ".self_attn.kv_scale"),
+                ("q", ".self_attn.attn.q_scale"),
+                ("k", ".self_attn.k_scale"),
+                ("v", ".self_attn.v_scale"),
+            )
+        ),
+        *MISTRAL_FORMAT,
+        qkv,
+    ]
+
+
+def _glm_ocr_mtp(module: nn.Module) -> list[WeightTransform]:
+    """GLM-OCR's MTP layers (`_spec_layers`), their head the target's `lm_head`"""
+    start = module.config.num_hidden_layers
+    return [
+        rename("^model.language_model.layers.", "model.layers."),
+        rename("^lm_head.weight$", f"model.layers.{start}.shared_head.head.weight"),
+        *_spec_layers(module),
+    ]
+
+
+def _hy_v3_mtp(module: nn.Module) -> list[WeightTransform]:
+    """HY V3's MTP layers (`_spec_layers`): their head the target's `lm_head`, their
+    own embedding and head dropped; a `qkv_proj` stored per kv head, a
+    `gate_and_up_proj` stored `[up, gate]`"""
+    config = module.config
+    start, spec = config.num_hidden_layers, _mtp_layers(module)
+    heads = config.num_attention_heads
+    kv_heads = getattr(config, "num_key_value_heads", heads)
+    return [
+        drop(rf"^model\.layers\.(?:{spec})\.(?:embed_tokens|shared_head)\."),
+        rename("^lm_head.weight$", f"model.layers.{start}.shared_head.head.weight"),
+        rename("gate_proj_bias", "gate_proj.bias"),
+        rename("up_proj_bias", "up_proj.bias"),
+        rename(".mlp.gate.wg.", ".mlp.gate."),
+        rename(".mlp.router.gate.", ".mlp.gate."),
+        *_spec_layers(module, own="enorm|hnorm|eh_proj|final_layernorm|shared_head"),
+        WeightConverter(
+            r"\.self_attn\.qkv_proj\.weight$",
+            ".self_attn.qkv_proj.weight",
+            operations=[GroupedQKV(heads, kv_heads)],
+        ),
+        WeightConverter(
+            r"\.gate_and_up_proj\.weight$",
+            ".gate_up_proj.weight",
+            operations=[SwapHalves()],
+        ),
+    ]
+
+
+def _longcat_mtp(module: nn.Module) -> list[WeightTransform]:
+    """LongCat-Flash's MTP layer (`model.mtp.`): layer `mtp_start_layer_idx`, its
+    decoder block (`transformer_layer.` or not) under `mtp_block.`"""
+    layer = f"model.layers.{module.model.mtp_start_layer_idx}."
+    return [
+        drop(r"^(?!model\.mtp\.)"),  # the target's
+        rename(r"^model\.mtp\.embed_tokens\.", "model.embed_tokens."),
+        rename(r"^model\.mtp\.layers\.0\.eh_proj\.", layer + "eh_proj."),
+        rename(r"^model\.mtp\.layers\.0\.(enorm|hnorm)\.m\.", layer + r"\1."),
+        rename(r"^model\.mtp\.norm\.", layer + "final_layernorm."),
+        rename(
+            r"^model\.mtp\.layers\.0\.(?:transformer_layer\.)?", layer + "mtp_block."
+        ),
+        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+    ]
+
+
+def _llama4_attention(module: nn.Module) -> list[WeightTransform]:
+    """A Llama 4 attention layer's (scoped to it): q and k rows hold each head's
+    rotary pairs interleaved (Meta's layout), as halves for vLLM's NeoX rope; their
+    per-row scales with them"""
+    head_dim = module.head_dim
+    halves = torch.arange(head_dim).view(-1, 2).t().reshape(-1)
+    qkv = fused("qkv_proj", "q_proj", "k_proj", "v_proj")
+    qkv.operations = [HeadPermute(halves, head_dim, (0, 1)), *qkv.operations]
+    return [qkv]
+
+
+def _falcon_attention(module: nn.Module) -> list[WeightTransform]:
+    """A Falcon attention layer's (scoped to it): `query_key_value` stored per kv
+    head (`GroupedQKV`); with one kv head (multi-query) that is the fused layout"""
+    if module.total_num_kv_heads == 1:
+        return []
+    grouped = GroupedQKV(module.total_num_heads, module.total_num_kv_heads)
+    return [
+        WeightConverter(
+            f"^query_key_value.{t}$", f"query_key_value.{t}", operations=[grouped]
+        )
+        for t in ("weight", "bias")
+    ]
+
+
+def _kimi_linear(module: nn.Module) -> list[WeightTransform]:
+    """Kimi Linear / K3's model: the DSA indexer's names; INT4 `weight_packed`
+    tensors loaded as `weight` where the experts are not packed"""
+    out = []
+    if getattr(module.config, "dsa_config", None) is not None:
+        out += [
+            rename(".self_attn.indexer.wq_b.", ".self_attn.dsa_indexer.wq_index."),
+            rename(
+                ".self_attn.indexer.k_norm.", ".self_attn.dsa_indexer.k_index_norm."
+            ),
+            rename(".self_attn.indexer.", ".self_attn.dsa_indexer."),
+        ]
+    mega = any(getattr(m, "use_mega_moe", False) for m in module.modules())
+    packed = any(n.endswith("w13_weight_packed") for n, _ in module.named_parameters())
+    if not mega and not packed:
+        out.append(rename(r"\.weight_packed$", ".weight"))
+    return out
+
+
+def _kimi_mla(module: nn.Module) -> list[WeightTransform]:
+    """A K3 MLA / DSA layer's (scoped to it): q_a and kv_a, with the output gate
+    where it is fused with them (`fused_qkv_a_g_proj`, ROCm's three-way
+    `fused_qkv_a_proj`)"""
+    if getattr(module, "fused_qkv_a_g_proj", None) is not None:
+        return [fused("fused_qkv_a_g_proj", "q_a_proj", "kv_a_proj_with_mqa", "g_proj")]
+    if (fused_a := getattr(module, "fused_qkv_a_proj", None)) is None:
+        return []
+    sources = ["q_a_proj", "kv_a_proj_with_mqa"]
+    if len(getattr(fused_a, "output_sizes", ())) == 3:
+        sources.append("g_proj")
+    return [fused("fused_qkv_a_proj", *sources)]
+
+
+def _mimo_v2_attention(module: nn.Module) -> list[WeightTransform]:
+    """A MiMo V2 attention layer's (scoped to it): an FP8 `qkv_proj` fused on disk
+    with its block scales, pre-sharded for `num_key_value_heads` ranks (MiMo V2.5)"""
+    if getattr(module.qkv_proj, "weight_scale_inv", None) is None:
+        return []
+    from vllm.model_executor.models.mimo_v2 import FusedFp8QKV
+
+    return [
+        WeightConverter(
+            [r"^qkv_proj\.weight$", r"^qkv_proj\.weight_scale_inv$"],
+            ["qkv_proj.weight", "qkv_proj.weight_scale_inv"],
+            operations=[FusedFp8QKV()],
+        )
+    ]
+
+
+def _qwen4_exp_qsa(module: nn.Module) -> list[WeightTransform]:
+    """A Qwen4-Exp QSA layer's (scoped to it): the main KV cache's scales on the
+    layer itself (`_k_scale` / `_v_scale`); the indexer's q/k projection as the last
+    shard of `qkv_proj` where the layer packs them"""
+    out = [
+        rename(
+            rf"^(?:{kv}_proj\.(?:{kv}|output)_scale|(?:attn\.)?_?{kv}_scale)$",
+            f"_{kv}_scale",
+        )
+        for kv in "kv"
+    ]
+    if getattr(module, "fuse_indexer_projection", False):
+        out.append(
+            fused("qkv_proj", "q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+        )
+    return out
+
+
+def _interns1_pro(module: nn.Module) -> list[WeightTransform]:
+    """InternS1-Pro: the VL names, its FoPE coefficients (saved at the language
+    model) onto the rotary embedding holding them"""
+    return [
+        *_CONVERSION_MAPPING["CohereCompassForConditionalGeneration"],
+        *(
+            rename(f"^{re.escape(old)}$", new)
+            for old, new in module.get_frope_params_map().items()
+        ),
+    ]
+
+
+def _voxtral(module: nn.Module) -> list[WeightTransform]:
+    """Voxtral's consolidated checkpoint: its Whisper encoder (under
+    `mm_whisper_embeddings.`, a streaming model's `mm_streams_embeddings.
+    embedding_module.`) in Whisper's names (a causal encoder's MLP in Mistral's), its
+    audio adapter, the rest its language model's (Mistral's format, `_mistral`)"""
+    causal = getattr(module.config.audio_config, "is_causal", False)
+    layer = r"^whisper_encoder\.transformer\.layers\.(\d+)\."
+    new = r"whisper_encoder.whisper_encoder.layers.\1."
+    mlp = (
+        (("w1", "mlp.gate_proj"), ("w2", "mlp.down_proj"), ("w3", "mlp.up_proj"))
+        if causal
+        else (("w1", "fc1"), ("w2", "fc2"))  # `WhisperEncoder`'s entry: `mlp.`
+    )
+    parts = (
+        ("attention.wq", "self_attn.q_proj"),
+        ("attention.wk", "self_attn.k_proj"),
+        ("attention.wv", "self_attn.v_proj"),
+        ("attention.wo", "self_attn.out_proj"),
+        ("attention_norm", "self_attn_layer_norm"),
+        ("ffn_norm", "final_layer_norm"),
+        *((f"feed_forward.{w}", name) for w, name in mlp),
+    )
+    encoder = "whisper_encoder.whisper_encoder."
+    return [
+        rename(r"^mm_streams_embeddings\.embedding_module\.", ""),
+        rename(r"^mm_whisper_embeddings\.", ""),
+        rename(r"^whisper_encoder\.conv_layers\.0\.(?:conv\.)?", encoder + "conv1."),
+        rename(r"^whisper_encoder\.conv_layers\.1\.(?:conv\.)?", encoder + "conv2."),
+        *(rename(layer + re.escape(old) + r"\.", new + f"{n}.") for old, n in parts),
+        rename(r"^whisper_encoder\.transformer\.norm\.", encoder + "layer_norm."),
+        rename(r"^audio_language_projection\.0\.", "audio_language_adapter.w_in."),
+        rename(r"^audio_language_projection\.2\.", "audio_language_adapter.w_out."),
+        rename(
+            r"^(?!whisper_encoder\.|audio_language_adapter\.|language_model\.)",
+            "language_model.",
+        ),
+        WHISPER_QKV_BIAS,  # the encoder's k_proj has no bias
+    ]
+
+
+# NeMo's routed experts, one `[experts, in, out]` tensor a projection (Nemotron 3.5
+# Transcribe's BF16 checkpoint); a non-gated MoE, its up projection in `w13`
+NEMO_EXPERTS = [
+    WeightConverter(
+        rf"\.experts\.{nemo}$",
+        f".experts.routed_experts.{w}_weight",
+        operations=[Transpose(1, 2)],
+    )
+    for nemo, w in (("gate_and_up_projs", "w13"), ("down_projs", "w2"))
+]
+
+
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
@@ -755,8 +1202,15 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "KimiGatedDeltaNetAttention": _kimi_kda,
     "KimiK3DeltaAttention": _kimi_kda,
     "MiniCPMMoE": _minicpm_moe,
+    # a MoE layer's experts (`fc1` / `fc2`, `[E, ...]`), not a dense layer's MLP
+    "Moondream3TextMoE": lambda m: [
+        rename("^fc1.weight$", "fc1_weight"),
+        rename("^fc2.weight$", "fc2_weight"),
+    ],
     "MuseSparkMoE": _muse_spark_moe,
     "ParallelEngramEmbedding": _engram_table,
+    "FlintNvfp4Experts": _flint_experts,
+    "Qwen4ExpPLESharedHostEmbedding": _leader_written,
     "MuseSparkMegaMoEExperts": lambda m: _stacked_experts(
         m, m.experts_start_idx, m.num_local_experts, m.num_experts
     ),
@@ -772,10 +1226,40 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "DeepseekV4AiterMegaMoEExperts": _per_expert,
     "DeepseekV4MegaMoEExperts": _per_expert,
     "DeepGemmMegaMoEExperts": _mega_moe_experts,
-    "DeepseekV4MoE": _mega_moe_shared_expert,
-    "Glm5NextMoE": _mega_moe_shared_expert,
+    "DeepseekV4MoE": _deepseek_v4_moe,
+    "Glm5NextMoE": lambda m: _mega_moe_shared_expert(m) + _fused_shared_expert(m),
+    "AliceAISparseMoeBlock": _fused_shared_expert,
+    # q, k, v and the beta in one projection, unless the beta is excluded from FP8
+    "BailingMoeV3KimiDeltaAttention": lambda m: (
+        []
+        if m.qkvb_proj is None
+        else [fused("qkvb_proj", *(f"{p}_proj" for p in "qkvb"))]
+    ),
+    "Glm4MoE": _fused_shared_expert,
+    "Qwen3NextSparseMoeBlock": _fused_shared_expert,
     "K2HorizonMoVAAttention": _k2_horizon,
     "MistralLarge4ForCausalLM": MISTRAL_LARGE4,
+    # the DSpark draft's tensors (`mtp_dspark.`) of the target's consolidated
+    # checkpoint: its layers named as the target's, then its own modules
+    "MistralLarge4DSparkForCausalLM": [
+        drop(r"^(?!mtp_dspark\.)"),
+        rename("^mtp_dspark.backbone.layers.", "model.layers."),
+        *(
+            rename(f"^mtp_dspark.backbone.{name}", f"model.{name}")
+            for name in ("target_projection.", "target_norm.", "final_norm.")
+        ),
+        rename("^mtp_dspark.backbone.mask_embedding$", "model.mask_embedding"),
+        rename(
+            "^mtp_dspark.autoregressive_head.embedding.", "model.markov_head.markov_w1."
+        ),
+        rename(
+            "^mtp_dspark.autoregressive_head.output.", "model.markov_head.markov_w2."
+        ),
+        rename("^mtp_dspark.autoregressive_head.joint_proj.", "model.joint_proj."),
+        *MISTRAL_LARGE4,
+    ],
+    "MistralForCausalLM": _mistral,
+    "Step5Attention": _step5_attention,
     "Gemma4Model": _gemma4,
     "GPT2LMHeadModel": GPT2,
     "GPT2ForSequenceClassification": GPT2,
@@ -806,6 +1290,14 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         GATE_UP,
     ],
     "Dots3NoteForCausalLM": _dots3_note,
+    # the MTP layer's embedding, stored under `mtp.`
+    "Dots3NoteMTP": lambda m: [
+        rename(
+            "^model.mtp.embed_tokens.",
+            f"model.layers.{m.config.num_hidden_layers}.embed_tokens.",
+        ),
+        *_CONVERSION_MAPPING["DeepseekV32MTP"](m),
+    ],
     "EmbeddingGemma2Model": [
         fused(
             ".self_attn.qkv_proj.weight",
@@ -876,14 +1368,18 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "BagelForConditionalGeneration": [
         drop("^vit_pos_embed.pos_embed"),
     ],
-    # TODO: old loader: stacked_unparsed
-    # TODO: old loader: tensor_ops
-    "BailingMoeV25MTPModel": [
+    "BailingMoeV25Model": [
+        rename(".attention.", ".self_attn."),
+        rename(".mlp.gate.e_score_correction_bias$", ".mlp.gate.expert_bias"),
+        rename(
+            r"\.mlp\.experts\.(e_score_correction|expert)_bias$",
+            ".mlp.gate.expert_bias",
+        ),
         fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
     ],
-    # TODO: old loader: tensor_ops
-    "BailingMoeV25Model": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+    # a full-attention layer's output projection, `dense` as the linear ones'
+    "BailingMoeV25MLAAttention": [
+        rename("^dense.", "o_proj."),
     ],
     # TODO: old loader: stacked_unparsed
     # TODO: old loader: tensor_ops
@@ -1020,6 +1516,11 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: tensor_ops
     "ColQwen3Model": [
+        # the projection: ColPali's / TomoroAI's name, under any prefix
+        rename(
+            r"^(?:.*\.)?(?:custom_text_proj|embedding_proj_layer)\.",
+            "custom_text_proj.",
+        ),
         rename("^vlm.model.visual.", "visual."),
         rename("^vlm.lm_head.", "language_model.lm_head."),
         rename("^vlm.model.language_model.", "language_model.model."),
@@ -1030,6 +1531,10 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: tensor_ops
     "ColQwen3_5Model": [
+        rename(
+            r"^(?:.*\.)?(?:custom_text_proj|embedding_proj_layer)\.",
+            "custom_text_proj.",
+        ),
         rename("^language_model.", "language_model.model."),
         drop("^mtp."),
     ],
@@ -1070,20 +1575,13 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("^action_proj_out."),
         rename("^lm_head.", "language_model.lm_head."),
     ],
-    # TODO: old loader: tensor_ops
-    "DSparkDeepseekV4ForCausalLM": [
-        fused("attn.fused_wqa_wkv", "attn.wq_a", "attn.wkv"),
-        fused(".gate_up_proj", ".w1", ".w3"),
-    ],
+    "DSparkDeepseekV4ForCausalLM": _deepseek_v4_dspark,
+    "DeepSeekV4MTP": _deepseek_v4_mtp,
     "DSpineQwen3Model": [
         rename(r"(?<![A-Za-z0-9_])midlayer(?=.|\*|$)", "layers.0"),
         rename(r"(?<![A-Za-z0-9_])encoder.output_norm_enc(?=.|\*|$)", "hidden_norm"),
         rename(r"(?<![A-Za-z0-9_])encoder.fc(?=.|\*|$)", "fc"),
         rename("transfer_embeddings", "transfer_codebook"),
-    ],
-    # TODO: old loader: stacked_unparsed
-    "DeepSeekMTP": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
     ],
     "DeepseekOCR2ForCausalLM": [
         rename("^model.embed_tokens.", "language_model.model.embed_tokens."),
@@ -1101,9 +1599,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
     ],
     # TODO: old loader: stacked_unparsed
-    "DeepseekV32MTP": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
-    ],
+    "DeepseekV32MTP": lambda m: [*_spec_layers(m), *_mla_qkv_a(m)],
     # TODO: old loader: stacked_unparsed
     "DeepseekV32Model": [
         fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
@@ -1125,11 +1621,45 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.", "language_model.model."),
         fused(".fc13.", ".fc1.", ".fc3."),
     ],
+    # EAGLE's draft checkpoint names its body's tensors without `model.`
+    "EagleDeepseekV3ForCausalLM": [
+        rename(r"^(?!lm_head\.|model\.)", "model."),
+    ],
+    "EagleLlamaForCausalLM": [
+        rename(r"^(?!lm_head\.|model\.)", "model."),
+    ],
     "EagleMistralLarge3ForCausalLM": [
+        # the draft's input projection
+        rename("^eagle_linear.weight$", "model.fc.weight"),
+        rename("^eagle_linear.qscale_act$", "model.fc.input_scale"),
+        rename("^eagle_linear.qscale_weight$", "model.fc.weight_scale"),
         *MISTRAL_FORMAT,
+    ],
+    # the draft's layers (`mtp.`), and the embedding and head it shares with the target
+    "ExaoneMoeMTP": [
+        drop(r"^(?!mtp\.)(?!.*(?:embed_tokens|lm_head))"),
+        rename("^mtp.", "model."),
     ],
     "Ernie4_5_MoeModel": [
         drop("mtp"),
+        rename(".moe_statics.e_score_correction_bias", ".gate.e_score_correction_bias"),
+    ],
+    # the text experts' router (`gate.weight`) and the vision ones' (`gate.weight_1`),
+    # stored `[hidden, experts]`; the experts split by `split_text_vision_experts`
+    "Ernie4_5_VLMoeMoE": [
+        rename(
+            ".mlp.moe_statics.e_score_correction_bias$", ".mlp.e_score_correction_bias"
+        ),
+        WeightConverter(
+            r"\.mlp\.gate\.weight$",
+            ".mlp.text_experts_gate.weight",
+            operations=[Transpose()],
+        ),
+        WeightConverter(
+            r"\.mlp\.gate\.weight_1$",
+            ".mlp.vision_experts_gate.weight",
+            operations=[Transpose()],
+        ),
     ],
     "Ernie4_5_VLMoeForConditionalGeneration": [
         rename("spatial_linear.0.", "spatial_linear1."),
@@ -1264,10 +1794,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model", "language_model.model"),
     ],
     # TODO: old loader: stacked_unparsed
-    "Glm4MoeLiteMTP": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
-    ],
-    # TODO: old loader: stacked_unparsed
     "Glm4MoeLiteModel": [
         fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
     ],
@@ -1278,10 +1804,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "Glm4vVisionTransformer": [
         fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
-    ],
-    # TODO: old loader: stacked_unparsed
-    "Glm5NextMTP": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
     ],
     # TODO: old loader: stacked_unparsed
     "Glm5NextModel": [
@@ -1309,6 +1831,27 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "GptOssForCausalLM": [
         rename(".self_attn.", ".attn."),
         rename(".embed_tokens.weight$", ".embedding.weight"),
+        # Quark's experts (`gate_up_proj.weight`, ...), fused or one by one; experts
+        # streamed one by one in vLLM's names (`experts.N.w13_weight`)
+        rename(r"\.experts\.gate_up_proj\.", ".experts.routed_experts.w13_"),
+        rename(r"\.experts\.down_proj\.", ".experts.routed_experts.w2_"),
+        rename(r"\.experts\.(\d+)\.(gate_up_proj|w13)[._]", r".experts.\1.w13."),
+        rename(r"\.experts\.(\d+)\.(down_proj|w2)[._]", r".experts.\1.w2."),
+        *(
+            WeightConverter(
+                rf"experts.*.{w}\.{kind}",
+                f"experts.routed_experts.{w}_{kind}",
+                operations=[MergeModulelist(dim=0)],
+            )
+            for w in ("w13", "w2")
+            for kind in (
+                "weight",
+                "weight_scale",
+                "weight_packed",
+                "bias",
+                "input_scale",
+            )
+        ),
     ],
     "Granite4VisionForConditionalGeneration": [
         rename("^model.language_model.", "language_model.model."),
@@ -1317,6 +1860,20 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.image_newline", "image_newline"),
         rename("^model.vision_tower.", "vision_tower."),
         rename("^lm_head.", "language_model.lm_head."),
+    ],
+    "GraniteMoeHybridModel": [
+        rename(".A_log$", ".A"),
+        rename(
+            ".block_sparse_moe.input_linear.",
+            ".block_sparse_moe.experts.routed_experts.w13_",
+        ),
+        rename(
+            ".block_sparse_moe.output_linear.",
+            ".block_sparse_moe.experts.routed_experts.w2_",
+        ),
+        rename(
+            ".block_sparse_moe.router.layer.weight$", ".block_sparse_moe.gate.weight"
+        ),
     ],
     "GraniteMoeModel": [
         rename("moe.input_linear.weight$", "moe.experts.gate_up_proj"),
@@ -1333,11 +1890,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^vision_model.", "visual."),
     ],
     "HYV4ForCausalLM": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
-    ],
-    # TODO: old loader: stacked_unparsed
-    # TODO: old loader: tensor_ops
-    "HYV4MTP": [
         fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
     ],
     "HrmTextForCausalLM": [
@@ -1388,6 +1940,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         ),
     ],
     "InklingMTP": [
+        drop(r"^(?!.*\.mtp\.|model\.llm\.embed_norm\.weight$)"),  # the target's
         rename(".w13_dn", ".gate_up_proj"),
         rename(".w2_md", ".down_proj"),
         rename("^model.llm.layers.", "model.layers."),
@@ -1473,15 +2026,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "JinaForRanking": [
         drop("^lm_head."),
     ],
-    "JinaRobertaModel": [
-        rename("emb_ln", "embeddings.LayerNorm"),
-        rename("mixer.Wqkv", "attn.qkv_proj"),
-        rename("mixer.out_proj", "attn.out_proj"),
-        rename("norm1", "attn_ln"),
-        rename("mlp.fc1.", "mlp.up_proj."),
-        rename("mlp.fc2", "mlp.down_proj"),
-        rename("norm2", "mlp_ln"),
-    ],
     "KimiK3ForConditionalGeneration": [
         rename("^language_model.layers.", "language_model.model.layers."),
         rename("^mm_projector.proj.0", "mm_projector.linear_1"),
@@ -1550,8 +2094,14 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^lm_head.", "language_model.lm_head."),
         rename("^model.", "language_model.model."),
     ],
-    "LongCatFlashMTP": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+    "LongCatFlashMTP": _longcat_mtp,
+    # each embedder's projection, transposed, stacked into `oe_projection`
+    "NgramEmbedding": [
+        WeightConverter(
+            "post_projs.*.weight",
+            "oe_projection",
+            operations=[MergeModulelist(dim=0), Transpose(1, 2)],
+        ),
     ],
     "LongcatFlashNgramForCausalLM": [
         drop("^model.mtp."),
@@ -1568,7 +2118,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "MiMoForCausalLM": [
         drop("^model.mtp_layers."),
     ],
+    # its checkpoint is its Whisper `encoder`'s, whose entry then renames `fc1`
     "MingAudioEncoder": [
+        rename(r"^(?!encoder\.)", "encoder."),
         rename("blocks.", "layers."),
         rename(".attn.query.", ".self_attn.q_proj."),
         rename(".attn.key.", ".self_attn.k_proj."),
@@ -1576,8 +2128,8 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename(".attn.out.", ".self_attn.out_proj."),
         rename(".attn_ln.", ".self_attn_layer_norm."),
         rename(".mlp_ln.", ".final_layer_norm."),
-        rename(".mlp.0.", ".mlp.fc1."),
-        rename(".mlp.2.", ".mlp.fc2."),
+        rename(".mlp.0.", ".fc1."),
+        rename(".mlp.2.", ".fc2."),
         rename("ln_post.", "layer_norm."),
         rename("positional_embedding$", "embed_positions.weight"),
     ],
@@ -1599,17 +2151,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^lm_head.", "language_model.lm_head."),
         drop("^mtp."),
     ],
-    # TODO: old loader: stacked_unparsed
-    "MiniMaxM3MTP": [
-        fused(
-            ".qkv_proj",
-            ".q_proj",
-            ".k_proj",
-            ".v_proj",
-            ".index_k_proj",
-            ".index_q_proj",
-        ),
-    ],
+    "MiniMaxM3MTP": _minimax_m3_mtp,
     "MiniMaxM3SparseForConditionalGeneration": [
         rename(".mlp.fc1.", ".fc1."),
         rename(".mlp.fc2.", ".fc2."),
@@ -1654,6 +2196,18 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.layers.", "encoder_layer.layers."),
         rename("^layers.", "encoder_layer.layers."),
         rename("^model.", ""),
+    ],
+    "Moondream3ForCausalLM": [
+        rename("^model.", ""),
+        rename("vision.proj_mlp.", "vision_proj."),
+        rename("^text.wte$", "text.wte.weight"),
+        rename("text.lm_head.", "lm_head."),
+        rename(".attn.qkv.", ".attn.qkv_proj."),
+        rename(".attn.proj.", ".attn.out_proj."),
+        rename(".attn.tau.alpha", ".attn.tau_alpha"),
+        rename(".attn.tau.wq", ".attn.tau_wq"),
+        rename(".attn.tau.wv", ".attn.tau_wv"),
+        rename(".mlp.router.", ".mlp.gate."),
     ],
     "Molmo2ForConditionalGeneration": [
         rename("image_pooling_2d.wq", "image_pooling_2d.q_proj"),
@@ -1721,6 +2275,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "MossTranscribeDiarizeWhisperEncoder": [
         rename(".fc1.", ".mlp.fc1."),
         rename(".fc2.", ".mlp.fc2."),
+        WHISPER_QKV_BIAS,  # its k_proj has no bias
     ],
     "MuseGlimmerForCausalLM": [
         rename(
@@ -1751,6 +2306,8 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.perception_emb_norm.", "perception_emb_norm."),
     ],
     "MuseSparkDSparkForCausalLM": [
+        drop(r"^(?:embed_tokens\.|mask_embedding$)"),  # the target's; the vocab row's
+        DRAFT_MODEL_PREFIX,
         fused(
             ".feed_forward.gate_up_proj.",
             ".feed_forward.gate_proj.",
@@ -1772,6 +2329,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^backbone.", "language_model.model."),
         rename("^lm_head", "language_model.lm_head"),
         rename("^perception.", "audio_tower."),
+        *NEMO_EXPERTS,
     ],
     "NemotronHForCausalLM": [
         rename("A_log", "A"),
@@ -1782,10 +2340,15 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     # TODO: old loader: stacked_unparsed
     "NemotronHMTP": [
         rename("^language_model.", ""),
+        drop(r"^(?!mtp\.)"),  # the target's
+        drop("rotary_emb.inv_freq"),
+        rename("^mtp.layers.", "model.layers."),
     ],
     # TODO: old loader: tensor_ops
     "NemotronH_Nano_VL_V2": [
         rename("^language_model.backbone", "language_model.model"),
+        rename("^vision_projector.vision_final_layernorm.", "vision_final_layernorm."),
+        rename("^sound_projection.", "sound_encoder.projection."),
     ],
     "NemotronLabsDiffusionForBlockDiffusion": [
         rename("^encoder.", "model."),
@@ -1841,9 +2404,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.", "language_model.model."),
     ],
     # TODO: old loader: stacked_unparsed
-    "OpenPanguMTP": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
-    ],
+    "OpenPanguMTP": lambda m: [*_spec_layers(m), *_mla_qkv_a(m)],
     "PaddleOCRVLForConditionalGeneration": [
         rename("^model.", "language_model.model."),
         rename("^lm_head.", "language_model.lm_head."),
@@ -1864,6 +2425,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "Phi3VForCausalLM": [
         rename("^model.vision_embed_tokens.wte", "embed_tokens"),
+        rename("^model.embed_tokens.", "embed_tokens."),
         rename("^model.vision_embed_tokens.", "vision_embed_tokens."),
         rename("^lm_head.", "language_model.lm_head."),
         rename("^model.", "language_model.model."),
@@ -1892,6 +2454,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: tensor_ops
     "PixtralForConditionalGeneration": [
+        # Mistral's consolidated names: the vision tower's and the adapter's
+        rename("^vision_tower.", "vision_encoder."),
+        rename("^multi_modal_projector.", "vision_language_adapter."),
         rename(
             r"^vision_encoder.transformer.layers.(\d+).attention.wq(?=.|$)",
             r"vision_encoder.transformer.layers.\1.attention.q_proj",
@@ -1925,8 +2490,12 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.language_model.", "language_model.model."),
         rename("^model.vision_tower.", "vision_encoder."),
         rename("^model.multi_modal_projector.", "vision_language_adapter."),
-        fused(".qkv_proj", ".wq", ".wk", ".wv"),
-        fused(".gate_up_proj", ".w1", ".w3"),
+        # the rest is the language model's, in its own format (`MistralForCausalLM`)
+        rename(
+            r"^(?!vision_encoder\.|vision_language_adapter\.|patch_merger\.|"
+            r"pre_mm_projector_norm\.|language_model\.)",
+            "language_model.",
+        ),
     ],
     "Qwen2VisionTransformer": [
         fused(".qkv", ".q_proj", ".k_proj", ".v_proj"),
@@ -1987,7 +2556,17 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "Qwen4ExpForCausalLM": [
         rename("^model.language_model.", "model."),
     ],
-    "Qwen4ExpModel": [
+    # a QSA layer owns its KV cache: its scales are its `_k_scale` / `_v_scale`
+    "Qwen4ExpModel": lambda m: [
+        *(
+            rename(
+                rf"^layers\.{i}\.self_attn\.(?:{kv}_proj\.(?:{kv}|output)_scale"
+                rf"|attn\._?{kv}_scale|_?{kv}_scale)$",
+                f"layers.{i}.self_attn._{kv}_scale",
+            )
+            for i in sorted(m._qsa_layer_ids)
+            for kv in "kv"
+        ),
         fused(".in_proj_qkvz", (".in_proj_qkv", 3), ".in_proj_z"),
         fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(
@@ -2058,8 +2637,53 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             ".mlp.up_gate_proj", ".mlp.gate_up_proj", operations=[SwapHalves()]
         ),
     ],
+    # the experts stacked on disk (`moe.gate_proj.weight`, `[E, I, H]`)
+    "Step3TextModel": [
+        rename(".moe.down_proj.weight$", ".moe.experts.routed_experts.w2_weight"),
+        WeightConverter(
+            [r"\.moe\.gate_proj\.weight$", r"\.moe\.up_proj\.weight$"],
+            ".moe.experts.routed_experts.w13_weight",
+            operations=[Concatenate(dim=1)],
+        ),
+    ],
+    # the experts stacked on disk (`moe.gate_proj.weight`, `[E, I, H]`, its block
+    # scales alike)
+    "Step3p5Model": [
+        *(
+            rename(
+                rf"\.moe\.down_proj\.{kind}$", f".moe.experts.routed_experts.w2_{kind}"
+            )
+            for kind in ("weight", "weight_scale")
+        ),
+        *(
+            WeightConverter(
+                [rf"\.moe\.gate_proj\.{kind}$", rf"\.moe\.up_proj\.{kind}$"],
+                f".moe.experts.routed_experts.w13_{kind}",
+                operations=[Concatenate(dim=1)],
+            )
+            for kind in ("weight", "weight_scale")
+        ),
+    ],
     "Step3p5ForCausalLM": [
         rename(".share_expert.", ".moe.share_expert."),
+    ],
+    # the experts stacked on disk (`moe.gate_proj.weight`, `[E, I, H]`, their block
+    # scales alike)
+    "Step5Model": [
+        *(
+            rename(
+                rf"\.moe\.down_proj\.{kind}$", f".moe.experts.routed_experts.w2_{kind}"
+            )
+            for kind in ("weight", "weight_scale_inv")
+        ),
+        *(
+            WeightConverter(
+                [rf"\.moe\.gate_proj\.{kind}$", rf"\.moe\.up_proj\.{kind}$"],
+                f".moe.experts.routed_experts.w13_{kind}",
+                operations=[Concatenate(dim=1)],
+            )
+            for kind in ("weight", "weight_scale_inv")
+        ),
     ],
     "Step5ForCausalLM": [
         drop("^vit_large_projector.weight$"),
@@ -2147,17 +2771,14 @@ _CONVERSION_MAPPING["CohereAsrForConditionalGeneration"] = (
 _CONVERSION_MAPPING["D3ForSequenceClassification"] = _CONVERSION_MAPPING[
     "ColQwen3_5Model"
 ]
-# TODO: old loader: tensor_ops
-_CONVERSION_MAPPING["DeepSeekV4MTP"] = _CONVERSION_MAPPING[
-    "DSparkDeepseekV4ForCausalLM"
-]
 _CONVERSION_MAPPING["DeepseekOCRForCausalLM"] = _CONVERSION_MAPPING[
     "DeepseekOCR2ForCausalLM"
 ]
 # TODO: old loader: tensor_ops
 _CONVERSION_MAPPING["DeepseekV4Model"] = [
     fused("compressor.fused_wkv_wgate", "compressor.wkv", "compressor.wgate"),
-] + _CONVERSION_MAPPING["DSparkDeepseekV4ForCausalLM"]
+    *DEEPSEEK_V4_LAYER,
+]
 _CONVERSION_MAPPING["Exaone4_5_ForConditionalGeneration"] = _CONVERSION_MAPPING[
     "LlavaOnevision2ForConditionalGeneration"
 ] + [
@@ -2165,9 +2786,7 @@ _CONVERSION_MAPPING["Exaone4_5_ForConditionalGeneration"] = _CONVERSION_MAPPING[
 ]
 _CONVERSION_MAPPING["GLM4VModel"] = _CONVERSION_MAPPING["GLM4VForCausalLM"]
 _CONVERSION_MAPPING["GraniteMoeSharedModel"] = _CONVERSION_MAPPING["GraniteMoeModel"]
-_CONVERSION_MAPPING["InternS1ProForConditionalGeneration"] = _CONVERSION_MAPPING[
-    "CohereCompassForConditionalGeneration"
-]
+_CONVERSION_MAPPING["InternS1ProForConditionalGeneration"] = _interns1_pro
 _CONVERSION_MAPPING["KimiAudioForConditionalGeneration"] = _CONVERSION_MAPPING[
     "MossTranscribeDiarizeWhisperEncoder"
 ] + [
@@ -2345,6 +2964,17 @@ _CONVERSION_MAPPING["Step5ForConditionalGeneration"] = [
     *_CONVERSION_MAPPING["Step3p7ForConditionalGeneration"],
     rename("(?<!.moe).share_expert.", ".moe.share_expert."),
 ]
+# the draft's tensors of the target's checkpoint (`mtp.`), its embedding and head
+_CONVERSION_MAPPING["Qwen4ExpMTP"] = [
+    rename("^model.language_model.", ""),
+    rename("^language_model.", ""),
+    rename("^embed_tokens.", "model.embed_tokens."),
+    rename("^model.mtp.", "mtp."),
+    rename(r"^(?:mtp\.|model\.)?shared_head\.head\.", "lm_head."),
+    rename("^model.lm_head.", "lm_head."),
+    drop(r"^(?!mtp\.|model\.embed_tokens\.|lm_head\.)"),
+    rename("^mtp.", "model."),
+]
 _CONVERSION_MAPPING["Qwen4ExpMultiTokenPredictor"] = [
     *_CONVERSION_MAPPING["Qwen3_5Model"],
     # stored apart, packed into adjacent shards of a merged projection
@@ -2372,6 +3002,233 @@ _CONVERSION_MAPPING["InternS2PreviewForConditionalGeneration"] = _CONVERSION_MAP
     drop("^model.time_series."),
     drop("^time_series."),
 ]
+_CONVERSION_MAPPING["UltravoxTransformerProjector"] = _CONVERSION_MAPPING[
+    "WhisperEncoder"
+]
+
+
+def _mtp_layers(module: nn.Module) -> str:
+    """The MTP layers' indices, after the decoder's (`num_hidden_layers + i`)"""
+    config = module.config
+    start = config.num_hidden_layers
+    return "|".join(str(start + i) for i in range(config.num_nextn_predict_layers))
+
+
+def _spec_layers(
+    module: nn.Module, own: str = "enorm|hnorm|eh_proj|shared_head"
+) -> list[WeightTransform]:
+    """DeepSeek V3-style MTP layers (`model.layers.<num_hidden_layers + i>`): their
+    decoder block under `mtp_block.` (all but `own`), the first one's `embed_tokens`
+    the model's (shared: the others' dropped)"""
+    start, spec = module.config.num_hidden_layers, _mtp_layers(module)
+    return [
+        rename(rf"^model\.layers\.{start}\.embed_tokens\.", "model.embed_tokens."),
+        drop(rf"^model\.layers\.(?:{spec})\.embed_tokens\."),
+        rename(
+            rf"^(model\.layers\.(?:{spec}))\.(?!(?:{own})(?:\.|$))", r"\1.mtp_block."
+        ),
+    ]
+
+
+def _mla_qkv_a(module: nn.Module) -> list[WeightTransform]:
+    """MLA's latent projections fused, when built (a `q_lora_rank`)"""
+    if getattr(module.config, "q_lora_rank", None) is None:
+        return []
+    return [fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa")]
+
+
+def _step_mtp(module: nn.Module) -> list[WeightTransform]:
+    """Step's MTP layers: `transformer.` dropped from their names, the head
+    `shared_head.output`, the embedding the model's"""
+    return [
+        rename(r"^layers\.", "model.layers."),
+        drop("tok_embeddings"),
+        rename(rf"^(model\.layers\.(?:{_mtp_layers(module)}))\.transformer\.", r"\1."),
+        rename(r"\.shared_head\.output\.", ".shared_head.head."),
+        *_spec_layers(module),
+    ]
+
+
+def _hy_v4_mtp(module: nn.Module) -> list[WeightTransform]:
+    """`model.mtp_layers.<i>` as layer `num_hidden_layers + i`; the target's
+    `lm_head` the first one's head, the layers' own embedding and head dropped;
+    block FP8 experts' `.scale` their `weight_scale_inv`"""
+    start, spec = module.config.num_hidden_layers, _mtp_layers(module)
+    own = "enorm|hnorm|eh_proj|final_layernorm|shared_head"
+    out = [
+        *(
+            rename(rf"^model\.mtp_layers\.{i}\.", f"model.layers.{start + i}.")
+            for i in range(module.config.num_nextn_predict_layers)
+        ),
+        drop(rf"^model\.layers\.(?:{spec})\.(?:embed_tokens|shared_head)\."),
+        rename(r"^lm_head\.weight$", f"model.layers.{start}.shared_head.head.weight"),
+        rename(
+            rf"^(model\.layers\.(?:{spec}))\.(?!(?:{own})(?:\.|$))", r"\1.mtp_block."
+        ),
+        rename(r"\.gate\.e_score_correction_bias$", ".expert_bias"),
+        *_mla_qkv_a(module),
+    ]
+    if getattr(module.quant_config, "weight_block_size", None) is not None:
+        out.append(rename(r"(\.mlp\.experts\..*)\.scale$", r"\1.weight_scale_inv"))
+    return out
+
+
+def _kimi_k3_mtp(module: nn.Module) -> list[WeightTransform]:
+    """K3's MTP layers in the multimodal checkpoint (`language_model.`); experts
+    unpacked (MXFP4) from compressed-tensors' `weight_packed`; MLA's latent
+    projections (and output gate) fused where built"""
+    params = [name for name, _ in module.named_parameters()]
+    out = [rename(r"^language_model\.", "")]
+    mega = any(getattr(m, "use_mega_moe", False) for m in module.modules())
+    if not mega and not any(n.endswith("w13_weight_packed") for n in params):
+        out.append(rename(r"\.weight_packed$", ".weight"))
+    out += _spec_layers(module)
+    gate = getattr(module.config, "mla_use_output_gate", False)
+    fusions = {}
+    for name in params:
+        for target in (".fused_qkv_a_g_proj.", ".fused_qkv_a_proj."):
+            if target in name:
+                prefix = name.split(target)[0]
+                parts = [".q_a_proj", ".kv_a_proj_with_mqa"]
+                parts += [".g_proj"] if gate else []
+                fusions[prefix] = fused(
+                    prefix + target[:-1], *(prefix + p for p in parts)
+                )
+    return [*out, *fusions.values()]
+
+
+def _jina_roberta(module: nn.Module) -> list[WeightTransform]:
+    """jina-embeddings-v3: its names, and the LoRA-parametrized weights merged with
+    the last (text-matching) adapter"""
+    config = module.config
+    out = [
+        rename("emb_ln", "embeddings.LayerNorm"),
+        rename("mixer.Wqkv", "attn.qkv_proj"),
+        rename("mixer.out_proj", "attn.out_proj"),
+        rename("norm1", "attn_ln"),
+        rename("mlp.fc1.", "mlp.up_proj."),
+        rename("mlp.fc2", "mlp.down_proj"),
+        rename("norm2", "mlp_ln"),
+    ]
+    if getattr(config, "lora_rank", None):
+        lora = [
+            r"\.parametrizations\.weight\.original$",
+            r"\.parametrizations\.weight\.0\.lora_A$",
+            r"\.parametrizations\.weight\.0\.lora_B$",
+        ]
+        scaling = config.lora_alpha / config.lora_rank
+        out.append(WeightConverter(lora, ".weight", operations=[MergeLora(scaling)]))
+    return out
+
+
+# MTP drafts: the target's checkpoint, their layers renamed
+_CONVERSION_MAPPING["DeepSeekMTP"] = lambda m: [*_spec_layers(m), *_mla_qkv_a(m)]
+_CONVERSION_MAPPING["Glm4MoeLiteMTP"] = _CONVERSION_MAPPING["DeepSeekMTP"]
+_CONVERSION_MAPPING["Glm4MoeMTP"] = lambda m: [
+    rename(
+        r"^lm_head\.weight$",
+        f"model.layers.{m.config.num_hidden_layers}.shared_head.head.weight",
+    ),
+    *_spec_layers(m),
+]
+_CONVERSION_MAPPING["Glm5NextMTP"] = lambda m: [
+    rename(r"^model\.language_model\.", "model."),
+    *_spec_layers(m),
+    *_mla_qkv_a(m),
+]
+_CONVERSION_MAPPING["HYV4MTP"] = _hy_v4_mtp
+_CONVERSION_MAPPING["KimiK3MTP"] = _kimi_k3_mtp
+_CONVERSION_MAPPING["Step3p5MTP"] = _step_mtp
+_CONVERSION_MAPPING["Step5MTP"] = _step_mtp
+_CONVERSION_MAPPING["Exaone4_5_MTP"] = [
+    rename(r"^model\.language_model\.embed_tokens\.", "model.embed_tokens."),
+    drop(r"^(?!mtp\.)(?!.*(?:embed_tokens|lm_head))"),
+    rename("^mtp.", "model."),
+]
+_CONVERSION_MAPPING["Qwen3NextMTP"] = [rename("^mtp.", "model.")]
+_CONVERSION_MAPPING["Qwen3_5MTP"] = [
+    # the target's tensors, but for the embedding and head it shares
+    drop(r"^(?!mtp\.)(?!.*(?:embed_tokens|lm_head))"),
+    rename("^mtp.", "model."),
+    rename(r"language_model\.(?=embed_tokens\.)", ""),
+]
+_CONVERSION_MAPPING["BailingMoeV25MTPModel"] = [
+    rename(r"^model\.word_embeddings\.", "model.embed_tokens."),
+    rename(".attention.dense.", ".self_attn.o_proj."),
+    rename(".attention.", ".self_attn."),
+    rename(r"\.mlp\.gate\.e_score_correction_bias$", ".mlp.gate.expert_bias"),
+    fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+]
+_CONVERSION_MAPPING["BailingMoeV3MultiTokenPredictor"] = [
+    rename(r"^word_embeddings\.", "embed_tokens."),
+    rename(r"\.mlp\.gate\.e_score_correction_bias$", ".mlp.gate.expert_bias"),
+]
+# EAGLE-3 drafts: the decoder layer `midlayer`, the body's names without `model.`
+_CONVERSION_MAPPING["Eagle3LlamaForCausalLM"] = [
+    rename(r"^(?:model\.)?midlayer\.", "model.layers.0."),
+    drop("mask_hidden"),  # P-EAGLE's, parallel drafting is unsupported
+]
+_CONVERSION_MAPPING["Eagle3Qwen3ForCausalLM"] = _CONVERSION_MAPPING[
+    "Eagle3LlamaForCausalLM"
+]
+_CONVERSION_MAPPING["Qwen3XPressForCausalLM"] = [
+    rename(r"^xpress_head\.mlp\.(gate|up|down)_proj\.", r"xpress_head.mlp_\1."),
+    drop("mask_embedding"),
+    # the body's names without `model.`, for its entry (`DFlashQwen3Model`)
+    rename(r"^(?!model\.|lm_head\.|draft_id_to_target_id$)", "model."),
+]
+_CONVERSION_MAPPING["BertSpladeSparseEmbeddingModel"] = [
+    *(
+        rename(rf"^(?:model\.|bert\.)?cls\.predictions\.{old}\.", f"mlm_head.{new}.")
+        for old, new in (
+            (r"transform\.dense", "dense"),
+            (r"transform\.LayerNorm", "layer_norm"),
+            ("decoder", "decoder"),
+        )
+    ),
+    *_CONVERSION_MAPPING["BertEmbeddingModel"],
+]
+_CONVERSION_MAPPING["JinaRobertaModel"] = _jina_roberta
+_CONVERSION_MAPPING["DeepseekV2MoE"] = _fused_shared_expert
+_CONVERSION_MAPPING["HYV3Model"] = [rename(".router.gate.", ".gate.")]
+_CONVERSION_MAPPING["HYV4Model"] = [
+    rename(r"\.gate\.e_score_correction_bias$", ".expert_bias"),
+    rename(".router.gate.", ".gate."),
+    rename(r"\bhc_fn$", "hc_fn.weight"),
+    rename(r"\bhc_head_fn$", "hc_head_fn.weight"),
+]
+# the loop gates (`gate_projections.<i>`, a module each): converters, so that the
+# `gate_proj` fallback does not take them
+_CONVERSION_MAPPING["IQuestLoopCoderModel"] = [
+    WeightConverter(
+        rf"gate_projections\.(\d+)\.{tensor}$",
+        rf"gate_projections.\1.gate_proj.{tensor}",
+        operations=[OutputConcatenate()],
+    )
+    for tensor in ("weight", "bias")
+]
+# ModelOpt's checkpoint: the text model at the top, one scale for all experts
+_CONVERSION_MAPPING["Llama4ForConditionalGeneration"] = [
+    rename(r"^model\.", "language_model.model."),
+    rename(r"^lm_head\.weight$", "language_model.lm_head.weight"),
+    *(
+        WeightConverter(
+            rf"\.feed_forward\.experts\.{proj}_{kind}_scale$",
+            f".feed_forward.experts.routed_experts.{w}_{kind}_scale",
+            operations=[RepeatToParam()],
+        )
+        for proj, w in (("down_proj", "w2"), ("gate_up_proj", "w13"))
+        for kind in ("input", "weight")
+    ),
+]
+_CONVERSION_MAPPING["OpenPanguModel"] = [
+    rename(r"(?<!gate\.)e_score_correction_bias", "gate.e_score_correction_bias"),
+]
+_CONVERSION_MAPPING["OpenVLAForActionPrediction"] = [
+    rename("^vision_backbone.featurizer.", "vision_backbone.dinov2_featurizer."),
+    rename("^vision_backbone.fused_featurizer.", "vision_backbone.siglip_featurizer."),
+    rename(r"\.(ls[12])\.scale_factor", r".\1.gamma"),  # timm's LayerScale
+]
 _CONVERSION_MAPPING["WhisperDecoder"] = _CONVERSION_MAPPING["WhisperEncoder"] + [
     WeightConverter(
         [".encoder_attn.k_proj.bias", ".encoder_attn.v_proj.bias"],
@@ -2379,6 +3236,52 @@ _CONVERSION_MAPPING["WhisperDecoder"] = _CONVERSION_MAPPING["WhisperEncoder"] + 
         operations=[ZeroMissingSource(), OutputConcatenate()],
     ),
     fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
+]
+
+
+# Group 2's load_weights audit: what their deleted loaders did
+_CONVERSION_MAPPING["AXK1MoE"] = _fused_shared_expert
+# EAGLE / DSpark drafts saved without the `model.` prefix
+for _draft in (
+    "Eagle3DeepseekV2ForCausalLM",
+    "EagleLlama4ForCausalLM",
+    "LiLiCorrForCausalLM",  # its head's `lilicorr.`, saved with `model.` or not
+    "DSpineQwen3ForCausalLM",
+):
+    _CONVERSION_MAPPING[_draft] = [DRAFT_MODEL_PREFIX]
+# its attention ships `q_proj` alone (k / v are the target's): kept, not fused
+_CONVERSION_MAPPING["Gemma4DSparkForCausalLM"] = [
+    DRAFT_MODEL_PREFIX,
+    fused(".self_attn.q_proj", ".self_attn.q_proj"),
+]
+_CONVERSION_MAPPING["GlmOcrMTP"] = _glm_ocr_mtp
+_CONVERSION_MAPPING["HYV3MTP"] = _hy_v3_mtp
+_CONVERSION_MAPPING["Llama4Attention"] = _llama4_attention
+# Llama 4's experts, `[E, hidden, 2 * intermediate]` on disk: vLLM's transposed
+_CONVERSION_MAPPING["Llama4MoE"] = [
+    WeightConverter(
+        rf"experts\.routed_experts\.{w}_weight$",
+        f"experts.routed_experts.{w}_weight",
+        operations=[Transpose(1, 2, check_dims=True)],
+    )
+    for w in ("w13", "w2")
+]
+_CONVERSION_MAPPING["FalconAttention"] = _falcon_attention
+_CONVERSION_MAPPING["KimiLinearModel"] = _kimi_linear
+for _mla in ("KimiMLAAttention", "MultiHeadLatentAttention", "KimiK3DSAAttention"):
+    _CONVERSION_MAPPING[_mla] = _kimi_mla
+# the indexer's `wk` and `weights_proj`, one GEMM where built so
+_CONVERSION_MAPPING["KimiK3DSAIndexer"] = lambda m: (
+    [fused("wkv_index", "wk", "weights_proj")] if hasattr(m, "wkv_index") else []
+)
+_CONVERSION_MAPPING["MiMoV2Attention"] = _mimo_v2_attention
+_CONVERSION_MAPPING["Qwen4ExpQSAAttention"] = _qwen4_exp_qsa
+_CONVERSION_MAPPING["VoxtralForConditionalGeneration"] = _voxtral
+# the MTP head's NeMo tensors (`llm.mtp.`)
+_CONVERSION_MAPPING["Nemotron3_5TranscribeMTP"] = [
+    rename("^llm.mtp.", "mtp."),
+    *_CONVERSION_MAPPING["NemotronHMTP"],
+    *NEMO_EXPERTS,
 ]
 
 

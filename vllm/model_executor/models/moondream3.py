@@ -46,6 +46,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -471,6 +472,9 @@ class Moondream3TextMoE(nn.Module):
         self.fc2_weight = nn.Parameter(
             torch.empty(self.num_local_experts, hidden_size, expert_inner_dim)
         )
+        # each TP rank holds its experts, consecutive
+        for param in (self.fc1_weight, self.fc2_weight):
+            set_weight_attrs(param, {"shard_dim": 0})
         self._use_fused_moe = True
 
         local_expert_start = get_tensor_model_parallel_rank() * self.experts_per_rank
@@ -660,6 +664,8 @@ class Moondream3Attention(nn.Module):
         self.tau_alpha = nn.Parameter(torch.zeros(self.num_heads_per_partition))
         self.tau_wq = nn.Parameter(torch.zeros(self.num_heads_per_partition, qkv_dim))
         self.tau_wv = nn.Parameter(torch.zeros(self.num_heads_per_partition, qkv_dim))
+        for param in (self.tau_alpha, self.tau_wq, self.tau_wv):
+            set_weight_attrs(param, {"shard_dim": 0})  # this rank's heads
         self.tp_size = tp_size
 
     def forward(
@@ -1317,4 +1323,3 @@ class Moondream3ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if logits is not None:
             logits[:, self._answer_id] = float("-inf")
         return logits
-

@@ -13,6 +13,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 __all__ = [
     "break_fp4_bytes",
     "dequantize_nvfp4_moe_weights",
+    "dequantize_nvfp4_tensor",
     "dequantize_to_dtype",
     "nvfp4_gathered_bias",
     "ref_nvfp4_quant",
@@ -632,6 +633,25 @@ def dequantize_to_dtype(
     out = out.reshape(*out.shape[:-2], -1)
 
     return out.to(dtype)
+
+
+def dequantize_nvfp4_tensor(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    group_size: int = 16,
+    invert_global_scale: bool,
+) -> torch.Tensor:
+    """One serialized NVFP4 tensor (e.g. a checkpoint expert's `[N, K/2]`) to
+    `dtype`: compressed-tensors stores the global encode scale
+    (`invert_global_scale`), ModelOpt its decode multiplier."""
+    if invert_global_scale:
+        global_scale = 1.0 / global_scale
+    return dequantize_to_dtype(
+        weight, weight_scale, global_scale, dtype, block_size=group_size, swizzle=False
+    )
 
 
 def _dequantize_nvfp4_moe_experts(

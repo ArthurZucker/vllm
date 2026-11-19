@@ -20,7 +20,12 @@ from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_classify
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.sequence import IntermediateTensors
 
-from .gpt_oss import GptOssModel, OAIAttention, TransformerBlock
+from .gpt_oss import (
+    GptOssModel,
+    OAIAttention,
+    TransformerBlock,
+    transpose_bf16_experts,
+)
 from .interfaces_base import attn_type, default_pooling_type
 from .utils import maybe_prefix
 
@@ -66,6 +71,7 @@ def _interleave_gate_up_concat_to_pairs(
     # gate/up interleaved. MXFP4/quark suffixes are already interleaved.
     for name, weight in weights:
         if name.endswith(".gate_up_proj") or name.endswith(".gate_up_proj_bias"):
+            weight = weight if isinstance(weight, torch.Tensor) else weight[...]
             *lead, two_i = weight.shape
             i = two_i // 2
             weight = (
@@ -80,6 +86,11 @@ def _interleave_gate_up_concat_to_pairs(
 @default_pooling_type(tok_pooling_type="ALL")
 class OpenAIPrivacyFilterForTokenClassification(nn.Module):
     is_pooling_model = True
+    # HF's experts: gate and up interleaved, then transposed into vLLM's layout
+    checkpoint_transforms = [
+        _interleave_gate_up_concat_to_pairs,
+        transpose_bf16_experts,
+    ]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

@@ -10,6 +10,7 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import regex as re
@@ -46,6 +47,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.common.eplb_util import collect_moe_layers
+from vllm.models.deepseek_v4.nvidia.dspark import context_wkv_sources
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
@@ -407,6 +409,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
             self.num_speculative_steps = spec_config.num_speculative_tokens
 
         self.set_moe_parameters()
+        self.checkpoint_transforms = [
+            partial(context_wkv_sources, layers=len(self.model.layers))
+        ]
 
     def set_moe_parameters(self) -> None:
         collect_moe_layers(
@@ -534,7 +539,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
     # --- Weight loading ----------------------------------------------------
-
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint `mtp.{i}.*` name to this model's parameter path.

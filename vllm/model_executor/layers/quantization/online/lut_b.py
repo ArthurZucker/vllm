@@ -134,7 +134,6 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
                     LUT_B_SM107_TILE_BYTES,
                 )
             replace_parameter(layer, name, weight)
-        self.release_requantization_source_weights(layer)
 
         quant_config = self.get_fused_moe_quant_config(layer)
         self.moe_quant_config = quant_config

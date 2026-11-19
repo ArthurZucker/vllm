@@ -759,6 +759,9 @@ class K2HorizonMoVAAttention(nn.Module):
                 for value in range(num_experts)
             ]
         )
+        # a kv head shared by tp / kv-heads ranks, as `qk_proj`'s k
+        for param in self.v_experts.parameters():
+            param.shard_replicas = max(1, tp_size // self.total_num_kv_heads)
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,

@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from tests.v1.spec_decode.utils import fake_speculative_config
 from vllm.config import ParallelConfig
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.model_loader.reload import lifecycle
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -174,9 +175,6 @@ def make_m3_draft(monkeypatch, m3_modules, m3_config):
     monkeypatch.setattr(mtp, "MiniMaxM3MultiTokenPredictor", lambda **_: inner)
     monkeypatch.setattr(mtp, "ParallelLMHead", lambda *_, **kw: _embed())
     monkeypatch.setattr(mtp, "LogitsProcessor", lambda *_: None)
-    monkeypatch.setattr(
-        mtp, "fused_moe_make_expert_params_mapping", lambda *_, **kw: []
-    )
     monkeypatch.setattr(mtp, "in_single_pp_stage", lambda: True)
     monkeypatch.setattr(eagle_utils, "in_single_pp_stage", lambda: True)
     return lambda: mtp.MiniMaxM3MTP(vllm_config=m3_config)
@@ -193,10 +191,10 @@ def test_m3_checkpoint_embedding_ownership(monkeypatch, make_m3_draft, key):
     weights = [("model.mtp.layers.0.weight", torch.ones(1, 1))]
     if key is not None:
         weights.append((key, torch.ones(VOCAB, HIDDEN)))
-    loaded = draft.load_weights(weights)
+    loaded = load_weights(draft, weights)
     assert ("model.embed_tokens.weight" in loaded) is (key is not None)
     monkeypatch.setattr(lifecycle, "_weight_update_active", True)
-    draft.load_weights([("lm_head.weight", torch.zeros(VOCAB, HIDDEN))])
+    load_weights(draft, [("lm_head.weight", torch.zeros(VOCAB, HIDDEN))])
     assert draft.has_own_embed_tokens is (key is not None)
     target = _inner(_embed(fill=2.0))
     original = draft.model.embed_tokens
@@ -221,7 +219,7 @@ def test_m3_direct_loader_embedding_ownership(
         {key: torch.ones_like(value) for key, value in draft.state_dict().items()}
     )
     monkeypatch.setattr(lifecycle, "_weight_update_active", True)
-    draft.load_weights([("model.mtp.layers.0.weight", torch.zeros(1, 1))])
+    load_weights(draft, [("model.mtp.layers.0.weight", torch.zeros(1, 1))])
     target = _inner(_embed(fill=2.0))
     original = draft.model.embed_tokens
     eagle_utils.maybe_share_target_embed(draft, draft.model, target)
@@ -238,11 +236,12 @@ def test_m3_preserves_legacy_embedding_sharing(monkeypatch, m3_modules, make_m3_
     mtp, _ = m3_modules
     monkeypatch.setattr(mtp, "in_single_pp_stage", lambda: False)
     draft = make_m3_draft()
-    draft.load_weights(
+    load_weights(
+        draft,
         [
             ("model.mtp.layers.0.weight", torch.ones(1, 1)),
             ("model.embed_tokens.weight", torch.ones(VOCAB, HIDDEN)),
-        ]
+        ],
     )
     # Not tracked, so the target's embedding is shared.
     assert draft.has_own_embed_tokens is False
@@ -288,12 +287,12 @@ def test_m3_weight_transfer_updates_embedding_ownership(
     weights = [("model.mtp.layers.0.weight", torch.ones(1, 1))]
     if initial_embed:
         weights.append(("model.embed_tokens.weight", torch.ones(VOCAB, HIDDEN)))
-    draft.load_weights(weights)
+    load_weights(draft, weights)
     monkeypatch.setattr(lifecycle, "_weight_update_active", True)
-    draft.load_weights([("model.mtp.layers.0.weight", torch.zeros(1, 1))])
+    load_weights(draft, [("model.mtp.layers.0.weight", torch.zeros(1, 1))])
     assert draft.has_own_embed_tokens is initial_embed
-    draft.load_weights(
-        [("model.embed_tokens.weight", torch.full((VOCAB, HIDDEN), 3.0))]
+    load_weights(
+        draft, [("model.embed_tokens.weight", torch.full((VOCAB, HIDDEN), 3.0))]
     )
     assert draft.has_own_embed_tokens
     target = _inner(_embed(fill=2.0))
@@ -345,7 +344,7 @@ def test_nemotron_only_reports_loaded_mtp_weights(nemotron_draft, prefix):
     ]
     assert not nemotron_draft.is_unused_checkpoint_weight(weights[0][0])
     assert all(nemotron_draft.is_unused_checkpoint_weight(k) for k, _ in weights[1:])
-    assert nemotron_draft.load_weights(weights) == {"model.layers.0.weight"}
+    assert load_weights(nemotron_draft, weights) == {"model.layers.0.weight"}
     assert nemotron_draft.model.embed_tokens is None
     assert nemotron_draft.lm_head is None
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,6 +32,7 @@ from vllm.multimodal.inputs import NestedTensors
 from .utils import (
     get_draft_quant_config,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -316,6 +318,7 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(

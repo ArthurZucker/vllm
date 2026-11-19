@@ -9,6 +9,8 @@ vLLM's parallel linear layers, MLA kernel, KDA kernel and fused MoE loader.
 """
 
 import copy
+import re
+from collections.abc import Iterable
 from math import lcm
 from typing import TypeGuard
 
@@ -289,6 +291,105 @@ def _get_block_fp8_mlp_padded_intermediate_size(
     tp_size = get_tensor_model_parallel_world_size()
     tp_alignment = tp_size * lcm(*alignments)
     return (intermediate_size + tp_alignment - 1) // tp_alignment * tp_alignment
+
+
+def _pad_block_fp8_mlp_checkpoint_tensor(
+    quant_config: QuantizationConfig,
+    name: str,
+    loaded_weight: torch.Tensor,
+    intermediate_size: int,
+    padded_intermediate_size: int,
+) -> torch.Tensor:
+    """Zero-pad an MLP checkpoint tensor on its intermediate dimension."""
+    if padded_intermediate_size == intermediate_size:
+        return loaded_weight
+
+    block_size = getattr(quant_config, "weight_block_size", None)
+    assert block_size is not None
+
+    if ".down_proj." in name:
+        if name.endswith(".bias"):
+            return loaded_weight
+        dim = 1
+        block = int(block_size[1])
+        logical_shards = 1
+    elif any(
+        projection in name
+        for projection in (".gate_proj.", ".up_proj.", ".gate_up_proj.")
+    ):
+        dim = 0
+        block = int(block_size[0])
+        logical_shards = 2 if ".gate_up_proj." in name else 1
+    else:
+        return loaded_weight
+
+    if name.endswith(".weight_scale_inv"):
+        expected_shard_size = (intermediate_size + block - 1) // block
+        target_shard_size = (padded_intermediate_size + block - 1) // block
+    elif name.endswith((".weight", ".bias")):
+        expected_shard_size = intermediate_size
+        target_shard_size = padded_intermediate_size
+    else:
+        return loaded_weight
+
+    current_size = loaded_weight.shape[dim]
+    if current_size % logical_shards != 0:
+        raise ValueError(
+            f"Cannot split {name} dimension {current_size} into "
+            f"{logical_shards} logical shards."
+        )
+    current_shard_size = current_size // logical_shards
+    if current_shard_size == target_shard_size:
+        return loaded_weight
+    if current_shard_size != expected_shard_size:
+        raise ValueError(
+            f"Cannot pad {name}: expected each logical intermediate dimension "
+            f"to be {expected_shard_size}, but got {current_shard_size}."
+        )
+
+    padded_shards: list[torch.Tensor] = []
+    for shard in loaded_weight.split(current_shard_size, dim=dim):
+        pad_shape = list(shard.shape)
+        pad_shape[dim] = target_shard_size - current_shard_size
+        padded_shards.extend([shard, shard.new_zeros(pad_shape)])
+    return torch.cat(padded_shards, dim=dim)
+
+
+def _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
+    quant_config: QuantizationConfig | None,
+    config: PreTrainedConfig,
+    name: str,
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    if ".mlp.shared_experts." not in name:
+        return loaded_weight
+
+    shared_prefix = name.split(".shared_experts.", 1)[0] + ".shared_experts"
+    shared_intermediate = (
+        config.moe_shared_expert_intermediate_size * config.num_shared_experts
+    )
+    padded_shared_intermediate = _get_block_fp8_mlp_padded_intermediate_size(
+        quant_config,
+        shared_intermediate,
+        shared_prefix,
+    )
+    if padded_shared_intermediate == shared_intermediate:
+        return loaded_weight
+
+    assert quant_config is not None
+    return _pad_block_fp8_mlp_checkpoint_tensor(
+        quant_config,
+        name,
+        loaded_weight,
+        shared_intermediate,
+        padded_shared_intermediate,
+    )
+
+
+# Ling's MXFP4 experts' scales, under Mxfp4MoEMethod's names
+_LING_MXFP4_SCALE = re.compile(
+    r"(\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight_scale)_inv$"
+)
 
 
 class _IdentityProjection(nn.Module):
@@ -1338,6 +1439,7 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         _configure_ling_fp8_quant_config(quant_config, config)
         self.config = config
         self.quant_config = quant_config
+        self.checkpoint_transforms = [self._ling_checkpoint]
         self.model = BailingMoeV3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -1351,6 +1453,25 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
             self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
+
+    def _ling_checkpoint(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Ling's MXFP4 expert scales renamed; block-FP8 shared experts zero-padded
+        to the intermediate size their TP shards hold whole blocks of"""
+        quant_config = self.quant_config
+        mxfp4 = (
+            isinstance(quant_config, Fp8Config) and quant_config.store_dtype == "mxfp4"
+        )
+        for name, weight in weights:
+            if mxfp4:
+                name = _LING_MXFP4_SCALE.sub(r"\1", name)
+            if ".mlp.shared_experts." in name:
+                weight = weight if isinstance(weight, torch.Tensor) else weight[...]
+                weight = _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
+                    quant_config, self.config, name, weight
+                )
+            yield name, weight
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

@@ -3,6 +3,7 @@
 
 from collections.abc import Iterable
 from contextlib import contextmanager
+from functools import partial
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
@@ -311,6 +312,12 @@ def as_seq_cls_model(cls: type[_T]) -> type[_T]:
                 prefix=maybe_prefix(prefix, "score"),
             )
 
+            if tokens is not None or method is not None:  # the LM head's rows
+                self.checkpoint_transforms = [
+                    *getattr(self, "checkpoint_transforms", []),
+                    partial(_score_from_lm_head, self),
+                ]
+
             pooler_config = vllm_config.model_config.pooler_config
             assert pooler_config is not None
 
@@ -560,6 +567,55 @@ def load_weights_no_post_processing(model, weights: Iterable[tuple[str, torch.Te
     if lm_head_name is not None:
         loaded_weights.discard(lm_head_name)
     return loaded_weights
+
+
+def _score_from_lm_head(model, weights: Iterable[tuple[str, torch.Tensor]]):
+    """The stream, the classifier converted online from the LM head (or the tied
+    embedding), which is not loaded: `from_2_way_softmax` (Qwen3-Reranker) the true
+    token's row minus the false token's, `no_post_processing` (bge-reranker-v2-gemma)
+    the tokens' rows"""
+    from vllm.tokenizers import get_tokenizer
+
+    model_config = model.vllm_config.model_config
+    hf_config = model_config.hf_config
+    text_config = hf_config.get_text_config()
+    tokens = getattr(
+        hf_config,
+        "classifier_from_token",
+        getattr(text_config, "classifier_from_token", None),
+    )
+    method = getattr(hf_config, "method", getattr(text_config, "method", None))
+    assert method in SEQ_CLS_LOAD_METHODS, f"method {method} not supported"
+    head = embedding = None
+    for name, weight in weights:
+        if name.endswith("lm_head.weight"):
+            head = weight
+            continue
+        if name.endswith("embed_tokens.weight"):
+            embedding = weight
+        yield name, weight
+    head = head if head is not None else embedding
+    assert head is not None, "No LM head (nor tied embedding) to convert"
+
+    tokenizer = get_tokenizer(
+        model_config.tokenizer,
+        revision=model_config.tokenizer_revision,
+        tokenizer_mode=model_config.tokenizer_mode,
+        trust_remote_code=model_config.trust_remote_code,
+    )
+    ids = [tokenizer.convert_tokens_to_ids(token) for token in tokens]
+    rows = torch.cat([head[i : i + 1] for i in ids])  # lazy: these rows only
+    if method == "from_2_way_softmax":
+        assert len(ids) == 2
+        rows = rows[1:].float() - rows[:1].float()  # true - false
+    language_model = _get_language_model_for_seq_cls(model)
+    score = (
+        language_model.score
+        if language_model is not model and hasattr(language_model, "score")
+        else model.score
+    )
+    name = next(n for n, p in model.named_parameters() if p is score.weight)
+    yield name, rows
 
 
 SEQ_CLS_LOAD_METHODS = {

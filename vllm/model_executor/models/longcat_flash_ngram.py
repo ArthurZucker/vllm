@@ -10,6 +10,8 @@ embedding fuses the token embedding with hashed embeddings of the preceding
 `get_model_state_cls` makes the model MRV2-only.
 """
 
+from collections.abc import Iterable
+from functools import partial
 from typing import Any
 
 import torch
@@ -166,6 +168,25 @@ class NgramEmbedding(nn.Module):
         return all_h.mean(dim=0)  # [N, H]
 
 
+def concat_ngram_embedders(
+    num_embedders: int, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The per-embedder n-gram tables (`ngram_embeddings.embedders.N.weight`) as
+    the one table `NgramEmbedding.oe_embedder` concatenates them into, in order"""
+    tables: dict[int, torch.Tensor] = {}
+    for name, weight in weights:
+        head, sep, rest = name.partition("ngram_embeddings.embedders.")
+        if not sep:
+            yield name, weight
+            continue
+        tables[int(rest.split(".")[0])] = (
+            weight if isinstance(weight, torch.Tensor) else weight[...]
+        )
+        if len(tables) == num_embedders:
+            table = torch.cat([tables.pop(i) for i in range(num_embedders)])
+            yield f"{head}ngram_embeddings.oe_embedder.weight", table
+
+
 class FlashNgramModel(FlashModel):
     """FlashModel whose input embedding is an `NgramEmbedding`."""
 
@@ -197,6 +218,10 @@ class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.model = FlashNgramModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        if (ngram := self.model.ngram_embeddings) is not None:
+            self.checkpoint_transforms = [
+                partial(concat_ngram_embedders, ngram.num_embedders)
+            ]
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,

@@ -575,6 +575,13 @@ class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant)
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        # one token embedding (the checkpoint's `model.embed_tokens`), loaded here
+        # and shared with the language model
+        lm_embed = getattr(
+            getattr(self.language_model, "model", None), "embed_tokens", None
+        )
+        if isinstance(lm_embed, VocabParallelEmbedding):
+            lm_embed.weight = self.embed_tokens.weight
 
     def _parse_and_validate_image_input(
         self, **kwargs: object

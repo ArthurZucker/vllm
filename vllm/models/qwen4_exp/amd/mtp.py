@@ -13,6 +13,8 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
+from collections.abc import Iterable
+
 import regex as re
 import torch
 from torch import nn
@@ -105,6 +107,20 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     if name.startswith("model.embed_tokens.") or name.startswith("lm_head."):
         return name
     return None
+
+
+def _mtp_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The draft's tensors of the target's checkpoint, at its names; the final
+    mixer's block injection is not the draft's"""
+    for name, tensor in weights:
+        name = _remap_mtp_weight_name(name)
+        if (
+            name is not None
+            and "hyper_connection_mixer.block_inject_weight" not in name
+        ):
+            yield name, tensor
 
 
 def _make_draft_vllm_config(
@@ -403,6 +419,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.checkpoint_transforms = [_mtp_weights]
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
 

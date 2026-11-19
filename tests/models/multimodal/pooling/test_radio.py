@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModel, CLIPImageProcessor
 
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.radio import RadioModel
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.radio import RadioConfig
@@ -90,7 +91,7 @@ def run_radio_test(
         **hf_config.args,
     )
     vllm_model = RadioModel(vllm_config)
-    loaded = vllm_model.load_weights(hf_model.state_dict())
+    loaded = load_weights(vllm_model, hf_model.state_dict().items())
     # Guard the remote-code -> vLLM key remap: every parameter must be loaded
     # from the checkpoint, except the LayerScale gains (layer_scale{1,2}.lambda1),
     # which are identity-init and may be absent from the remote-code checkpoint.
@@ -224,7 +225,7 @@ def test_native_format_weight_loading(default_vllm_config, dist_init):
         for param in model.parameters():
             param.zero_()
 
-    loaded = model.load_weights(native_weights)
+    loaded = load_weights(model, native_weights.items())
 
     missing = set(expected) - loaded
     assert not missing, f"native weights not loaded: {sorted(missing)}"
@@ -274,7 +275,7 @@ def test_native_format_from_transformers(default_vllm_config, dist_init):
     hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     vllm_config = RadioConfig(model_name=hf_config.args["model"], **hf_config.args)
     vllm_model = RadioModel(vllm_config)
-    loaded = vllm_model.load_weights(native_weights)
+    loaded = load_weights(vllm_model, native_weights.items())
 
     expected = {
         name

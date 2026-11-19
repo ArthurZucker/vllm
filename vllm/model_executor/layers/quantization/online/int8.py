@@ -91,7 +91,6 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w13_scale", w13_scale)
         replace_parameter(layer, "w2_scale", w2_scale)
         self._setup_kernel(layer)
-        self.release_requantization_source_weights(layer)
 
         layer._already_called_process_weights_after_loading = True
 

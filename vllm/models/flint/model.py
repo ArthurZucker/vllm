@@ -51,7 +51,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .configs import FlintConfig
-from .gguf_nvfp4 import find_gguf_file
+from .gguf_nvfp4 import find_gguf_file, gguf_nvfp4_weights_iterator
 from .ops import linear as flint_linear
 from .ops.moe import (
     BF16_DECODE_MAX_TOKENS,
@@ -620,9 +620,10 @@ class FlintForCausalLM(nn.Module, SupportsPP):
                 )
             quant_config = _nvfp4_gguf_quant_config()
             vllm_config.quant_config = quant_config
-            # load_weights reads the GGUF itself and never consumes the default
-            # loader's (lazy) iterator; the pattern just names the right file.
+            # the GGUF is read by `_gguf_weights`, never the default loader's
+            # (lazy) iterator; the pattern just names the right file.
             self.allow_patterns_overrides = ["*.gguf"]
+            self.checkpoint_transforms = [self._gguf_weights]
         if quant_config is not None:
             quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.quant_config = quant_config
@@ -658,6 +659,18 @@ class FlintForCausalLM(nn.Module, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def _gguf_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The GGUF's tensors (NVFP4 repacked) instead of the default loader's"""
+        device = next(self.parameters()).device
+        weights = self._apply_dequantized_scales(
+            gguf_nvfp4_weights_iterator(self.gguf_path, device, _GGUF_DEQUANTIZED)
+        )
+        if self.flint_dense:
+            weights = flint_linear.check_merged_global_scales(weights)
+        return weights
 
     def _apply_dequantized_scales(
         self, weights: Iterable[tuple[str, torch.Tensor]]

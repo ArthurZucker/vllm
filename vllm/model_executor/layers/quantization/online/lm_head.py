@@ -151,7 +151,7 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
         tied = getattr(layer, "online_lm_head_tied_weight", False)
-        weight = self.get_weight_for_quantization(layer)
+        weight = layer.weight
         n, k = weight.shape
         packed, scales, zero_points = self.quantize(weight)
         set_weight_attrs(packed, {"packed_dim": 1})
@@ -195,7 +195,6 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
             w_zp_param_name=w_zp_name,
         )
         self.kernel.process_weights_after_loading(layer)
-        self.release_requantization_source_weights(layer)
         logger.info_once(
             "Quantized the lm_head to %s (%d x %d per rank) with %s.",
             self.scheme,

@@ -42,6 +42,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.ops_loader import ShardOutputs
 from vllm.model_executor.model_loader.weight_utils import (
     make_attention_sink,
 )
@@ -768,6 +769,44 @@ def _shard_fp8_qkv_proj(
         scale_index[index]
     ].repeat_interleave(block, dim=1)
     return _requantize_fp8(grouped, index.numel(), block, w_full.dtype)
+
+
+class FusedFp8QKV(ShardOutputs):
+    """A layer's FP8 `qkv_proj` and its block scales, fused on disk and pre-sharded
+    for `num_key_value_heads` ranks (MiMo V2.5): this rank's rows of both
+    (`_shard_fp8_qkv_proj`), read whole. It shards its outputs itself (a
+    `ShardOutputs`)."""
+
+    needs_full = True
+
+    def __init__(self):
+        pass
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        model, name = kwargs["model"], kwargs["full_layer_name"]
+        attn = model.get_submodule(name.rsplit(".", 2)[0])
+        weight, scale = (
+            value[0] if isinstance(value, list) else value
+            for value in (input_dict[p] for p in source_patterns)
+        )
+        sharded = _shard_fp8_qkv_proj(
+            weight,
+            scale,
+            num_heads=attn.total_num_heads,
+            num_kv_heads=attn.total_num_kv_heads,
+            head_dim=attn.head_dim,
+            v_head_dim=attn.v_head_dim,
+            tp_rank=attn.qkv_proj.tp_rank,
+            tp_size=attn.qkv_proj.tp_size,
+            ckpt_tp=kwargs["config"].get_text_config().num_key_value_heads,
+            kv_chunk_rows=attn.kv_chunk_rows,
+        )
+        out = {}
+        for pattern, tensor in zip(target_patterns, sharded):
+            param = model.get_parameter(name.replace(target_patterns[0], pattern))
+            out[pattern] = tensor[: param.shape[0]]  # the layer's padding rows
+        return out
 
 
 @support_torch_compile

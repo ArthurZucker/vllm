@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -297,6 +298,44 @@ class DSpineQwen3Model(DFlashQwen3Model):
         ):
             raise ValueError("DSpine requires a zero terminal projection")
 
+    def bridge_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream, the selected-prefix bridge's tensors (validated, its metadata
+        not loaded) onto the injection's params: its layer stacks one per layer"""
+        bridge: dict[str, torch.Tensor] = {}
+        for name, weight in weights:
+            key = name.removeprefix("model.")
+            if key in _BRIDGE_METADATA[:2] or key.startswith("selected_prefix_bridge."):
+                bridge[key] = weight[...]  # read: a lazy slice
+            else:
+                yield name, weight
+        if not any(key.startswith("selected_prefix_bridge.") for key in bridge):
+            return
+        self._validate_bridge_metadata(bridge)
+        aliases = {
+            "codebook": "transfer_codebook",
+            "read_weight": f"injection.readouts.{self.injection.num_layers - 1}.weight",
+            "gate.weight": "injection.receiver_gate.weight",
+            "gate.bias": "injection.gate_bias",
+            "predecessor_gate.weight": "injection.predecessor_gate.weight",
+            "prev.weight": "injection.message.weight",
+        }
+        for name, weight in bridge.items():
+            if name in _BRIDGE_METADATA:
+                continue
+            key = name.removeprefix("selected_prefix_bridge.")
+            if key in ("early_read_weights", "feature_write_weights"):
+                read = key == "early_read_weights"
+                count = self.injection.num_layers - int(read)
+                if weight.ndim != 3 or weight.shape[0] != count:
+                    raise ValueError(f"Invalid DSpine layer stack: {name}")
+                module = "readouts" if read else "writes"
+                for index, tensor in enumerate(weight):
+                    yield f"model.injection.{module}.{index}.weight", tensor
+            else:
+                yield f"model.{aliases.get(key, name)}", weight
+
 
 class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     speculator_config_class = DSpineSpeculatorConfig
@@ -308,6 +347,7 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             raise ValueError("DSpine requires the full target vocabulary.")
+        self.checkpoint_transforms.append(self.model.bridge_weights)
 
     def compute_candidates(
         self, hidden_states: torch.Tensor

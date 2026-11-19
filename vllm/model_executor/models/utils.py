@@ -1276,3 +1276,18 @@ def parse_diarized_speaker(speaker: str) -> str | None:
     ):
         return None
     return speaker
+
+
+def observe_eagle_weights(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """An EAGLE draft's checkpoint stream (a `checkpoint_transforms` entry, with
+    `functools.partial(observe_eagle_weights, model)`): a draft shipping its own
+    `lm_head` / `embed_tokens` keeps them (`has_own_lm_head`,
+    `has_own_embed_tokens`), else it shares the target's"""
+    for name, weight in weights:
+        if "lm_head" in name:
+            model.has_own_lm_head = True
+        if "embed_tokens" in name:
+            model.has_own_embed_tokens = True
+        yield name, weight

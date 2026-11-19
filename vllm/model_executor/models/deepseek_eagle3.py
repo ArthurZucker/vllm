@@ -3,6 +3,8 @@
 
 """Eagle3 speculative decoding model for DeepseekV2/V3 with MLP (no MoE)."""
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -27,6 +29,7 @@ from .interfaces import LocalArgmaxMixin
 from .utils import (
     get_draft_quant_config,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 
@@ -294,6 +297,7 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def embed_input_ids(
         self,

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from fnmatch import fnmatch
+from functools import partial
 from typing import Any, cast
 
 import torch
@@ -87,7 +88,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    dequantize_nvfp4_moe_weights,
+    dequantize_nvfp4_tensor,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     CSF_SCALE_ENCODINGS,
@@ -949,21 +950,17 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """FP4 variants use 'weight_scale_2' pattern for per-tensor weight scales."""
         return True
 
-    def dequantize_weight(
-        self, layer: torch.nn.Module
-    ) -> Iterator[tuple[slice, torch.Tensor, torch.Tensor]]:
-        """Yield `(experts, w13, w2)` dequantized ModelOpt NVFP4 experts."""
-        return dequantize_nvfp4_moe_weights(
-            layer.w13_weight,
-            layer.w13_weight_scale,
-            layer.w13_weight_scale_2,
-            layer.w2_weight,
-            layer.w2_weight_scale,
-            layer.w2_weight_scale_2,
-            layer.params_dtype,
+    def dequantize_op(self, layer: torch.nn.Module):
+        """Each NVFP4 checkpoint expert as it loads, for requantization: its
+        `weight_scale_2` the decode multiplier"""
+        dequantize = partial(
+            dequantize_nvfp4_tensor,
+            dtype=layer.params_dtype,
             group_size=self.quant_config.group_size,
-            invert_global_scales=False,
+            invert_global_scale=False,
         )
+        names = ["weight", "weight_scale", "weight_scale_2"]
+        return dequantize, names, ["input_scale"]
 
     def create_weights(
         self,
@@ -3182,16 +3179,20 @@ class ModelOptLinearMethod(LinearMethodBase):
 
         return VllmLayoutQuantizer(*op)
 
-    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
-        """Reconstruct serialized weights for online requantization."""
-        if self.wkey.key is kMxfp8Static:
-            return dequant_mxfp8_to_bf16(
-                layer.weight.contiguous(), layer.weight_scale.contiguous()
-            )
-        else:
+    def dequantize_op(self, layer: torch.nn.Module):
+        """Each MXFP8 checkpoint weight to bf16 as it loads, for requantization:
+        its scales one per `(rows, 32)` block (`KMxfp8Static.scale_block_rows`)"""
+        if self.wkey.key is not kMxfp8Static:
             raise NotImplementedError(
                 "ModelOpt weight dequantization is only supported for MXFP8."
             )
+        rows = KMxfp8Static.scale_block_rows(self.ctx)
+
+        def dequantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            scale = scale.view(torch.uint8).repeat_interleave(rows, dim=0)
+            return dequant_mxfp8_to_bf16(weight.contiguous(), scale.contiguous())
+
+        return dequantize, ["weight", "weight_scale"], []
 
     def apply(self, layer, x, bias=None):
         return self.fmt.apply(

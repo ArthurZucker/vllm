@@ -7,6 +7,7 @@ or all sliding). The draft checkpoint shares token embedding and lm_head
 weights with the target model through the generic spec-decode proposer.
 """
 
+from functools import partial
 
 import torch
 from torch import nn
@@ -32,6 +33,7 @@ from .qwen3_dflash import DFlashQwen3Model
 from .utils import (
     get_draft_quant_config,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -218,7 +220,6 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         return all_k_normed
 
 
-
 class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
     # The speculator this is a draft model of (see SpeculativeDraftModel).
     speculator_config_class = DFlashSpeculatorConfig
@@ -232,6 +233,7 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
             raise ValueError("Laguna DFlash config requires `draft_vocab_size`.")
         self.has_own_embed_tokens = False
         self.has_own_lm_head = False
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.config.target_layer_count = target_layer_num
         target_vocab_size = vllm_config.model_config.get_vocab_size()
@@ -306,7 +308,6 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
         if needs_squeeze:
             result = result.squeeze(0)
         return result
-
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_kv_buffers()

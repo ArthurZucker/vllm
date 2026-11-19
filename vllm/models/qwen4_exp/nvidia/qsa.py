@@ -74,10 +74,10 @@ class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
             quant_config=quant_config,
             prefix=qkv_proj.prefix,
         )
-
-
-
-
+        # loading (`ops_loader`): k and v replicated as in `qkv_proj`, the indexer's
+        # q/k on every rank
+        replicas = self.num_kv_head_replicas
+        self.shard_replicas = {1: replicas, 2: replicas, 3: self.tp_size}
 
 
 class Qwen4ExpQSABackend(AttentionBackend):
@@ -426,7 +426,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def process_weights_after_loading(self) -> None:
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
-
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend

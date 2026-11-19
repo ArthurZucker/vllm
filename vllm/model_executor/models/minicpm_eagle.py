@@ -25,6 +25,7 @@
 """Inference-only EagleMiniCPM model compatible with HuggingFace weights."""
 
 import math
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -49,6 +50,7 @@ from .minicpm import MiniCPMMoE as EagleMiniCPMMoE
 from .utils import (
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 if TYPE_CHECKING:
@@ -227,7 +229,6 @@ class EagleMiniCPMModel(nn.Module):
         return hidden_states, hidden_states
 
 
-
 class EagleMiniCPMForCausalLM(
     nn.Module, SupportsLoRA, _EagleMiniCPMSupportsPP, SupportsEagle
 ):
@@ -286,6 +287,7 @@ class EagleMiniCPMForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def _init_model(
         self, *, vllm_config: VllmConfig, prefix: str = "", start_layer: int = 0
@@ -319,4 +321,3 @@ class EagleMiniCPMForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

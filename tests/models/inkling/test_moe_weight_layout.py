@@ -9,6 +9,7 @@ import torch
 from vllm.lora.utils import get_supported_lora_modules
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.models.inkling.amd import moe as amd_moe
 from vllm.models.inkling.nvidia import moe
 from vllm.models.inkling.nvidia.model import _TmlForCausalLMBase
@@ -25,7 +26,7 @@ def test_gate_loads_directly_into_padded_runtime_weight() -> None:
     )
     loaded = torch.arange(28, dtype=gate.weight.dtype).reshape(7, 4)
 
-    gate.weight.weight_loader(gate.weight, loaded)
+    load_with_ops(gate, iter([("weight", loaded)]))
 
     assert gate.weight.shape == (8, 4)
     torch.testing.assert_close(gate.weight[:7], loaded)

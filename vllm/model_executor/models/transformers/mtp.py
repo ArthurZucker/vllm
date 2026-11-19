@@ -16,6 +16,7 @@
 # limitations under the License.
 """Transformers modeling backend mixin for multi-token prediction draft models."""
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -86,6 +87,26 @@ class MTPMixin(CausalMixin):
         `PrefetchOffloader.wrap_modules` may only be called once (for the target)."""
         return NoopOffloader()
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """The draft's tensors only (its MTP layers, and the embedding when it
+        tracks its own); `has_own_embed_tokens` when the checkpoint ships one"""
+        embed_prefix = None
+        if self._tracks_own_embed:
+            embed = self.model.get_input_embeddings()
+            embed_prefix = next(n for n, m in self.named_modules() if m is embed) + "."
+
+        def is_draft_weight(name: str) -> bool:
+            if self.mtp_weights.search(name):
+                return True
+            if embed_prefix is None:
+                return False
+            mapped = self.hf_to_vllm_mapper.map_name(name)
+            return mapped is not None and mapped.startswith(embed_prefix)
+
+        loaded = super().load_weights(w for w in weights if is_draft_weight(w[0]))
+        if embed_prefix is not None:
+            self.has_own_embed_tokens = any(n.startswith(embed_prefix) for n in loaded)
+        return loaded
 
     def forward(  # type: ignore[override]
         self,

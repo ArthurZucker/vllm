@@ -14,6 +14,7 @@ byte (low nibble first) and stores the same three factors as `weight`,
 import glob
 import os
 import warnings
+from collections.abc import Iterator
 
 import huggingface_hub
 import numpy as np
@@ -155,3 +156,68 @@ def _map_name(name: str) -> tuple[str, bool]:
     if rest not in _LAYER_NAMES:
         raise ValueError(f"Unexpected tensor in Flint GGUF: {name}")
     return prefix + _LAYER_NAMES[rest], False
+
+
+def gguf_nvfp4_weights_iterator(
+    path: str,
+    device: torch.device | str = "cuda",
+    dequantize: frozenset[str] = frozenset(),
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield HF-style (name, tensor) pairs; NVFP4 tensors become `.weight`
+    (packed uint8), `.weight_scale` (E4M3) and `.weight_scale_2` (F32),
+    except HF base names in `dequantize`, which become a BF16 `.weight`
+    holding `e2m1 * e4m3` (exact) plus the F32 `.weight_scale_2` that the
+    caller applies to the fp32 output."""
+    try:
+        import gguf
+    except ImportError as err:
+        raise ImportError(
+            "Loading Flint NVFP4 GGUF checkpoints requires the `gguf` package "
+            "(pip install 'gguf>=0.19.0')."
+        ) from err
+
+    reader = gguf.GGUFReader(path)
+    prec_a4 = reader.fields.get("general.tensor_extra.prec_a4")
+    if prec_a4 is not None and any(prec_a4.contents()):
+        raise ValueError(
+            "GGUF marks tensors with FP4 activations (prec_a4); only weight-only "
+            "NVFP4 (W4A16) is supported."
+        )
+    tensors = {t.name: t for t in reader.tensors}
+    for name, t in tensors.items():
+        if name.endswith(".scale"):
+            continue
+        data = _as_tensor(t.data)
+        if t.tensor_type != _GGUF_NVFP4:
+            hf_name, _ = _map_name(name)
+            if t.tensor_type == gguf.GGMLQuantizationType.BF16:
+                data = data.view(torch.bfloat16)
+            elif t.tensor_type != gguf.GGMLQuantizationType.F32:
+                raise ValueError(
+                    f"Unsupported GGUF tensor type for {name}: {t.tensor_type}"
+                )
+            yield hf_name, data
+            continue
+
+        base = name.removesuffix(".weight")
+        hf_base, stacked = _map_name(base)
+        n_cols = int(t.shape[0])
+        weight, weight_scale = _repack_nvfp4(data.to(device), n_cols)
+        global_scale = _as_tensor(tensors[base + ".scale"].data)
+        if hf_base in dequantize:
+            yield (
+                hf_base + ".weight",
+                dequantize_nvfp4(weight, weight_scale, out_dtype=torch.bfloat16),
+            )
+            yield hf_base + ".weight_scale_2", global_scale.reshape(())
+            continue
+        if not stacked:
+            yield hf_base + ".weight", weight
+            yield hf_base + ".weight_scale", weight_scale
+            yield hf_base + ".weight_scale_2", global_scale.reshape(())
+            continue
+        for e in range(weight.shape[0]):
+            expert = hf_base.format(e)
+            yield expert + ".weight", weight[e]
+            yield expert + ".weight_scale", weight_scale[e]
+            yield expert + ".weight_scale_2", global_scale[e]

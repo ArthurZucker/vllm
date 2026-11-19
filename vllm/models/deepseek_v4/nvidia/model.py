@@ -126,6 +126,23 @@ def _use_mega_gate(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _pad_intermediate(mlp: nn.Module, checkpoint_size: int, padded_size: int) -> None:
+    """The intermediate axis (`gate_up_proj`'s gate and up rows, `down_proj`'s
+    columns) padded from the checkpoint's size: each rank reads its rows of the
+    padded axis, the trailing ranks' padding stays zero (`VllmShard._segments`).
+    Block scales alike, in proportion"""
+    for layer, dim_name, shards in (
+        (mlp.gate_up_proj, "output_dim", 2),
+        (mlp.down_proj, "input_dim", 1),
+    ):
+        for param in layer.parameters(recurse=False):
+            if (dim := getattr(param, dim_name, None)) is None:
+                continue
+            full = param.shape[dim] * layer.tp_size // shards  # one source's
+            extra = full - full * checkpoint_size // padded_size
+            param.shard_segments = [(full, extra, False)]
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -147,8 +164,9 @@ class DeepseekV4MLP(nn.Module):
         #
         # Block-FP8 shards in whole 128-blocks; cdiv rounds the per-rank block
         # count up so the linear's even TP split stays block-aligned, with the
-        # trailing ranks zero-filled by load_weights.
+        # trailing ranks zero-filled on load (`_pad_intermediate`).
         block_size = getattr(quant_config, "weight_block_size", None)
+        checkpoint_size = intermediate_size
         if block_size is not None and not is_sequence_parallel:
             tp_size = get_tensor_model_parallel_world_size()
             n_local = cdiv(intermediate_size // block_size[0], tp_size)
@@ -170,6 +188,8 @@ class DeepseekV4MLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
+        if intermediate_size != checkpoint_size:
+            _pad_intermediate(self, checkpoint_size, intermediate_size)
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -1062,31 +1082,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
-
-    @staticmethod
-    def _pad_shared_expert_weight(
-        quant_config: QuantizationConfig | None,
-        name: str,
-        loaded_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
-        axis so the standard TP loaders split it into even, block-aligned shards
-        (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
-        down (w2 -> down_proj) [H, I] pads dim 1.
-        """
-        block_size = getattr(quant_config, "weight_block_size", None)
-        assert block_size is not None
-        # Round the intermediate axis up to a whole number of TP shards. The axis
-        # is in elements for weights (step = block) and in blocks for scales.
-        step = 1 if name.endswith("weight_scale_inv") else block_size[0]
-        dim = 1 if ".down_proj." in name else 0
-        mult = get_tensor_model_parallel_world_size() * step
-        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
-        if pad == 0:
-            return loaded_weight
-        pad_shape = list(loaded_weight.shape)
-        pad_shape[dim] = pad
-        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:

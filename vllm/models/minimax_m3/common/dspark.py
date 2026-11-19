@@ -8,6 +8,8 @@ Markov and confidence heads) built from MiniMax-M3 layers: Gemma RMSNorm
 checkpoint ships no token embedding or LM head; both are shared with the target.
 """
 
+from collections.abc import Iterable
+
 import torch
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
@@ -46,6 +48,20 @@ from vllm.utils.torch_utils import (
 )
 
 _CHECKPOINT_PREFIX = "language_model.model.dspark."
+
+
+def _rename_checkpoint_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """MiniMax's DSpark names onto Qwen3 DSpark's, before its own conversions"""
+    for name, tensor in weights:
+        name = name.removeprefix(_CHECKPOINT_PREFIX)
+        name = name.replace(".decoder_layer.", ".")
+        if name.startswith("final_norm."):
+            name = "norm." + name.removeprefix("final_norm.")
+        # MiniMax stores the MXFP8 E8M0 block scales as weight_scale_inv.
+        name = name.replace(".weight_scale_inv", ".weight_scale")
+        yield name, tensor
 
 
 def _shared_slot_mapping(
@@ -417,6 +433,10 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.checkpoint_transforms = [
+            _rename_checkpoint_weights,
+            *getattr(self, "checkpoint_transforms", []),
+        ]
         extra = vllm_config.additional_config
         if (
             current_platform.is_cuda()

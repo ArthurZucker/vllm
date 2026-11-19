@@ -155,7 +155,6 @@ class Nvfp4WeightOnlyOnlineLinearMethod(OnlineLinearBase):
         replace_parameter(layer, "weight_global_scale", global_scale)
 
         self.kernel.process_weights_after_loading(layer)
-        self.release_requantization_source_weights(layer)
 
         layer._already_called_process_weights_after_loading = True
 
@@ -302,7 +301,6 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w13_input_scale", ones)
         replace_parameter(layer, "w2_input_scale", ones.clone())
         self._setup_kernel(layer)
-        self.release_requantization_source_weights(layer)
 
         layer._already_called_process_weights_after_loading = True
 

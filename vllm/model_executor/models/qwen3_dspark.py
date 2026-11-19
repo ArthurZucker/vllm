@@ -15,6 +15,7 @@ DFlash Qwen3 draft (see qwen3_dflash.py). DSpark adds:
 DSparkMarkovHead and DSparkConfidenceHead are shared with the DSV4-style DSpark model.
 """
 
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import (
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -267,6 +269,9 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        # DSpark embeds masked slots with embed_tokens[mask_token_id] alone
+        self.model.mask_embedding.loaded_at_init = True
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
@@ -313,4 +318,3 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
-

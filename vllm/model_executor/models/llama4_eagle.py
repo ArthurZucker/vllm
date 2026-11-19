@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -43,6 +44,7 @@ from .interfaces import (
 from .utils import (
     _merge_multimodal_embeddings,
     maybe_prefix,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -184,6 +186,7 @@ class EagleLlama4ForCausalLM(_EagleLlama4ForCausalLMBase, SupportsMultiModalEmbe
 
         # Set MoE hyperparameters
         self.set_moe_parameters()
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def get_language_model(self) -> torch.nn.Module:
         return self.model

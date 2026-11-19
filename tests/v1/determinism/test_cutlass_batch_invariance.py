@@ -186,6 +186,7 @@ def test_online_fp8_linear_batch_invariant(
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
+    from vllm.model_executor.model_loader.ops_loader import load_weights
     from vllm.utils.torch_utils import set_default_torch_dtype
 
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
@@ -196,7 +197,10 @@ def test_online_fp8_linear_batch_invariant(
         layer = ReplicatedLinear(
             1024, 768, bias=False, quant_config=quant_config, prefix="mlp.down_proj"
         )
-        layer.weight.weight_loader(layer.weight, torch.randn(768, 1024))
+        root = torch.nn.Module()
+        root.down_proj = layer  # quantized as it loads: the plan's quantize op
+        load_weights(root, iter([("down_proj.weight", torch.randn(768, 1024))]))
+        layer.quant_method.process_weights_after_loading(layer)
 
         needle = torch.randn(1, 1024)
         filler = 100 * torch.randn(63, 1024)

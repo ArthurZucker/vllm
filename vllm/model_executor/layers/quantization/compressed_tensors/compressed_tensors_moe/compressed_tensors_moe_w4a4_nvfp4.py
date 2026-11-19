@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterator
+from functools import partial
 
 import torch
 
@@ -31,7 +31,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     trtllm_nvfp4_hidden_alignment,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    dequantize_nvfp4_moe_weights,
+    dequantize_nvfp4_tensor,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -207,20 +207,19 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         )
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
-    def dequantize_weight(
-        self, layer: torch.nn.Module
-    ) -> Iterator[tuple[slice, torch.Tensor, torch.Tensor]]:
-        """Yield `(experts, w13, w2)` dequantized NVFP4 experts."""
-        return dequantize_nvfp4_moe_weights(
-            layer.w13_weight_packed,
-            layer.w13_weight_scale,
-            layer.w13_weight_global_scale,
-            layer.w2_weight_packed,
-            layer.w2_weight_scale,
-            layer.w2_weight_global_scale,
-            layer.params_dtype,
+    def dequantize_op(self, layer: torch.nn.Module):
+        """Each NVFP4 checkpoint expert as it loads, for requantization: its
+        `weight_global_scale` the encode scale"""
+        dequantize = partial(
+            dequantize_nvfp4_tensor,
+            dtype=layer.params_dtype,
             group_size=self.group_size,
-            invert_global_scales=True,
+            invert_global_scale=True,
+        )
+        return (
+            dequantize,
+            ["weight_packed", "weight_scale", "weight_global_scale"],
+            ["input_global_scale"],
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:

@@ -479,7 +479,6 @@ def test_marlin_workspace_without_manager(monkeypatch):
 
 def test_model_cleanup(dist_init, default_vllm_config):
     layer = QKVParallelLinear(2, 3, 4)
-    assert layer.weight.weight_loader.__self__ is layer
     info = LayerReloadingInfo(
         restore_metadata=capture_layer_to_meta(layer),
         restore_device=torch.device("cpu"),

@@ -9,6 +9,9 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
+from collections.abc import Iterable
+from functools import partial
+
 import regex as re
 import torch
 import torch.nn as nn
@@ -55,10 +58,19 @@ from .model import (
 
 logger = init_logger(__name__)
 
-# MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
-# fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
-_EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 _CONTEXT_WKV_RE = re.compile(r"^mtp\.(\d+)\.attn\.wkv\.(.+)$")
+
+
+def context_wkv_sources(
+    weights: Iterable[tuple[str, torch.Tensor]], layers: int
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Each draft layer's WKV, and again as a source of the cross-layer
+    `context_wkv_proj` (`conversion_mapping._deepseek_v4_dspark`)"""
+    for name, weight in weights:
+        yield name, weight
+        match = _CONTEXT_WKV_RE.fullmatch(name)
+        if match is not None and int(match.group(1)) < layers:
+            yield f"context_wkv_proj_src.{match.group(1)}.{match.group(2)}", weight
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -346,6 +358,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
         self.set_moe_parameters()
+        self.checkpoint_transforms = [
+            partial(context_wkv_sources, layers=len(self.model.layers))
+        ]
 
     def set_moe_parameters(self) -> None:
         collect_moe_layers(

@@ -7,7 +7,7 @@ BAGEL is a unified multimodal model for image understanding and generation.
 For vLLM, we focus on the image understanding (vision-to-text) capabilities.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
 import torch
@@ -402,6 +402,7 @@ class BagelForConditionalGeneration(
                     max_num_patch_per_side=config.vit_max_num_patch_per_side,
                     hidden_size=llm_hidden_size,
                 )
+            self.checkpoint_transforms = [self._patch_embedding_as_conv]
         else:
             self.vit_model = StageMissingLayer("image_tower")
             self.connector = StageMissingLayer("image_tower")
@@ -410,6 +411,29 @@ class BagelForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    def _patch_embedding_as_conv(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream, the SigLIP patch embedding saved as a linear (`[out, p * p *
+        c]`, Bagel's) as its conv's `[out, c, p, p]`"""
+        patch = self.config.vit_config.patch_size
+        channels = self.config.vit_config.num_channels
+        for name, tensor in weights:
+            if "patch_embedding.weight" in name:
+                shape = (
+                    tensor.shape
+                    if isinstance(tensor, torch.Tensor)
+                    else tensor.get_shape()
+                )
+                if len(shape) == 2 and shape[1] == channels * patch * patch:
+                    tensor = (
+                        tensor[...]
+                        .reshape(shape[0], patch, patch, channels)
+                        .permute(0, 3, 1, 2)
+                        .contiguous()
+                    )
+            yield name, tensor
 
     def _parse_and_validate_image_input(
         self, **kwargs: object

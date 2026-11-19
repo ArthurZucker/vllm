@@ -146,6 +146,26 @@ class Deinterleave(ConversionOps):
         return {target_patterns[0]: tensor.reshape(shape)}
 
 
+class GroupedQKV(ConversionOps):
+    """A fused `qkv` stored per kv head (`[kv_heads, heads / kv_heads + 2, head_dim]`:
+    each group's queries, its key, its value; Falcon's `query_key_value`) as all the
+    queries, then the keys, then the values"""
+
+    needs_full = True  # the groups are kv heads before they are a rank's
+
+    def __init__(self, heads: int, kv_heads: int):
+        self.heads, self.kv_heads = heads, kv_heads
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        tensor = _first(input_dict)
+        shape, group = tensor.shape, self.heads // self.kv_heads + 2
+        grouped = tensor.view(self.kv_heads, group, -1, *shape[1:])
+        q, k, v = grouped.split([group - 2, 1, 1], dim=1)
+        parts = [part.reshape(-1, *shape[1:]) for part in (q, k, v)]
+        return {target_patterns[0]: torch.cat(parts)}
+
+
 class ExpertRows(ConversionOps):
     """Experts stacked along the rows (`[experts * rows, cols]`, Nomic MoE, DBRX) as
     `[experts, rows, cols]`, `experts` read from the config (a dotted path)"""
@@ -165,7 +185,8 @@ class ExpertRows(ConversionOps):
 class HeadPermute(ConversionOps):
     """Each head's channels gathered by `index` (`head_dim` channels a head), on the
     sources at `positions` (all by default): K2-Horizon's partial-RoPE channels
-    reordered for NeoX rope. Per head: sharded heads permute alone"""
+    reordered for NeoX rope. Per head: sharded heads permute alone; a per-tensor
+    scale stays as is"""
 
     def __init__(self, index: torch.Tensor, head_dim: int, positions=None):
         self.index, self.head_dim, self.positions = index, head_dim, positions
@@ -185,6 +206,8 @@ class HeadPermute(ConversionOps):
                 t.view(-1, self.head_dim, *t.shape[1:])[:, self.index.to(t.device)]
                 .reshape(t.shape)
                 .contiguous()
+                if t.numel() > 1
+                else t
                 for t in tensors
             ]
         return input_dict
@@ -310,13 +333,15 @@ class EqualSources(ConversionOps):
 class RepeatToParam(ConversionOps):
     """Each dim repeated (`repeat_interleave`) to its target param's size: block
     scales coarser than the param's (an FP8 shared expert's 128x128 UE8M0 scales
-    into MegaMoE's 1x32)"""
+    into MegaMoE's 1x32); a scalar into every element (one scale for all experts)"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
         shape = _target(kwargs).shape
 
         def repeat(t):
+            if t.numel() == 1:
+                t = t.reshape((1,) * len(shape))
             for dim, (have, want) in enumerate(zip(t.shape, shape)):
                 if have != want:
                     if want % have:
@@ -325,3 +350,27 @@ class RepeatToParam(ConversionOps):
             return t
 
         return _each(input_dict, repeat)
+
+
+class MergeLora(ConversionOps):
+    """A LoRA-parametrized weight merged, `W + (B @ A) * scaling` with one adapter
+    (`index`) of the stacked ones: jina-embeddings-v3's `parametrizations`
+    (`original`, `0.lora_A`, `0.lora_B`); an embedding's A and B are swapped"""
+
+    needs_full = True  # sharded after the merge
+
+    def __init__(self, scaling: float, index: int = -1):
+        self.scaling, self.index = scaling, index
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        def get(part: str) -> torch.Tensor:
+            tensor = next(v for k, v in input_dict.items() if part in k)
+            return tensor[0] if isinstance(tensor, list) else tensor
+
+        weight, lora_a, lora_b = get("original"), get("lora_A"), get("lora_B")
+        a, b = lora_a[self.index].float(), lora_b[self.index].float()
+        if "embeddings" in kwargs.get("full_layer_name", ""):
+            a, b = b, a
+        delta = (b @ a).view(weight.shape) * self.scaling
+        return {target_patterns[0]: (weight.float() + delta).to(weight.dtype)}
