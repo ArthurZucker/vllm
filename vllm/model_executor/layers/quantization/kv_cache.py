@@ -23,7 +23,7 @@ class KVCacheScaleParameter(torch.nn.Parameter):
 
     Initialized to -1.0 (an invalid sentinel) so call sites just write
     `KVCacheScaleParameter()`. A scalar or `(1,)` checkpoint tensor loads into
-    it as is (`ops_loader._load_into` views a same-size value at the param's
+    it as is (`ops_loader.copy_into` views a same-size value at the param's
     shape); anything larger is a shape mismatch. Per-head scales are
     compressed-tensors' (`AttnHeadScales`).
     """

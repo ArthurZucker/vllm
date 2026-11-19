@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Conversion ops vLLM adds to Transformers' (`transformers.core_model_loading`)."""
 
+import operator
+
 import torch
 from transformers.core_model_loading import Concatenate, ConversionOps
 
@@ -145,17 +147,19 @@ class Deinterleave(ConversionOps):
 
 
 class ExpertRows(ConversionOps):
-    """Experts stacked along the rows (`[experts * rows, cols]`, Nomic MoE) as
-    `[experts, rows, cols]`, `experts` read from the config"""
+    """Experts stacked along the rows (`[experts * rows, cols]`, Nomic MoE, DBRX) as
+    `[experts, rows, cols]`, `experts` read from the config (a dotted path)"""
+
+    needs_full = True  # the rows are experts' before they are a rank's
 
     def __init__(self, experts_attr: str = "num_experts"):
         self.experts_attr = experts_attr
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        tensor = _first(input_dict)
-        experts = getattr(kwargs["config"].get_text_config(), self.experts_attr)
-        return {target_patterns[0]: tensor.view(experts, -1, *tensor.shape[1:])}
+        config = kwargs["config"].get_text_config()
+        experts = operator.attrgetter(self.experts_attr)(config)
+        return _each(input_dict, lambda t: t.view(experts, -1, *t.shape[1:]))
 
 
 class HeadPermute(ConversionOps):
@@ -270,3 +274,54 @@ class Refuse(ConversionOps):
 
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
         raise RuntimeError(self.message)
+
+
+class Reciprocal(ConversionOps):
+    """`1 / x`, in float32: compressed-tensors' global scales (quantization scales)
+    as the dequantization scales a param holds"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        return _each(input_dict, lambda t: 1.0 / t.float())
+
+
+class EqualSources(ConversionOps):
+    """The first source, which the others must equal (to `rtol`): NVFP4 experts'
+    `w1` and `w3` `weight_scale_2`, one L1 scale per expert"""
+
+    def __init__(self, rtol: float = 1e-5):
+        self.rtol = rtol
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        first, *others = (
+            t[0] if isinstance(t, list) else t for t in input_dict.values()
+        )
+        for other in others:
+            if not torch.allclose(other.float(), first.float(), rtol=self.rtol):
+                raise ValueError(
+                    f"{kwargs.get('full_layer_name')}: {source_patterns} differ "
+                    f"({first.flatten().tolist()[:4]} vs "
+                    f"{other.flatten().tolist()[:4]}); one value is loaded"
+                )
+        return {target_patterns[0]: first}
+
+
+class RepeatToParam(ConversionOps):
+    """Each dim repeated (`repeat_interleave`) to its target param's size: block
+    scales coarser than the param's (an FP8 shared expert's 128x128 UE8M0 scales
+    into MegaMoE's 1x32)"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        shape = _target(kwargs).shape
+
+        def repeat(t):
+            for dim, (have, want) in enumerate(zip(t.shape, shape)):
+                if have != want:
+                    if want % have:
+                        raise ValueError(f"{tuple(t.shape)} does not tile {shape}")
+                    t = t.repeat_interleave(want // have, dim)
+            return t
+
+        return _each(input_dict, repeat)

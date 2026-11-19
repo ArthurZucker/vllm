@@ -2,14 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Block-FP8 routed experts re-quantized to MXFP4 at load (ROCm).
 
-`VLLM_FP8_MOE_REQUANT=mxfp4` keeps the checkpoint's block-FP8 expert
-weights for loading and, once loaded, dequantizes each expert to bf16 and
-quantizes it to MXFP4 (e2m1 values, e8m0 block-32 scales) for the aiter MXFP4
-MoE kernels: half the expert bytes of FP8. `VLLM_FP8_MOE_REQUANT_ACT` selects
-the activation dtype: a8w4 (fp8 per-token; aiter's interleaved FlyDSL kernels,
-the `AITER_MXFP4_BF16` backend; default), a4w4 (MXFP4 activations,
-`AITER_MXFP4_MXFP4`) or a16w4 (bf16, `AITER_TRITON_MXFP4_BF16`).
+`VLLM_FP8_MOE_REQUANT=mxfp4` dequantizes each block-FP8 checkpoint expert to
+bf16 as it loads, and quantizes the merged experts to MXFP4 (e2m1 values, e8m0
+block-32 scales) for the aiter MXFP4 MoE kernels: half the expert bytes of FP8.
+`VLLM_FP8_MOE_REQUANT_ACT` selects the activation dtype: a8w4 (fp8 per-token;
+aiter's interleaved FlyDSL kernels, the `AITER_MXFP4_BF16` backend; default),
+a4w4 (MXFP4 activations, `AITER_MXFP4_MXFP4`) or a16w4 (bf16,
+`AITER_TRITON_MXFP4_BF16`).
 """
+
+from functools import partial
 
 import torch
 
@@ -22,17 +24,9 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     make_mxfp4_moe_quant_config,
 )
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
-    MXFP4_BLOCK_SIZE,
     Mxfp4OnlineMoEMethod,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    mxfp4_quantize,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
-from vllm.model_executor.model_loader.reload.layerwise import (
-    initialize_online_processing,
-)
-from vllm.model_executor.utils import replace_parameter
 
 logger = init_logger(__name__)
 
@@ -51,22 +45,15 @@ def dequant_block_fp8_to_bf16(
 class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
     """Block-FP8 routed experts stored as MXFP4 (VLLM_FP8_MOE_REQUANT=mxfp4).
 
-    Weights are created and loaded by `Fp8MoEMethod` (fp8 values + block
-    `weight_scale_inv`), so the checkpoint loader is unchanged; the
-    re-quantization happens in `process_weights_after_loading`. Rounding the
-    values to the e2m1 grid with power-of-two block-32 scales is lossy: the
-    weight error is of the order of an MXFP4 quantization of the bf16 weights.
+    The plan requantizes them as they load (`checkpoint_quantizer`): each
+    checkpoint expert (fp8 values + block `weight_scale_inv`) is dequantized to
+    bf16 before the experts merge, the merged experts quantized to MXFP4 after.
+    Rounding the values to the e2m1 grid with power-of-two block-32 scales is
+    lossy: the weight error is of the order of an MXFP4 quantization of the bf16
+    weights.
     """
 
-    # FP8 expert parameters live on the meta device and are materialized one
-    # layer at a time by the layerwise online-processing loader, so each layer
-    # is re-quantized as soon as its experts are loaded: peak memory is the
-    # MXFP4 model plus one layer of FP8 experts (TP4 would not fit otherwise).
-    uses_meta_device = True
-
     def __init__(self, quant_config, layer: RoutedExperts) -> None:
-        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
-
         act = envs.VLLM_FP8_MOE_REQUANT_ACT.lower()
         moe_config = layer.moe_config
         # a4w4 asks for MXFP4 activations (AITER_MXFP4_MXFP4). With bf16
@@ -74,17 +61,18 @@ class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
         # weight layout makes aiter quantize activations to fp8 (a8w4); true
         # bf16 activations need the aiter Triton backend.
         self.activation_quant_key = kMxfp4Dynamic if act == "a4w4" else None  # type: ignore[assignment]
-        # The FP8 method only creates/loads the block-FP8 parameters; build it
-        # before the MXFP4 backend override below (it resolves moe_backend too).
-        self.fp8_method = Fp8MoEMethod(quant_config, layer)
-        assert self.fp8_method.block_quant, "FP8 re-quant needs block-scaled experts"
-        assert self.fp8_method.weight_block_size is not None
-        self.fp8_block_size = list(self.fp8_method.weight_block_size)
+        assert quant_config.weight_block_size is not None, (
+            "FP8 re-quant needs block-scaled experts"
+        )
+        self.fp8_block_size = list(quant_config.weight_block_size)
         if act == "a16w4" and moe_config.moe_backend == "auto":
             moe_config.moe_backend = "aiter_triton_mxfp4_bf16"
         super().__init__(moe=moe_config)
-        self.w13_precision_config = None
-        self.w2_precision_config = None
+        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+            raise ValueError(
+                "VLLM_FP8_MOE_REQUANT=mxfp4 needs an MXFP4 MoE backend, and none "
+                "is available on this platform."
+            )
         self.quant_config = quant_config
         logger.info_once(
             "FP8 block experts re-quantized to MXFP4 at load (%s, %s)",
@@ -113,92 +101,15 @@ class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
             )
         return super().get_fused_moe_quant_config(layer)
 
-    def create_weights(
-        self,
-        layer: RoutedExperts,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        if hidden_size != layer.moe_config.hidden_dim_unpadded or (
-            intermediate_size_per_partition
-            != layer.moe_config.intermediate_size_per_partition_unpadded
-        ):
-            raise ValueError(
-                "FP8 -> MXFP4 re-quant does not pad expert dims (the FP8 "
-                f"loader writes the unpadded checkpoint shapes): got "
-                f"{hidden_size}x{intermediate_size_per_partition}"
-            )
-        self.fp8_method.create_weights(
-            layer,
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            params_dtype,
-            **extra_weight_attrs,
-        )
-        layer.w13_input_scale = None
-        layer.w2_input_scale = None
-        layer.weight_block_size = [1, MXFP4_BLOCK_SIZE]
-        for name, param in list(layer.named_parameters(recurse=False)):
-            meta = torch.nn.Parameter(
-                torch.empty_like(param, device="meta"), requires_grad=False
-            )
-            meta.__dict__.update(param.__dict__)
-            layer.register_parameter(name, meta)
-        initialize_online_processing(layer)
-
     def checkpoint_quantizer(self, layer: RoutedExperts):
-        """The FP8 experts load as `Fp8MoEMethod` loads them; the MXFP4
-        requantization runs after loading (see `create_weights`)."""
-        quantizer = getattr(self.fp8_method, "checkpoint_quantizer", None)
-        return None if quantizer is None else quantizer(layer)
+        """Each FP8 expert dequantized before the experts merge, the merged
+        experts quantized to MXFP4 after (the online MXFP4 quantize op)"""
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmRequantizeQuantizer,
+        )
 
-    def _requant(self, weight: torch.Tensor, scale_inv: torch.Tensor):
-        num_experts, n, k = weight.shape
-        out = torch.empty(
-            (num_experts, n, k // 2), dtype=torch.uint8, device=weight.device
+        dequantize = partial(dequant_block_fp8_to_bf16, block_size=self.fp8_block_size)
+        targets = super().checkpoint_quantizer(layer).targets
+        return VllmRequantizeQuantizer(
+            targets, dequantize, ["weight", "weight_scale_inv"]
         )
-        out_scale = torch.empty(
-            (num_experts, n, k // MXFP4_BLOCK_SIZE),
-            dtype=torch.uint8,
-            device=weight.device,
-        )
-        for e in range(num_experts):
-            bf16 = dequant_block_fp8_to_bf16(
-                weight[e], scale_inv[e], self.fp8_block_size
-            )
-            q, s = mxfp4_quantize(bf16)
-            out[e] = q.view(torch.uint8)
-            out_scale[e] = s.view(torch.uint8)
-        return out, out_scale
-
-    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
-            raise ValueError(
-                "VLLM_FP8_MOE_REQUANT=mxfp4 needs an MXFP4 MoE backend, and none "
-                "is available on this platform."
-            )
-        w13, w13_scale = self._requant(
-            layer.w13_weight.data, layer.w13_weight_scale_inv.data
-        )
-        w2, w2_scale = self._requant(
-            layer.w2_weight.data, layer.w2_weight_scale_inv.data
-        )
-        delattr(layer, "w13_weight_scale_inv")
-        delattr(layer, "w2_weight_scale_inv")
-        # Hand the MXFP4 tensors over under the names the kernel-format
-        # conversion expects (it replaces or deletes them per backend).
-        replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w2_weight", w2)
-        replace_parameter(layer, "w13_weight_scale", w13_scale)
-        replace_parameter(layer, "w2_weight_scale", w2_scale)
-        torch.accelerator.empty_cache()
-        layer.w13_input_scale = None
-        layer.w2_input_scale = None
-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, None, None)
-        layer._already_called_process_weights_after_loading = True

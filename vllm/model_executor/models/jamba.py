@@ -492,7 +492,7 @@ class JambaForSequenceClassification(JambaForCausalLM):
 
         # TODO: The original reward weights have float32 accuracy data, we
         # would like to load them in fp32 to get that extra precision.
-        # Currently weight_loader passes the weight which is already in bf16
+        # Currently the loader passes the weight which is already in bf16
         self.score = nn.Linear(
             config.hidden_size,
             num_labels,

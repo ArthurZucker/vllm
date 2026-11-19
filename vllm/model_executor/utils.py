@@ -54,20 +54,6 @@ def set_weight_attrs(
         return
     for key, value in weight_attrs.items():
         assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
-
-        # NOTE(woosuk): During weight loading, we often do something like:
-        # narrowed_tensor = param.data.narrow(0, offset, len)
-        # narrowed_tensor.copy_(real_weight)
-        # expecting narrowed_tensor and param.data to share the same storage.
-        # However, on TPUs, narrowed_tensor will lazily propagate to the base
-        # tensor, which is param.data, leading to the redundant memory usage.
-        # This sometimes causes OOM errors during model loading. To avoid this,
-        # we sync the param tensor after its weight loader is called.
-        # TODO(woosuk): Remove this hack once we have a better solution.
-        from vllm.platforms import current_platform
-
-        if current_platform.use_sync_weight_loader() and key == "weight_loader":
-            value = current_platform.make_synced_weight_loader(value)
         setattr(weight, key, value)
 
 
@@ -208,10 +194,8 @@ def replace_parameter(
 
     new_tensor_attrs = dict(new_tensor.__dict__)
 
-    # a `weight_loader` riding along on new_tensor is not ported over (nor its
-    # `BasevLLMParameter` backing field `_weight_loader`).
+    # a `weight_loader` riding along on new_tensor is not ported over
     new_tensor_attrs.pop("weight_loader", None)
-    new_tensor_attrs.pop("_weight_loader", None)
     # A checkpoint record belongs to the parameter it was recorded on (direct
     # reload); one on new_tensor (another checkpoint parameter) must not overwrite it.
     # Likewise the reload zero-fill flag: it is declared per parameter.

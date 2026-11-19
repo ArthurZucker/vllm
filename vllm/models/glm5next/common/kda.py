@@ -140,7 +140,8 @@ def _fused_qkv_conv1d(
         prefix=prefix,
     )
     conv1d.weight.data = conv1d.weight.data.unsqueeze(1)
-    delattr(conv1d.weight, "weight_loader")
+    # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+    conv1d.shard_ids = (0, 1, 2)
     set_weight_attrs(
         conv1d.weight,
         {"shard_dim": 0},

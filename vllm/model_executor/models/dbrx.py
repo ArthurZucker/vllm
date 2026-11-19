@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from itertools import islice
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -11,7 +10,6 @@ from transformers import DbrxConfig
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.attention import Attention
@@ -78,58 +76,6 @@ class DbrxExperts(RoutedExperts):
         self.d_model = config.d_model
         self.tp_size = self.moe_config.tp_size
         self.intermediate_size = self.config.ffn_config.ffn_hidden_size // self.tp_size
-
-    # Define custom weight loader for dbrx model
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int | None = None,
-        return_success: Any = False,
-    ) -> Any:
-        param_name = shard_id
-        tp_rank = get_tensor_model_parallel_rank()
-        param_data = param.data
-        shard_size = self.intermediate_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
-        # DBRX uses GLU for each experts.
-        # GLU has 3 linear layers: w1, v1 and w2.
-        if weight_name.endswith("w1"):
-            if param_name.endswith("weight"):
-                loaded_weight = torch.reshape(
-                    loaded_weight,
-                    [-1, self.intermediate_size * self.tp_size, self.d_model],
-                )
-                param_data[:, 0:shard_size, :] = loaded_weight[:, shard, :]
-            elif param_name.endswith("weight_scale"):
-                param_data[:, 0] = loaded_weight
-            else:
-                param_data = loaded_weight
-        if weight_name.endswith("v1"):
-            if param_name.endswith("weight"):
-                loaded_weight = torch.reshape(
-                    loaded_weight,
-                    [-1, self.intermediate_size * self.tp_size, self.d_model],
-                )
-                param_data[:, shard_size : 2 * shard_size, :] = loaded_weight[
-                    :, shard, :
-                ]
-            elif param_name.endswith("weight_scale"):
-                param_data[:, 1] = loaded_weight
-            else:
-                param_data[:] = loaded_weight
-        if weight_name.endswith("w2"):
-            if param_name.endswith("weight"):
-                loaded_weight = torch.reshape(
-                    loaded_weight,
-                    [-1, self.intermediate_size * self.tp_size, self.d_model],
-                ).transpose(1, 2)
-                param_data[:] = loaded_weight[:, :, shard]
-            else:
-                param_data[:] = loaded_weight
-        return True if return_success else None
 
 
 class DbrxMoE(nn.Module):
@@ -377,7 +323,6 @@ class DbrxModel(nn.Module):
         return hidden_states
 
 
-
 class DbrxForCausalLM(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -423,4 +368,3 @@ class DbrxForCausalLM(nn.Module, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-

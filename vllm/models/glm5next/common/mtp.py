@@ -320,8 +320,3 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         elif shared_weight:
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
-
-
-    def process_weights_after_loading(self) -> None:
-        for mlp in self.moe_mlp_layers:
-            mlp.finalize_mega_moe_weights()

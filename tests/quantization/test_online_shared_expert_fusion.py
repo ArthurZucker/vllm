@@ -339,19 +339,13 @@ def _unpadded_block(padded: torch.Tensor, expected: torch.Tensor) -> torch.Tenso
     return padded[:rows, :cols]
 
 
-@pytest.mark.parametrize(
-    "load_path", ["load_weights", "fused_gate_up", "weight_loader"]
-)
+@pytest.mark.parametrize("load_path", ["load_weights", "fused_gate_up"])
 def test_online_shared_expert_loads_bf16_weights_into_mxfp4_slot(
     default_vllm_config,
     single_rank_parallel_state,
     load_path: str,
 ) -> None:
-    """A BF16 shared expert is quantized while routed MXFP4 weights are loaded.
-
-    `weight_loader` covers DeepSeek-style model loaders, which bypass
-    `RoutedExperts.load_weights`.
-    """
+    """A BF16 shared expert is quantized while routed MXFP4 weights are loaded."""
     default_vllm_config.model_config = ModelConfig()
     hidden_size = intermediate_size = 64
     num_routed_experts = 2
@@ -407,17 +401,6 @@ def test_online_shared_expert_loads_bf16_weights_into_mxfp4_slot(
                 ("2.down_proj.weight", shared_down),
             ]
         list(layer.load_weights(weights))
-
-        if load_path == "weight_loader":
-            for stem, shard_id, weight in (
-                ("w13", "w1", shared_gate),
-                ("w13", "w3", shared_up),
-                ("w2", "w2", shared_down),
-            ):
-                param = getattr(layer, f"{stem}_weight")
-                param.weight_loader(
-                    param, weight, f"{layer.layer_name}.{stem}_weight", shard_id, 2
-                )
 
     expected_gate, expected_gate_scale = mxfp4_quantize(shared_gate)
     expected_up, expected_up_scale = mxfp4_quantize(shared_up)
@@ -989,25 +972,6 @@ def test_fse_online_quantization_routed_shared(
     assert _online_quantization_logs(caplog_vllm) == [
         f"Quantizing {len(quantized)} layers of types: " + "; ".join(quantized)
     ]
-
-    if fse_requested:
-        # The staged shared experts were quantized into their slots once.
-        with pytest.raises(NotImplementedError, match="Reloading fused shared"):
-            routed_experts.weight_loader(
-                routed_experts.w2_weight,
-                torch.zeros(1),
-                f"{routed_experts.layer_name}.w2_weight",
-                "w2",
-                routed_experts.moe_config.num_logical_experts,
-            )
-    if fse_requested and source_cls is None:
-        # Requantized routed experts parameters are replaced after processing, and
-        # are restored for reloads by the layerwise reload machinery only.
-        shared_prefix = routed_experts.moe_config.shared_expert_prefix
-        with pytest.raises(NotImplementedError, match="Reloading fused shared"):
-            model.load_weights(
-                [(f"{shared_prefix}.down_proj.weight", routed_experts.w2_weight[0])]
-            )
 
 
 def test_fse_online_quantization_bf16_routed_quantized_shared_raises(

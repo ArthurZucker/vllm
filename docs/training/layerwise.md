@@ -25,33 +25,18 @@ For more information on implementation, see [Low Level `layerwise` API](#low-lev
 
 ## Layerwise Loading with Online Quantization
 
-Online quantization refers to when a user provides full precision weights and those weights are quantized on-the-fly as they are loaded into the model. The layerwise reloading system handles this by treating online quantization as a **processing** step, which is then handled in an online way both during first-time load and during reload. A typical online quantization method implementation should look like this:
+Online quantization refers to when a user provides full precision weights and those weights are quantized on-the-fly as they are loaded into the model. It is an op of the loading plan, not a processing step: the method's `checkpoint_quantizer(layer)` returns a quantizer whose quantize op runs after the model's converter ops (e.g. the merged `qkv_proj`), and writes the quantized weight and its scales into the layer's params. A requantization (a quantized checkpoint to another format) also dequantizes each checkpoint tensor before those ops. Nothing is buffered on first load; a reload re-runs the same ops.
 
 ```python
-class Fp8PerTensorOnlineLinearMethod(LinearMethodBase):
-    """Online version of FP8 per-tensor quantization which loads a full
-    precision checkpoint and quantizes weights during loading."""
-
-    uses_meta_device: bool = True
-
+class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
     def create_weights(self, layer: torch.nn.Module, ...):
-        # weight is materialized and processed during loading
-        layer.weight = ModelWeightParameter(
-            data=torch.empty(..., device="meta"),
-            weight_loader=weight_loader,
-        )
+        # the quantized params, filled by the plan's quantize op
+        layer.weight = ModelWeightParameter(data=torch.empty(..., dtype=fp8), ...)
+        layer.weight_scale = torch.nn.Parameter(torch.empty(1), requires_grad=False)
 
-        # set up online processing
-        initialize_online_processing(layer)
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-
-        layer.weight, layer.weight_scale = ops.scaled_fp8_quant(layer.weight)
-
-        # Prevent duplicate processing (e.g., during weight reload)
-        layer._already_called_process_weights_after_loading = True
+    def checkpoint_quantizer(self, layer):
+        quantize = partial(self.quantize_weight, layer)  # weight -> (qweight, scale)
+        return VllmQuantizeQuantizer({"weight": (quantize, ["weight_scale"], True)})
 ```
 
 For RL weight updates, prefer [Direct Weight Reload](direct_reload.md)
@@ -107,12 +92,12 @@ llm.collective_rpc("reload_weights", kwargs={"weights_iterator": weights_iterato
 
 [layerwise.py](../../vllm/model_executor/model_loader/reload/layerwise.py) Implements the following functions to execute its lifecycle:
 
-| Function | Purpose | Quantized Reload | Online Quantization |
+| Function | Purpose | Reload | First load |
 | - | - | - | - |
 | `record_metadata_for_reloading` | Record tensor metadata so that layers can be restored on the meta device | Called by `BaseModelLoader` | Called by `BaseModelLoader` |
-| `restore_layer_on_meta` | Restore layer to model format at start of reload | Called by `initialize_layerwise_reload` | Not called. Online quantized weights already start on meta device via `...OnlineLinearMethod.create_weights` |
-| `initialize_online_processing` | Wrap weight loaders with the `online_process_loader` wrapper, which buffers weights until all layer weights have been loaded | Called by `initialize_layerwise_reload` | Called by `...OnlineLinearMethod.create_weights` |
-| `_layerwise_process` | Process layer once all weights are loaded | Called by `online_process_loader` during loading | Called by `online_process_loader` during loading |
+| `restore_layer_on_meta` | Restore layer to model format at start of reload | Called by `initialize_layerwise_reload` | Not called |
+| `reload_load_into` | The write `load_with_ops` uses while a reload is in progress: buffers a layer's writes until all its weights are loaded | Called by `load_with_ops` | Not called |
+| `_layerwise_process` | Process layer once all weights are loaded | Called by `reload_load_into` during loading | Not called |
 | `_copy_and_restore_kernel_tensors` | Copy processed weights into original tensor locations to affect compiled cuda graphs, etc. | Called by `_layerwise_process` after `process_weights_after_loading` | Not called. There is no compiled cuda graph yet |
 | `finalize_layerwise_processing` | Catch any layers which did not load all weights (for example attention weights or weights with padding) | Called by `BaseModelLoader` | Called by `BaseModelLoader` |
 

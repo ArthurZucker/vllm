@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,29 +36,6 @@ from ..ops.scatter_states import scatter_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
-
-
-def _make_fused_conv1d_weight_loader(
-    dims: list[int],
-    tp_size: int,
-    tp_rank: int,
-) -> Callable[..., None]:
-    sharded_dims = [dim // tp_size for dim in dims]
-
-    def weight_loader(
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: int,
-    ) -> None:
-        if loaded_weight.dim() == 2:
-            loaded_weight = loaded_weight.unsqueeze(1)
-        shard_size = sharded_dims[loaded_shard_id]
-        source_start = tp_rank * shard_size
-        target_start = sum(sharded_dims[:loaded_shard_id])
-        loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
-
-    return weight_loader
 
 
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -181,7 +157,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        delattr(self.conv1d.weight, "weight_loader")
+        # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+        self.conv1d.shard_ids = (0, 1, 2)
         set_weight_attrs(
             self.conv1d.weight,
             {"shard_dim": 0},

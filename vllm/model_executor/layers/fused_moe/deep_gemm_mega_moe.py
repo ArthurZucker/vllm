@@ -10,7 +10,7 @@ scales each token by its own FP32 scale.
 """
 
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from inspect import signature
 from typing import Any, ClassVar, Literal
@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
     prepare_megamoe_inputs,
     prepare_megamoe_nvfp4_inputs,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
     GroupShape,
@@ -37,7 +38,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4DynamicToken,
 )
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import is_weights_pre_processed, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 
@@ -250,21 +251,59 @@ def _matches_weight_spec(linear: nn.Module, spec: MegaMoEWeightSpec) -> bool:
     )
 
 
+def _kernel_rows(t: torch.Tensor, fused: bool, is_scale: bool = False) -> torch.Tensor:
+    """`[..., n, k]` checkpoint rows (gate rows then up rows when `fused`) in
+    the MegaMoE kernel's row order.
+
+    Fused weights interleave gate and up by 8 rows: shard row r goes to
+    `(r // 8) * 16 + 8 * half + r % 8`. Scales are in UTCCP order: row
+    `128b + 32j + i` goes to `128b + 4i + j`, after the interleave for fused
+    ones, where shard row `64b + 16j + 8q + m` goes to `128b + 64q + 32half +
+    4m + j`.
+    """
+    shape, (n, k) = t.shape, t.shape[-2:]
+    if not is_scale:
+        if not fused:
+            return t
+        return t.reshape(-1, 2, n // 16, 8, k).transpose(1, 2).reshape(shape)
+    if not fused:
+        return t.reshape(-1, n // 128, 4, 32, k).transpose(2, 3).reshape(shape)
+    t = t.reshape(-1, 2, n // 128, 4, 2, 8, k)
+    return t.permute(0, 2, 4, 1, 5, 3, 6).reshape(shape)
+
+
+class _MegaMoELayout(QuantizeMethodBase):
+    """Runs the layer's `prepare_weights` after a load or reload: layerwise
+    reload processes the reloaded checkpoint layout, then copies the result into
+    the kernel tensors."""
+
+    supports_pre_processed_weights = True
+
+    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
+        raise NotImplementedError("MegaMoE experts allocate weights at construction")
+
+    def apply(self, layer: nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("MegaMoE experts run through their forward")
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        layer.prepare_weights()
+
+
 class DeepGemmMegaMoEExperts(nn.Module):
     """Routed experts, and optionally the shared expert, as one MegaMoE launch.
 
-    Parameters are registered in the kernel layout and every checkpoint shard is
-    written straight into it, so loading (and reloading) needs no post-load
-    transform, except the SM90 requantization of a fused FP8 shared expert.
+    Weights load in the checkpoint layout (`conversion_mapping`: experts merged
+    into this rank's slots, gate rows then up rows, block scales one byte each)
+    and `prepare_weights`, run by the loader after loading (`quant_method`),
+    lays them out for the kernel in place.
     Whether the shared expert runs inside the launch is decided here, before
     any weight loads; a fused layer owns the shared-expert weights and the
     caller drops its shared MLP.
 
     NVFP4 experts also take per-expert `weight_scale_2` (`w1` and `w3`
     must match: one L1 scale per expert) and `w2` `input_scale`; the kernel
-    quantizes every L2 input with the max of the latter over all loaded
-    experts. Dispatch uses per-token scales, so `w1`/`w3` `input_scale`
-    are not loaded.
+    quantizes every L2 input with the max of the latter over all experts.
+    Dispatch uses per-token scales, so `w1`/`w3` `input_scale` are not loaded.
 
     Args:
         num_experts: Physical experts across EP ranks, redundant included.
@@ -346,25 +385,21 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.l2_input_scale = l2_input_scale
         self._kernel_kwargs = activation.kernel_kwargs()
         self.eplb_state = EplbLayerState()
-        # L2 input scale of every logical expert; the NVFP4 kernel takes the max.
-        self._w2_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
+        self.quant_method = _MegaMoELayout()
+        # The NVFP4 kernel's L2 input scale, set after loading.
         self.l2_activation_scale = 1.0
-        # The first of each expert's w1/w3 weight_scale_2 until the other loads.
-        self._pending_l1_scales: dict[int, tuple[str, float]] = {}
-        # Shared-expert shards whose weight / scale loaded since the last SM90
-        # requantization.
-        self._new_shared_weights: set[str] = set()
-        self._new_shared_scales: set[str] = set()
 
         self.num_shared_experts, self.shared_spec = self._fusable_shared_experts(
             shared_experts
         )
         self._create_weights()
+        # Loaded as their bytes; the routed ones by expert, this rank's only.
         for name, param in self.named_parameters(recurse=False):
-            shared = name.startswith("shared_")
-            loader = self.shared_weight_loader if shared else self.weight_loader
-            set_weight_attrs(param, {"weight_loader": loader})
-            if not shared and name.endswith("weight_scale"):
+            attrs: dict[str, Any] = {"keeps_sent_dtype": (param.dtype,)}
+            if not name.startswith("shared_"):
+                attrs["expert_dim"] = 0
+            set_weight_attrs(param, attrs)
+            if "expert_dim" in attrs and name.endswith("weight_scale"):
                 param.quant_method = "block"
 
         # Register in the static forward context so the custom-op wrapper
@@ -451,7 +486,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
         } <= api and (spec.scale_group_k is None or hasattr(deep_gemm, block_m_api))
 
     def _create_weights(self) -> None:
-        """Register the routed and fused shared-expert parameters.
+        """Register the routed and fused shared-expert parameters, in the
+        checkpoint layout until `prepare_weights`.
 
         Routed parameters are indexed by local expert on dim 0, which EPLB moves.
         """
@@ -485,10 +521,12 @@ class DeepGemmMegaMoEExperts(nn.Module):
             torch.zeros(*outer, n, k // spec.values_per_element, dtype=spec.dtype),
         )
         if spec.scale_group_k is not None:
-            # Block scales, MN-major, four per int32 along K.
-            scale_k = k // (4 * spec.scale_group_k)
-            scale = torch.zeros(*outer, scale_k, n, dtype=torch.int32)
-            register(f"{name}_weight_scale", scale.transpose(-1, -2))
+            # One byte per block; the kernel's packs four per int32, MN-major.
+            scale_k = k // spec.scale_group_k
+            register(
+                f"{name}_weight_scale",
+                torch.zeros(*outer, n, scale_k, dtype=torch.uint8),
+            )
 
     def _kernel_weights(
         self, name: str
@@ -505,233 +543,90 @@ class DeepGemmMegaMoEExperts(nn.Module):
     def l2_weights(self) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self._kernel_weights("w2")
 
-    def _map_global_expert_id(self, expert_id: int) -> list[int]:
-        """Local slots that logical expert `expert_id` occupies on this rank."""
-        physical_ids: list[int] = []
-        for p in range(self.experts_start_idx, self.experts_end_idx):
-            if p % self.num_logical_experts == expert_id:
-                physical_ids.append(p - self.experts_start_idx)
-        return physical_ids
+    @property
+    def local_logical_experts(self) -> list[int]:
+        """The logical expert each local slot holds (EPLB's redundant slots
+        repeat one)."""
+        return [
+            p % self.num_logical_experts
+            for p in range(self.experts_start_idx, self.experts_end_idx)
+        ]
 
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> bool | None:
-        if not loaded_weight.is_meta:
-            self._record_global_scale(weight_name, loaded_weight, shard_id, expert_id)
-        local_expert_ids = self._map_global_expert_id(expert_id)
-        param_prefix = "w2_" if shard_id == "w2" else "w13_"
-        if not local_expert_ids or param_prefix not in weight_name:
-            return False if return_success else None
-        is_global_scale = weight_name.endswith(("weight_scale_2", "input_scale"))
-        is_scale = weight_name.endswith("weight_scale")
-        if self.weight_format == MEGA_MOE_MXFP4_SM90 and not param.is_meta:
-            try:
-                loaded_weight = self._sm90_fp4_shard(
-                    loaded_weight.to(param.device), is_scale
-                )
-            except AssertionError as e:
-                raise ValueError(
-                    f"MegaMoE MXFP4 expert {expert_id} {shard_id} ({weight_name}) "
-                    f"cannot run on SM90: {e}"
-                ) from e
-        for local_expert_id in local_expert_ids:
-            if is_global_scale:
-                param.data[local_expert_id].copy_(loaded_weight.reshape(()))
-            else:
-                self._load_weight(
-                    param.data[local_expert_id], loaded_weight, shard_id, is_scale
-                )
-        return True if return_success else None
-
-    def _record_global_scale(
-        self, weight_name: str, scale: torch.Tensor, shard_id: str, expert_id: int
-    ) -> None:
-        """Track NVFP4 global scales the kernel takes one of per launch or expert.
-
-        Every rank sees the scales of all experts, so ranks agree and EPLB can
-        move experts.
-        """
-        if weight_name.endswith("w2_input_scale"):
-            self._w2_input_scales[expert_id] = scale.max()
-            self.l2_activation_scale = float(self._w2_input_scales.max()) or 1.0
-        elif weight_name.endswith("w13_weight_scale_2"):
-            # Compare w1 and w3 of the same load, not the live (maybe stale) slot.
-            prev = self._pending_l1_scales.pop(expert_id, None)
-            value = float(scale)
-            if prev is None or prev[0] == shard_id:
-                self._pending_l1_scales[expert_id] = (shard_id, value)
-            elif not math.isclose(value, prev[1], rel_tol=1e-5):
-                raise ValueError(
-                    f"MegaMoE NVFP4 expert {expert_id}: {prev[0]} weight_scale_2 "
-                    f"{prev[1]} != {shard_id} weight_scale_2 {value}; the kernel "
-                    "takes one L1 scale per expert."
-                )
-
-    # Fused checkpoint tensors, [num_experts, ...] with gate rows before up rows.
-    _FUSED_EXPERT_SHARDS: ClassVar[dict[str, tuple[str, ...]]] = {
-        "gate_up_proj": ("w1", "w3"),
-        "w13": ("w1", "w3"),
-        "down_proj": ("w2",),
-        "w2": ("w2",),
-    }
-
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        """Load per-expert `{e}.{w1,w2,w3}.*`, fused `gate_up_proj`/`down_proj`
-        (or `w13`/`w2`) and `shared_experts.*` tensors."""
-        for name, weight in weights:
-            if name.startswith("shared_experts."):
-                yield from self._load_shared_expert_weights(name, weight)
-                continue
-            for expert_id, shard_id, suffix, shard in self._expert_shards(name, weight):
-                suffix, shard = self._checkpoint_tensor(suffix, shard_id, shard)
-                param_name = f"{'w2' if shard_id == 'w2' else 'w13'}_{suffix}"
-                if (param := getattr(self, param_name, None)) is None:
-                    continue
-                param.weight_loader(
-                    param, shard, param_name, shard_id=shard_id, expert_id=expert_id
-                )
-                yield param_name
-
-    def _expert_shards(
-        self, name: str, weight: torch.Tensor
-    ) -> Iterable[tuple[int, str, str, torch.Tensor]]:
-        """`(expert_id, shard_id, param suffix, tensor)` per shard in `weight`."""
-        head, _, rest = name.partition(".")
-        if head.isdigit():
-            shard_id, _, suffix = rest.partition(".")
-            yield int(head), shard_id, suffix, weight
-            return
-        if (shard_ids := self._FUSED_EXPERT_SHARDS.get(head)) is None:
-            raise ValueError(f"Unexpected MegaMoE expert tensor: {name}")
-        n = len(shard_ids)
-        for expert_id, tensor in enumerate(weight):
-            # Gate and up share a scalar global scale.
-            shards = (tensor,) * n if tensor.numel() == 1 else tensor.chunk(n)
-            for shard_id, shard in zip(shard_ids, shards):
-                yield expert_id, shard_id, rest or "weight", shard
-
-    def _checkpoint_tensor(
-        self, suffix: str, shard_id: str, tensor: torch.Tensor
-    ) -> tuple[str, torch.Tensor]:
-        """Map compressed-tensors suffixes and quantization scales to the
-        ModelOpt names and dequantization scales the parameters hold."""
-        if suffix == "weight_packed":
-            return "weight", tensor
-        if suffix == "weight_global_scale":
-            return "weight_scale_2", 1.0 / tensor.float()
-        if suffix == "input_global_scale":
-            suffix, tensor = "input_scale", 1.0 / tensor.float()
-        fixed = self.l2_input_scale
-        if suffix == "input_scale" and shard_id == "w2" and fixed is not None:
-            tensor = torch.full_like(tensor, fixed, dtype=torch.float32)
-        return suffix, tensor
-
-    def _load_shared_expert_weights(
-        self, name: str, weight: torch.Tensor
-    ) -> Iterable[str]:
-        if ".gate_up_proj." not in name:
-            yield self.load_shared_expert_weight(name, weight).removeprefix("experts.")
-            return
-        for shard_id, shard in zip(("w1", "w3"), weight.chunk(2)):
-            shard_name = name.replace(".gate_up_proj.", f".{shard_id}.")
-            yield from self._load_shared_expert_weights(shard_name, shard)
-
-    def load_shared_expert_weight(self, name: str, loaded_weight: torch.Tensor) -> str:
-        """Load one shared-expert checkpoint tensor; return the parameter name."""
-        if ".w2." in name or ".down_proj." in name:
-            param_name = "shared_l2_weight"
-        elif ".w1." in name or ".w3." in name:
-            param_name = "shared_l1_weight"
-        else:
-            raise ValueError(f"Unexpected shared-expert tensor: {name}")
-        if "weight_scale" in name:
-            param_name += "_scale"
-        param = getattr(self, param_name)
-        param.weight_loader(param, loaded_weight, name)
-        return f"{name.partition('shared_experts.')[0]}experts.{param_name}"
-
-    def shared_weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str
-    ) -> None:
-        shard_id = (
-            "w1" if ".w1." in weight_name else "w3" if ".w3." in weight_name else "w2"
-        )
-        is_scale = "weight_scale" in weight_name
-        self._load_weight(param.data, loaded_weight, shard_id, is_scale)
-        if self.weight_format == MEGA_MOE_MXFP4_SM90 and not loaded_weight.is_meta:
-            new = self._new_shared_scales if is_scale else self._new_shared_weights
-            new.add(shard_id)
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        """The first local slot of logical expert `expert_id`, -1 if none: the
+        loader reads this rank's experts only."""
+        slots = self.local_logical_experts
+        return slots.index(expert_id) if expert_id in slots else -1
 
     @torch.no_grad()
-    def process_weights_after_loading(self) -> None:
-        """Requantize newly loaded shared-expert shards to SM90 scales.
+    def prepare_weights(self) -> None:
+        """Lay the weights, loaded in the checkpoint layout, out for the kernel
+        in place; set the NVFP4 L2 input scale.
 
-        Requantization is row-local and leaves requantized rows unchanged, so a
-        reloaded shard is exact when both its weight and scale arrived.
-
-        Raises:
-            ValueError: If a shard's weight or scale loaded without the other.
-
+        The routed and shared-expert weights get gate and up rows interleaved
+        and their scales packed four per int32 in UTCCP row order, MN-major
+        (`_kernel_rows`). SM90 FP4 experts are relaid out first, a fused FP8
+        shared expert is requantized to SM90 scales after.
         """
-        weights, scales = self._new_shared_weights, self._new_shared_scales
-        if weights != scales:
-            raise ValueError(
-                f"{self.prefix}: shared-expert shards {sorted(weights ^ scales)} "
-                "loaded without their weight or weight_scale; the SM90 "
-                "requantization needs both."
-            )
-        from vllm.utils.deep_gemm import requantize_fp8_weights_for_sm90_mega_moe
+        if self.weight_format.routed.has_global_scale:
+            self._set_l2_activation_scale()
+        if is_weights_pre_processed():
+            return
+        for name in ("w13", "w2", "shared_l1", "shared_l2"):
+            if hasattr(self, f"{name}_weight"):
+                self._to_kernel_layout(name)
+        if self.has_fused_shared_experts and self.weight_format == MEGA_MOE_MXFP4_SM90:
+            from vllm.utils.deep_gemm import requantize_fp8_weights_for_sm90_mega_moe
 
-        for name in {"shared_l2" if s == "w2" else "shared_l1" for s in weights}:
-            weight, scale = self._kernel_weights(name)
-            requantized = requantize_fp8_weights_for_sm90_mega_moe(
-                (weight.data, scale.data), is_sf_transposed_for_utccp=True
-            )
-            for param, data in zip((weight, scale), requantized):
-                param.data.copy_(data)
-        weights.clear()
-        scales.clear()
-
-    def _load_weight(
-        self,
-        dst: torch.Tensor,
-        src: torch.Tensor,
-        shard_id: str,
-        is_scale: bool,
-    ) -> None:
-        """Write checkpoint shard `src` into `dst` in the kernel layout.
-
-        `dst` is one routed expert's slice or a shared-expert parameter.
-        """
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(f"Unsupported expert shard id: {shard_id}")
-        rows = dst.shape[0] // (1 if shard_id == "w2" else 2)
-        if is_scale:
-            src = self._pack_scale(src, rows, dst.shape[1] * 4)
-        else:
-            src = src.view(dst.dtype)
-            if tuple(src.shape) != (rows, dst.shape[1]):
-                raise ValueError(
-                    f"MegaMoE {shard_id} weight shape {tuple(src.shape)} does not "
-                    f"match the kernel shard ({rows}, {dst.shape[1]})"
+            for name in ("shared_l1", "shared_l2"):
+                weight, scale = self._kernel_weights(name)
+                requantized = requantize_fp8_weights_for_sm90_mega_moe(
+                    (weight.data, scale.data), is_sf_transposed_for_utccp=True
                 )
-        dst, src = self._kernel_layout_shard(dst, src, shard_id, is_scale)
-        dst.copy_(src)
+                for param, data in zip((weight, scale), requantized):
+                    param.data.copy_(data)
 
-    @staticmethod
-    def _sm90_fp4_shard(src: torch.Tensor, is_scale: bool) -> torch.Tensor:
-        """Repack a routed FP4 shard for the SM90 kernel's dequantization.
+    def _set_l2_activation_scale(self) -> None:
+        """The scale the kernel quantizes every L2 input with: `l2_input_scale`,
+        else the max `w2` `input_scale` over every expert (all EP ranks), so
+        ranks agree and EPLB can move experts."""
+        if self.l2_input_scale is not None:
+            self.l2_activation_scale = self.l2_input_scale
+            return
+        scale = self.w2_input_scale.data.max().float()
+        ep_group = get_ep_group()
+        if ep_group.world_size > 1:
+            torch.distributed.all_reduce(
+                scale, op=torch.distributed.ReduceOp.MAX, group=ep_group.device_group
+            )
+        self.l2_activation_scale = float(scale) or 1.0
+
+    def _to_kernel_layout(self, name: str) -> None:
+        fused = name in ("w13", "shared_l1")
+        weight = getattr(self, f"{name}_weight")
+        scale = getattr(self, f"{name}_weight_scale", None)
+        # Four block scales per int32 along K.
+        sf = None if scale is None else scale.data.view(torch.int32)
+        if self.weight_format == MEGA_MOE_MXFP4_SM90 and name in ("w13", "w2"):
+            assert sf is not None
+            self._relayout_sm90_fp4(weight.data, sf, fused)
+        if fused:
+            weight.data.copy_(_kernel_rows(weight.data, fused))
+        if scale is not None and sf is not None:
+            rows = _kernel_rows(sf, fused, is_scale=True)
+            # MN-major, on the scale's own storage.
+            *outer, n, k = sf.shape
+            scale.data = sf.view(*outer, k, n).transpose(-1, -2)
+            scale.data.copy_(rows)
+
+    def _relayout_sm90_fp4(
+        self, weight: torch.Tensor, sf: torch.Tensor, fused: bool
+    ) -> None:
+        """Repack each routed FP4 checkpoint shard, in place, for the SM90
+        kernel's dequantization.
 
         Raises:
-            AssertionError: If a row's UE8M0 scales are out of the kernel's range.
+            ValueError: If a row's UE8M0 scales are out of the kernel's range.
 
         """
         from vllm.utils.deep_gemm import (
@@ -739,46 +634,17 @@ class DeepGemmMegaMoEExperts(nn.Module):
             transform_fp4_sf_for_sm90_mega_moe,
         )
 
-        if is_scale:
-            # The codes load in a separate call, so rows wider than the kernel
-            # range cannot be clamped here and fail the load.
-            sf = src.view(torch.uint8).contiguous().view(torch.int32)
-            return transform_fp4_sf_for_sm90_mega_moe(sf)
-        return relayout_fp4_weights_for_sm90_mega_moe(src.view(torch.int8))
-
-    @staticmethod
-    def _pack_scale(sf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-        """Expand block scales to the kernel granularity, four per int32 along K."""
-        sf = sf.view(torch.uint8)
-        if rows % sf.shape[0] or cols % sf.shape[1]:
-            raise ValueError(
-                f"Scale shape {tuple(sf.shape)} does not tile ({rows}, {cols})"
-            )
-        sf = sf.repeat_interleave(rows // sf.shape[0], 0)
-        sf = sf.repeat_interleave(cols // sf.shape[1], 1)
-        return sf.contiguous().clone().view(torch.int32)
-
-    @staticmethod
-    def _kernel_layout_shard(
-        dst: torch.Tensor,
-        src: torch.Tensor,
-        shard_id: str,
-        is_scale: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pair a checkpoint shard with its destination in the MegaMoE layout."""
-        k = src.shape[-1]
-        if shard_id == "w2":
-            if not is_scale:
-                return dst, src
-            # UTCCP: scale row 128*b + 32*j + i -> 128*b + 4*i + j.
-            return dst.view(-1, 32, 4, k).transpose(1, 2), src.reshape(-1, 4, 32, k)
-        half = 0 if shard_id == "w1" else 1
-        if not is_scale:
-            # Interleave gate/up by 8 rows: r -> (r // 8) * 16 + 8 * half + r % 8.
-            return dst.view(-1, 2, 8, k)[:, half], src.reshape(-1, 8, k)
-        # Interleave + UTCCP: 64b + 16j + 8q + m -> 128b + 64q + 32half + 4m + j.
-        dst = dst.view(-1, 2, 2, 8, 4, k)[:, :, half].permute(0, 3, 1, 2, 4)
-        return dst, src.reshape(-1, 4, 2, 8, k)
+        shards = 2 if fused else 1
+        for slot, (w, s) in enumerate(zip(weight, sf)):
+            for w_shard, s_shard in zip(w.chunk(shards), s.chunk(shards)):
+                try:
+                    s_shard.copy_(transform_fp4_sf_for_sm90_mega_moe(s_shard))
+                except AssertionError as e:
+                    raise ValueError(
+                        f"{self.prefix}: MegaMoE MXFP4 expert slot {slot} cannot "
+                        f"run on SM90: {e}"
+                    ) from e
+                w_shard.copy_(relayout_fp4_weights_for_sm90_mega_moe(w_shard))
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -1036,6 +902,3 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if shared_experts is not None:
             y += shared_experts(hidden_states)
         return y
-
-
-DeepGemmMegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]

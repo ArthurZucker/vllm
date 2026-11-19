@@ -303,35 +303,31 @@ def copy_into(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
 # `load_into(name, param, value)`: writes one final value into its param
 LoadInto = Callable[[str, torch.Tensor, torch.Tensor], None]
 
-# writers installed around `load_with_ops` calls made by others (a model's own
-# `load_weights`): the last one installed writes (layerwise reload, an engine's)
-_INSTALLED: list[LoadInto] = []
+# writers of the `load_with_ops` calls made by others (a model's own `load_weights`)
+# in a `loading_into` block: the innermost writes
+_LOADING_INTO: list[LoadInto] = []
 
 
 def current_load_into() -> LoadInto:
-    """The write `load_with_ops` uses when not given one: the last installed"""
-    return _INSTALLED[-1] if _INSTALLED else copy_into
+    """The write `load_with_ops` uses when not given one: the innermost
+    `loading_into`'s, else a layerwise reload's while one is in progress, else
+    `copy_into`"""
+    if _LOADING_INTO:
+        return _LOADING_INTO[-1]
+    from vllm.model_executor.model_loader.reload import layerwise
 
-
-def install_load_into(load_into: LoadInto) -> None:
-    """Route the writes of later `load_with_ops` calls through `load_into` (once)"""
-    if load_into not in _INSTALLED:
-        _INSTALLED.append(load_into)
-
-
-def uninstall_load_into(load_into: LoadInto) -> None:
-    if load_into in _INSTALLED:
-        _INSTALLED.remove(load_into)
+    return layerwise.reload_load_into if layerwise.reloading() else copy_into
 
 
 @contextmanager
 def loading_into(load_into: LoadInto):
-    """`install_load_into` for the duration of a block"""
-    install_load_into(load_into)
+    """Route the writes of the `load_with_ops` calls in this block through
+    `load_into`"""
+    _LOADING_INTO.append(load_into)
     try:
         yield
     finally:
-        uninstall_load_into(load_into)
+        _LOADING_INTO.pop()
 
 
 def _padded_converters(model: nn.Module) -> list[WeightConverter]:
@@ -354,7 +350,10 @@ def load_weights(
         return custom(weights)  # the Transformers backend: its own conversions first
     from vllm.model_executor.models.transformers.conversion import checkpoint_plan
 
-    return load_with_ops(model, weights, hf_quantizer=checkpoint_plan(model))
+    conversions, plan = get_conversion_mapping(model), checkpoint_plan(model)
+    if plan is not None:  # e.g. a dequantization reads the scales along
+        conversions = plan.update_weight_conversions(conversions, model)
+    return load_with_ops(model, weights, conversions, plan)
 
 
 def load_with_ops(
@@ -367,7 +366,7 @@ def load_with_ops(
     """Load `weights` (tensors, or lazy safetensors slices: then each rank reads its
     bytes only) into `model` with `conversions` (default: the model's entries in
     `conversion_mapping`). Each final value is written by `load_into(name, param,
-    value)` (default: the installed one, else `copy_into`). Returns the params
+    value)` (default: `current_load_into()`). Returns the params
     loaded."""
     # functions of the whole stream, run first: a model's (Jina v5's task LoRA merged,
     # MiniMax M3's ROCm redirect), then the quant config's (pair scales, repack)

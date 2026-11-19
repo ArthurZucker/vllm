@@ -147,6 +147,9 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         self.v_sconv = InklingShortConv(
             kv_conv_dim, config.sconv_kernel_size, owner=conv_owner, stream_idx=_V
         )
+        # a kv head's channels shared by `r` ranks, like qkvr's k/v
+        self.k_sconv.weight.shard_replicas = r
+        self.v_sconv.weight.shard_replicas = r
 
         # FA4 left/right window; right=0 keeps it causal. local_extent-1 mirrors
         # the source (sliding_window_size - 1).

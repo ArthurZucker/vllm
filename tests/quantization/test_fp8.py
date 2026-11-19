@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
 )
+from vllm.model_executor.model_loader.ops_loader import copy_into
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 
@@ -790,23 +791,18 @@ def test_fp8_reloading(
 
     # capture weights format during loading
     original_metadata = [
-        (name, param.shape, getattr(param, "weight_loader", default_weight_loader))
-        for name, param in layer.named_parameters()
+        (name, param.shape) for name, param in layer.named_parameters()
     ]
 
     # test loading
-    for name, shape, _ in original_metadata:
-        param = getattr(layer, name)
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, torch.zeros(shape))  # cannot use empty
+    for name, shape in original_metadata:
+        copy_into(name, getattr(layer, name), torch.zeros(shape))  # cannot use empty
 
     method.process_weights_after_loading(layer)
 
     # test reloading works after loading
-    for name, shape, _ in original_metadata:
-        param = getattr(layer, name)
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, torch.zeros(shape))  # cannot use empty
+    for name, shape in original_metadata:
+        copy_into(name, getattr(layer, name), torch.zeros(shape))  # cannot use empty
 
     method.process_weights_after_loading(layer)
 
@@ -823,8 +819,8 @@ def test_kv_cache_scale_sync_to_host_copies():
     method.create_weights(layer)
     # 0.3 stays != 1.0 even after the fp8_fnuz x2 rescale.
     checkpoint_scale = torch.tensor(0.3, dtype=torch.float32)
-    layer.k_scale.weight_loader(layer.k_scale, checkpoint_scale)
-    layer.v_scale.weight_loader(layer.v_scale, checkpoint_scale)
+    copy_into("k_scale", layer.k_scale, checkpoint_scale)
+    copy_into("v_scale", layer.v_scale, checkpoint_scale)
     method.process_weights_after_loading(layer)
 
     assert layer._k_scale_float != 1.0

@@ -130,7 +130,8 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        delattr(self.conv1d.weight, "weight_loader")
+        # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+        self.conv1d.shard_ids = (0, 1, 2)
         set_weight_attrs(
             self.conv1d.weight,
             {"shard_dim": 0},
@@ -505,27 +506,6 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-
-
-def _make_fused_conv1d_weight_loader(dims, tp_size, tp_rank):
-    """Weight loader for loading separate HF conv weights into a fused conv1d.
-
-    dims: list of original (un-sharded) dims per section,
-          e.g. [key_dim, key_dim, value_dim]
-    """
-    sharded_dims = [d // tp_size for d in dims]
-
-    def weight_loader(param, loaded_weight, loaded_shard_id=None):
-        if loaded_weight.dim() == 2:
-            loaded_weight = loaded_weight.unsqueeze(1)
-        dim = dims[loaded_shard_id]
-        shard_size = dim // tp_size
-        tp_start = tp_rank * shard_size
-        sharded_weight = loaded_weight[tp_start : tp_start + shard_size]
-        offset = sum(sharded_dims[:loaded_shard_id])
-        param.data[offset : offset + shard_size].copy_(sharded_weight)
-
-    return weight_loader
 
 
 @eager_break_during_capture

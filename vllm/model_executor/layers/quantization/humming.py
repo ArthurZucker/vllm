@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
+from functools import partial
 from math import gcd
 from typing import TYPE_CHECKING, Any
 
@@ -47,7 +47,6 @@ from vllm.model_executor.layers.quantization.utils.humming.linear import (
     kernel_parameters,
     replace_layer_parameters,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -158,8 +157,7 @@ class HummingLoadedWeight(ConversionOps):
     """A checkpoint tensor in its Humming schema's layout
     (`process_loaded_weight`, e.g. BitNet's 2-bit repack). Whole, on each
     source (one expert, one of q / k / v): sharded after. A full precision `weight`
-    stays as it is, for the param's loader (online quantization, or a layer the
-    checkpoint left unquantized)"""
+    stays as it is"""
 
     needs_full = True
 
@@ -425,73 +423,35 @@ class HummingLinearMethod(LinearMethodBase):
         self.force_input_schema = quant_config.force_input_schema
         self.is_online_quant = self.quant_config.is_online_quant
 
-    def prepare_weight_loader(self, layer: torch.nn.Module, weight_loader: Callable):
-        """A full precision `weight`: quantized online, or the layer falls back to
-        unquantized. Not a tensor transform: it fills other params / swaps the
-        method, so it stays the param's loader"""
-
-        def new_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            shard_id: str | int | None = None,
-        ):
-            name = param.param_name
-            float_dtypes = [torch.float16, torch.bfloat16, torch.float32]
-            is_unquantized = name == "weight" and loaded_weight.dtype in float_dtypes
-            if is_unquantized and self.is_online_quant:
-                # online quant (fp16/bf16 -> quant_type)
-                assert isinstance(self.weight_schema, _hm.HummingWeightSchema)
-                tensors = self.weight_schema.quant_tensor(
-                    loaded_weight.to(param.device),
-                    self.weight_schema,
-                    layer.param_dtype,
-                )
-
-                for key, tensor in tensors.items():
-                    if tensor is None or tensor.nelement() == 0:
-                        continue
-                    param = getattr(layer, key)
-                    param.weight_loader(param, tensor, shard_id)
-
-                return None
-            elif is_unquantized and not self.is_online_quant:
-                # fallback to unquantized linear
-                # some model skip some layer when quantizing model, but
-                # don't mark the layer as unquantized.
-                if not layer.is_fallback:
-                    layer.is_fallback = True
-                    for name, _ in list(layer.named_parameters()):
-                        if name != "bias":
-                            delattr(layer, name)
-                    self.__class__ = UnquantizedLinearMethod  # type: ignore
-                    tensor = torch.empty(
-                        (
-                            layer.output_partition_sizes_sum,
-                            layer.input_size_per_partition,
-                        ),
-                        dtype=layer.param_dtype,
-                        device=param.device,
-                    )
-                    extra_weight_attrs = layer.extra_weight_attrs.copy()
-                    layer.weight = ModelWeightParameter(
-                        data=tensor,
-                        input_dim=1,
-                        output_dim=0,
-                    )
-                    layer.weight.tp_size = layer.tp_size
-                    layer.weight.tp_rank = layer.tp_rank
-                    set_weight_attrs(layer.weight, extra_weight_attrs)
-
-                param = layer.weight
-            # quantized: already in the schema's layout (`HummingLoadedWeight`)
-            if shard_id is not None:
-                return weight_loader(param, loaded_weight, shard_id)
-            return weight_loader(param, loaded_weight)
-
-        return new_weight_loader
-
     def checkpoint_quantizer(self, layer: torch.nn.Module):
+        if self.is_online_quant:  # a full precision checkpoint
+            from vllm.model_executor.models.transformers.conversion import (
+                VllmQuantizeQuantizer,
+            )
+
+            quantize = partial(self.quantize_weight, layer)
+            return VllmQuantizeQuantizer({"weight": (quantize, [], True)})
         return _loaded_weight_quantizer(self.weight_schema, layer)
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """The layer's params (`{name: tensor}`) of its full precision `weight`
+        (this rank's), each of its shards (q / k / v) quantized on its own"""
+        schema = self.weight_schema
+        assert isinstance(schema, _hm.HummingWeightSchema)
+        shards = [
+            schema.quant_tensor(w, schema, layer.param_dtype)
+            for w in weight.split(layer.output_partition_sizes)
+        ]
+        return {
+            name: torch.cat(
+                [torch.atleast_1d(s[name]) for s in shards],
+                getattr(getattr(layer, name), "output_dim", 0),
+            )
+            for name, tensor in shards[0].items()
+            if tensor is not None and tensor.nelement() > 0
+        }
 
     def create_weights(
         self,
@@ -503,14 +463,12 @@ class HummingLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer.is_fallback = False
         layer.param_dtype = params_dtype
         layer.input_size = input_size
         layer.output_size = output_size
         layer.input_size_per_partition = input_size_per_partition
         layer.output_partition_sizes_sum = sum(output_partition_sizes)
         layer.output_partition_sizes = output_partition_sizes
-        layer.extra_weight_attrs = extra_weight_attrs.copy()
 
         input_schema = self.force_input_schema or self.input_schema
         input_schema = input_schema.to_humming_schema(params_dtype)
@@ -523,10 +481,6 @@ class HummingLinearMethod(LinearMethodBase):
                     shape_k=input_size_per_partition,
                 )
                 setattr(self, name, schema)
-
-        extra_weight_attrs["weight_loader"] = self.prepare_weight_loader(
-            layer, default_weight_loader
-        )
 
         for key in ["weight_block_size", "block_structure"]:
             block_size = getattr(self.weight_schema, key, None)
@@ -563,9 +517,6 @@ class HummingLinearMethod(LinearMethodBase):
             layer.weight = param
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if layer.is_fallback:
-            return None
-
         # convert from checkpoint format to humming format
         is_humming_weight = isinstance(self.weight_schema, _hm.HummingWeightSchema)
         is_humming_input = isinstance(self.input_schema, _hm.HummingInputSchema)

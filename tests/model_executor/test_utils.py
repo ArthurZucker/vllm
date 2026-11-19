@@ -203,10 +203,6 @@ def test_replace_parameter_weight_loader_comes_from_old_parameter() -> None:
     the old parameter's loader is authoritative. A loader riding along on the
     replacement tensor must neither shadow it nor trip the overwrite assertion
     in `set_weight_attrs`, and the other attributes must still be carried over.
-
-    `_weight_loader` is excluded for the same reason: it is the backing field
-    of `BasevLLMParameter.weight_loader`, so leaving it in would smuggle a
-    stale loader past the `weight_loader` exclusion.
     """
     calls: list[str] = []
 
@@ -223,7 +219,6 @@ def test_replace_parameter_weight_loader_comes_from_old_parameter() -> None:
 
     new_data = torch.ones(4, 4)
     new_data.weight_loader = stale_weight_loader
-    new_data._weight_loader = stale_weight_loader
     new_data.is_shuffled = True
 
     replace_parameter(layer, "weight", new_data)
@@ -231,7 +226,6 @@ def test_replace_parameter_weight_loader_comes_from_old_parameter() -> None:
     layer.weight.weight_loader(layer.weight, torch.full((4, 4), 2.0))
 
     assert calls == ["old"]
-    assert not hasattr(layer.weight, "_weight_loader")
     assert layer.weight.is_shuffled is True
 
 

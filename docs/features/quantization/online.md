@@ -157,6 +157,11 @@ vLLM uses the checkpoint method to load and dequantize the checkpoint weight, an
 method to implement weight dequantization, unsupported source and target
 combinations raise an error.
 
+Block-FP8 routed experts re-quantized to MXFP4 (`VLLM_FP8_MOE_REQUANT=mxfp4`, ROCm)
+are requantized by the loading plan instead: each checkpoint expert is dequantized
+to bf16 as it loads, before the experts merge, and the merged experts are quantized
+to MXFP4 after, so no FP8 expert stays resident.
+
 Currently supported combinations are:
 
 | Checkpoint layer | Online target | Requirements |

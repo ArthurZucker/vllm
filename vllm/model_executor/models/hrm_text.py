@@ -152,9 +152,9 @@ class HrmTextAttention(nn.Module):
         bias = getattr(config, "attention_bias", False)
 
         # gqkv_proj: 4-way fused [gate | q | k | v] matching the on-disk
-        # `attn.gqkv_proj.weight` row layout. MergedColumnParallelLinear's
-        # weight_loader auto-splits the fused disk tensor along the output
-        # dim by `output_sizes` (Phi-3's fused gate_up_proj path). MHA
+        # `attn.gqkv_proj.weight` row layout. The ops loader splits the fused
+        # disk tensor along the output dim by `output_sizes` (MergedColumn's
+        # shard_ids, Phi-3's fused gate_up_proj path). MHA
         # only: GQA (num_kv_heads != num_heads) would need
         # QKVParallelLinear semantics for q/k/v shard replication.
         per_head_size = self.total_num_heads * self.head_dim

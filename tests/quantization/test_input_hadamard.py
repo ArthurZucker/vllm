@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
+from vllm.model_executor.model_loader import ops_loader
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -156,13 +157,13 @@ def test_layerwise_reload(rotate_weight: bool, default_vllm_config):
     h = hadamard_matrix(32, torch.device("cpu"))
     signs = (h * 32**0.5).round().to(torch.int8)
 
-    def load(w: torch.Tensor) -> None:
-        layer.weight.weight_loader(
-            layer.weight, w if rotate_weight else block_hadamard_rotate(w, h)
+    def load(w: torch.Tensor) -> None:  # as `load_with_ops` writes, reloading or not
+        write = ops_loader.current_load_into()
+        write(
+            "weight", layer.weight, w if rotate_weight else block_hadamard_rotate(w, h)
         )
-        if not rotate_weight:  # the layerwise reload's loader, once it wraps one
-            rotation = layer.input_rotation
-            getattr(rotation, "weight_loader", default_weight_loader)(rotation, signs)
+        if not rotate_weight:
+            write("input_rotation", layer.input_rotation, signs)
 
     set_random_seed(0)
     load(torch.randn(16, 128))

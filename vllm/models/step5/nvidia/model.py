@@ -459,8 +459,8 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
     single weight `[qkv_rows | indexer_rows]` and one `hidden @ W` replaces two
     GEMMs. The indexer rows are appended to the qkv rows of the base class, which
     keeps every q/k/v shard offset (and the kv-head replication for
-    total_num_kv_heads < tp_size) inside `QKVParallelLinear.weight_loader_v2`
-    instead of being reimplemented here.
+    total_num_kv_heads < tp_size) to `QKVParallelLinear`'s sharding in the ops
+    loader instead of being reimplemented here.
     """
 
     INDEXER_SHARD_IDS = ("index_q", "index_k", "index_z", "index_g")

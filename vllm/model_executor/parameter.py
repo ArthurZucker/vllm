@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Hashable
+from collections.abc import Hashable
 from fractions import Fraction
 from typing import Any
 from weakref import WeakValueDictionary
@@ -30,36 +30,15 @@ logger = init_logger(__name__)
 
 
 class BasevLLMParameter(Parameter):
-    """Base parameter for vLLM linear layers. A `weight_loader` assigned to it
-    is the param-level load hook `ops_loader` calls."""
+    """Base parameter for vLLM linear layers: its sharding metadata (output_dim,
+    input_dim, packing) is what `ops_loader` reads to shard each tensor."""
 
     def __new__(cls, data: torch.Tensor | None, **kwargs):
         return super().__new__(cls, data=data, requires_grad=False)
 
     def __init__(self, data: torch.Tensor):
-        self._weight_loader: Callable | None = None
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-
-    @property
-    def weight_loader(self) -> Callable:
-        # NOTE(@ksayers) some models such as mamba_mixer2 override the
-        # weight loader to support custom loading. In the future, model-specific
-        # weight loading should be implemented via Model.load_weights. In the
-        # meantime, support deleting and overriding `weight_loader` attribute
-        if self._weight_loader is None:
-            raise AttributeError(
-                f"{self.__class__.__name__} weight_loader attribute has been deleted"
-            )
-        return self._weight_loader
-
-    @weight_loader.setter
-    def weight_loader(self, value: Callable):
-        self._weight_loader = value
-
-    @weight_loader.deleter
-    def weight_loader(self):
-        self._weight_loader = None  # type: ignore[assignment]
 
     def _is_1d_and_scalar(self, loaded_weight: torch.Tensor):
         cond1 = self.data.ndim == 1 and self.data.numel() == 1
@@ -68,13 +47,8 @@ class BasevLLMParameter(Parameter):
 
 
 class _ColumnvLLMParameter(BasevLLMParameter):
-    """Private class defining weight loading functionality
-    (load_merged_column_weight, load_qkv_weight)
-    for parameters being loaded into linear layers with column
-    parallelism. This includes QKV and MLP layers which are
-    not already fused on disk. Requires an output dimension
-    to be defined. Called within the weight loader of
-    each of the column parallel linear layers.
+    """Parameter of a column parallel linear layer (QKV and MLP layers included):
+    `output_dim` is the dimension `ops_loader` shards over the TP ranks.
     """
 
     def __init__(self, output_dim: int, **kwargs):
@@ -87,10 +61,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
 
 class RowvLLMParameter(BasevLLMParameter):
-    """Parameter class defining weight_loading functionality
-    (load_row_parallel_weight) for parameters being loaded
-    into linear layers with row parallel functionality.
-    Requires an input_dim to be defined.
+    """Parameter of a row parallel linear layer: `input_dim` is the dimension
+    `ops_loader` shards over the TP ranks.
     """
 
     def __init__(self, input_dim: int, **kwargs):

@@ -175,7 +175,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader import weight_utils
+from vllm.model_executor.model_loader import ops_loader, weight_utils
 from vllm.model_executor.model_loader.base_loader import log_online_quantization
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.reload.layerwise import (
@@ -473,18 +473,7 @@ def test_online_moe_stages_quantized_weights_for_humming(
                     dtype=parameter.dtype,
                     device=DEVICE,
                 )
-            for expert in range(2):
-                if name.startswith("w13"):
-                    if weight[expert].ndim == 0:
-                        gate = up = weight[expert]
-                    else:
-                        gate, up = weight[expert].chunk(2, dim=0)
-                    for shard, tensor in (("w1", gate), ("w3", up)):
-                        parameter.weight_loader(parameter, tensor, name, shard, expert)
-                else:
-                    parameter.weight_loader(
-                        parameter, weight[expert], name, "w2", expert
-                    )
+            ops_loader.current_load_into()(name, parameter, weight)
         runner._quant_method.process_weights_after_loading(layer)
         finalize_layerwise_reload(runner, config.model_config)
 
@@ -1059,7 +1048,7 @@ def test_weight_loading_requantization(
     default_vllm_config,
     monkeypatch,
 ) -> None:
-    """Checkpoint sources retain parameter-specific loaders under online overrides."""
+    """Checkpoint sources load their TP shards under online overrides."""
     default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
     for module in (
         "vllm.model_executor.layers.linear",
@@ -1098,10 +1087,6 @@ def test_weight_loading_requantization(
     source = target.requantization_source
     # Checkpoint parameters must belong to the selected source method.
     assert isinstance(source, expected_source_cls)
-    for name in ("weight", "weight_scale"):
-        # Source registration must choose V2 rather than the online target's loader.
-        assert getattr(layer, name).weight_loader == layer.weight_loader_v2
-
     torch.manual_seed(11)
     rows = 128 if projection == "merged" else 64
     if source_format == "modelopt_mxfp8":
@@ -1114,16 +1099,15 @@ def test_weight_loading_requantization(
     else:
         pytest.fail(f"Unsupported checkpoint source: {source_format}")
     expected = {}
+    # the merged layer's shards fused on disk: each rank reads its slice of each
+    ops_loader.load_with_ops(layer, checkpoint.items(), conversions=[])
     for name, tensor in checkpoint.items():
         param = getattr(layer, name)
         if projection == "merged":
-            for shard, part in enumerate(tensor.chunk(2, dim=0)):
-                param.weight_loader(param, part, shard)
             expected[name] = torch.cat(
                 [part.chunk(2, dim=0)[tp_rank] for part in tensor.chunk(2, dim=0)]
             )
         else:
-            param.weight_loader(param, tensor)
             expected[name] = tensor.chunk(2, dim=1 if projection == "row" else 0)[
                 tp_rank
             ]
@@ -1511,7 +1495,7 @@ def test_online_requantized_moe_reload(
             for name, loaded_weight in weights.items():
                 parameter = getattr(layer, name)
                 if reload:
-                    parameter.weight_loader(parameter, loaded_weight)
+                    ops_loader.current_load_into()(name, parameter, loaded_weight)
                 elif name in (packed_w13_name, "w2_weight", "w2_weight_packed"):
                     for expert in range(2):
                         if name == packed_w13_name:

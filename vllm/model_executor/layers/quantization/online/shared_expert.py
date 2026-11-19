@@ -28,21 +28,14 @@ from vllm.model_executor.utils import set_weight_attrs
 SharedExpertQuantizer = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 
 
-def _param_stem(shard_id: str) -> str:
-    return "w2" if shard_id == "w2" else "w13"
-
-
 class OnlineSharedExpertLoader:
     """Loads the fused shared experts (FSE) of a `RoutedExperts` layer with online
     quantization.
 
-    - Staged shared experts: the shared experts are loaded as stored in temporary
-      slots (`online_w{13,2}_weight[_scale]`), dequantized after loading, and
-      quantized into the routed experts slots: with the routed experts when they
-      are requantized, else by `finalize`.
-    - Unquantized shared experts with pre-quantized routed experts: the shared
-      experts are quantized on arrival by `quantizer`, and loaded in the routed
-      experts slots.
+    The shared experts are loaded as stored in temporary slots
+    (`online_w{13,2}_weight[_scale]`), dequantized after loading, and quantized
+    into the routed experts slots: with the routed experts when they are
+    requantized, else by `finalize` (with `quantizer`).
     """
 
     def __init__(
@@ -89,14 +82,12 @@ class OnlineSharedExpertLoader:
                     "open an issue."
                 )
             self.quantizer = ONLINE_SHARED_EXPERT_QUANTIZERS[target_key]
-            # Quantized shared experts are staged, as their weight and scale
-            # are needed together to be dequantized.
-            self.stages_shared_experts = self.stored_key is not None
+            self.stages_shared_experts = True
             from vllm.model_executor.layers.quantization.online.moe_base import (
                 OnlineMoEMethodBase,
             )
 
-            if self.stages_shared_experts and isinstance(
+            if self.stored_key is not None and isinstance(
                 quant_method, OnlineMoEMethodBase
             ):
                 # `finalize` writes into pre-quantized routed experts slots.
@@ -237,28 +228,6 @@ class OnlineSharedExpertLoader:
             < self.num_logical_experts + self.num_fused_shared_experts
         )
 
-    @staticmethod
-    def _staging_param_name(weight_name: str, shard_id: str) -> str | None:
-        """Staging parameter (`online_w{13,2}_weight[_scale]`) of a shared expert
-        tensor. They are separate from the routed experts' parameters. None for
-        other tensors.
-        """
-        stem = f"online_{_param_stem(shard_id)}"
-        if weight_name.endswith("_weight_scale"):
-            return f"{stem}_weight_scale"
-        if weight_name.endswith("_weight"):
-            return f"{stem}_weight"
-        return None
-
-    def redirect_param_name(
-        self, param_name: str, shard_id: str, expert_id: int
-    ) -> str:
-        """Parameter name a checkpoint tensor of expert `expert_id` loads into."""
-        # Once the staging is released, reloads go to `load`, which raises.
-        if self.staging_parameters and self.is_fused_shared_expert(expert_id):
-            return self._staging_param_name(param_name, shard_id) or param_name
-        return param_name
-
     def redirect_mapping(
         self, mapping: list[tuple[str, str, int, str]]
     ) -> list[tuple[str, str, int, str]]:
@@ -275,69 +244,3 @@ class OnlineSharedExpertLoader:
                 param_name = f"{param_name.removesuffix(stem)}online_{stem}"
             redirected.append((param_name, weight_name, expert_id, shard_id))
         return redirected
-
-    def load(
-        self,
-        layer: Any,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        global_expert_id: int,
-        expert_id: int,
-    ) -> tuple[torch.nn.Parameter, int, bool | None]:
-        """Prepare the load of a fused shared expert tensor in
-        `RoutedExperts.weight_loader`.
-
-        Returns:
-            The parameter and local expert id to load into, and the load result if
-            the tensor was already loaded (None to let the caller load it).
-
-        """
-        if not self.is_fused_shared_expert(global_expert_id):
-            return param, expert_id, None
-
-        if self.stages_shared_experts:
-            if not self.staging_parameters:
-                # The staged shared experts were already quantized and released.
-                raise NotImplementedError(
-                    "Reloading fused shared experts staged for online quantization "
-                    "is not supported."
-                )
-            staging_name = self._staging_param_name(weight_name, shard_id)
-            if staging_name is None:
-                raise NotImplementedError(
-                    f"Fused shared expert tensor {weight_name!r} has no online "
-                    "staging parameter: only *_weight and *_weight_scale are "
-                    "supported when staging shared experts."
-                )
-            return (
-                getattr(layer, staging_name),
-                global_expert_id - self.num_logical_experts,
-                None,
-            )
-
-        # Only quantize high-precision shared expert weights, load anything else as is.
-        if (
-            self.quantizer is None
-            or not weight_name.endswith("_weight")
-            or not loaded_weight.is_floating_point()
-            or loaded_weight.dtype == param.dtype
-        ):
-            return param, expert_id, None
-
-        # Full-precision shared expert: quantize it, then load the weight and
-        # scale like a pre-quantized expert.
-        weight, weight_scale = self.quantizer(loaded_weight.to(layer.moe_config.device))
-        layer.weight_loader(
-            getattr(layer, f"{_param_stem(shard_id)}_weight_scale"),
-            weight_scale,
-            f"{weight_name}_scale",
-            shard_id,
-            global_expert_id,
-            return_success=True,
-        )
-        loaded = layer.weight_loader(
-            param, weight, weight_name, shard_id, global_expert_id, True
-        )
-        return param, expert_id, loaded

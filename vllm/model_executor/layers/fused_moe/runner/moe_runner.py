@@ -312,7 +312,6 @@ class MoERunner(MoERunnerInterface):
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
 
-
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
@@ -352,7 +351,7 @@ class MoERunner(MoERunnerInterface):
         """Fuse router and shared expert gate weights.
 
         Cannot be done at __init__ because gate weights are loaded after
-        module construction (via weight_loader). The loader runs this after
+        module construction (by the ops loader). The loader runs this after
         every load or reload, refilling the fused tensor in place so captured
         CUDA graphs see updated gates.
         """

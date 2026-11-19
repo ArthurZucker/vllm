@@ -404,10 +404,6 @@ class Glm5NextMoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
-    def finalize_mega_moe_weights(self) -> None:
-        if self.use_mega_moe and self.experts.weight_block_size is not None:
-            self.experts.requantize_block_fp8()
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1143,9 +1139,6 @@ class Glm5NextForCausalLM(
         return logits
 
     def process_weights_after_loading(self) -> None:
-        for module in self.modules():
-            if isinstance(module, Glm5NextMoE):
-                module.finalize_mega_moe_weights()
         # Every load format ends here, including the ones that skip loaders.
         self.model.split_mhc_fns()
 

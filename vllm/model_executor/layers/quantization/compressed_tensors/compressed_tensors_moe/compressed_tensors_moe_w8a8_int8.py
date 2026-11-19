@@ -150,7 +150,7 @@ class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
+        # Add PER-CHANNEL quantization (the ops loader shards by param attributes).
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )

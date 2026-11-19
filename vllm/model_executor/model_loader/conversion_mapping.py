@@ -19,6 +19,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
+import torch
 from torch import nn
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import (
@@ -33,13 +34,17 @@ from transformers.core_model_loading import (
 from vllm.model_executor.model_loader.weight_ops import (
     Affine,
     Deinterleave,
+    EqualSources,
     ExpertRows,
+    Gather,
     HeadPermute,
     Narrow,
     OutputConcatenate,
     ParamRows,
+    Reciprocal,
     Refuse,
     RepeatLastSource,
+    RepeatToParam,
     SwapHalves,
     ViewAsParam,
     ZeroMissingSource,
@@ -635,6 +640,114 @@ def _per_expert(module: nn.Module) -> list[WeightTransform]:
     ]
 
 
+# DeepGEMM MegaMoE experts' checkpoint tensors: (suffix, param suffix, ops after the
+# merge into this rank's slots)
+_MEGA_MOE_TENSORS = (
+    ("weight", "weight", []),
+    ("weight_scale", "weight_scale", [RepeatToParam()]),
+    ("weight_scale_inv", "weight_scale_inv", []),
+    ("weight_scale_2", "weight_scale_2", []),
+    ("weight_global_scale", "weight_scale_2", [Reciprocal()]),
+    ("input_scale", "input_scale", []),
+    ("input_global_scale", "input_scale", [Reciprocal()]),
+)
+
+
+def _mega_moe_experts(module: nn.Module) -> list[WeightTransform]:
+    """DeepGEMM MegaMoE experts (`DeepGemmMegaMoEExperts`), loaded in the checkpoint
+    layout as their bytes. Experts stored one by one (`N.{w1,gate_proj}.<tensor>`, up
+    and down alike) are merged, gate rows then up rows, into this rank's slots (EPLB's
+    redundant ones repeat a logical expert); experts stacked on disk (`w13_weight`,
+    also `routed_experts.`) are gathered into them. Compressed-tensors' global scales
+    load as their reciprocals, NVFP4's `w1` / `w3` `weight_scale_2` as one; a fused
+    shared expert (`shared_experts.*`) into `shared_l{1,2}_*`. Projections are renamed
+    first (`N.gate.`, ...), so a model's own `.w1` converters do not take them"""
+    params = dict(module.named_parameters(recurse=False))
+    slots = module.local_logical_experts
+    present = sorted(set(slots))
+    gather = (
+        []
+        if slots == present
+        else [Gather(torch.tensor([present.index(s) for s in slots]), dim=0)]
+    )
+    stacked = Gather(torch.tensor(slots), dim=0)
+    stacked.needs_full = True  # all experts read, then this rank's
+    out: list[WeightTransform] = [
+        *(
+            rename(rf"^(\d+)\.(?:{names})\.", rf"\1.{proj}.")
+            for proj, names in (
+                ("gate", "w1|gate_proj"),
+                ("up", "w3|up_proj"),
+                ("down", "w2|down_proj"),
+            )
+        ),
+        drop(r"^\d+\.(?:gate|up)\.input_(?:global_)?scale$"),
+        rename(r"^shared_experts\.(?:w1|gate_proj)\.", "shared_gate."),
+        rename(r"^shared_experts\.(?:w3|up_proj)\.", "shared_up."),
+        rename(r"^shared_experts\.gate_up_proj\.", "shared_gate_up."),
+        rename(r"^shared_experts\.(?:w2|down_proj)\.", "shared_down."),
+        rename(r"\.weight_packed$", ".weight"),
+    ]
+    for suffix, param_suffix, ops in _MEGA_MOE_TENSORS:
+        for param, projs in (("w13", ("gate", "up")), ("w2", ("down",))):
+            if (target := f"{param}_{param_suffix}") not in params:
+                continue
+            one = param_suffix == "weight_scale_2"  # one L1 scale per expert
+            gate_up = EqualSources() if one else Concatenate(dim=1)
+            out.append(
+                WeightConverter(
+                    [f"*.{p}.{suffix}" for p in projs],
+                    target,
+                    operations=[
+                        ViewAsParam(),
+                        MergeModulelist(dim=0),
+                        *([gate_up] if len(projs) > 1 else []),
+                        *gather,
+                        *ops,
+                    ],
+                )
+            )
+    out += [
+        WeightConverter(
+            rf"^(?:routed_experts\.)?{name}$",
+            name,
+            operations=[ViewAsParam(), stacked],
+        )
+        for name in params
+        if not name.startswith("shared_")
+    ]
+    if getattr(module, "has_fused_shared_experts", False):
+        for suffix in ("weight", "weight_scale", "weight_scale_inv"):
+            for param, sources, merge in (
+                ("shared_l1", ["^shared_gate", "^shared_up"], [Concatenate(dim=0)]),
+                ("shared_l1", ["^shared_gate_up"], []),
+                ("shared_l2", ["^shared_down"], []),
+            ):
+                # `weight_scale_inv` into `weight_scale` unless staged as is
+                target = f"{param}_{suffix}"
+                if target not in params:
+                    target = f"{param}_weight_scale"
+                if target not in params:
+                    continue
+                repeat = [RepeatToParam()] if target.endswith("_scale") else []
+                out.append(
+                    WeightConverter(
+                        [f"{s}.{suffix}$" for s in sources],
+                        target,
+                        operations=[ViewAsParam(), *merge, *repeat],
+                    )
+                )
+    return out
+
+
+def _mega_moe_shared_expert(module: nn.Module) -> list[WeightTransform]:
+    """A MoE block whose DeepGEMM MegaMoE experts fuse its shared expert: the shared
+    expert's tensors into the experts' (`_mega_moe_experts`)"""
+    if not getattr(getattr(module, "experts", None), "has_fused_shared_experts", 0):
+        return []
+    return [rename("^shared_experts.", "experts.shared_experts.")]
+
+
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
@@ -658,6 +771,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ),
     "DeepseekV4AiterMegaMoEExperts": _per_expert,
     "DeepseekV4MegaMoEExperts": _per_expert,
+    "DeepGemmMegaMoEExperts": _mega_moe_experts,
+    "DeepseekV4MoE": _mega_moe_shared_expert,
+    "Glm5NextMoE": _mega_moe_shared_expert,
     "K2HorizonMoVAAttention": _k2_horizon,
     "MistralLarge4ForCausalLM": MISTRAL_LARGE4,
     "Gemma4Model": _gemma4,
@@ -1689,6 +1805,19 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         # experts stacked on the rows; w2 stored `[e * i, h]`, the param `[e, h, i]`
         WeightConverter(
             ".mlp.w2$", ".mlp.w2", operations=[ExpertRows(), Transpose(1, 2)]
+        ),
+    ],
+    # experts stacked on the rows, `w2` stored `[e * i, h]` as Nomic's
+    "DbrxForCausalLM": [
+        WeightConverter(
+            [".experts.mlp.w1$", ".experts.mlp.v1$"],
+            ".experts.routed_experts.w13_weight",
+            operations=[ExpertRows("ffn_config.moe_num_experts"), Concatenate(dim=1)],
+        ),
+        WeightConverter(
+            ".experts.mlp.w2$",
+            ".experts.routed_experts.w2_weight",
+            operations=[ExpertRows("ffn_config.moe_num_experts"), Transpose(1, 2)],
         ),
     ],
     "OPTForCausalLM": [

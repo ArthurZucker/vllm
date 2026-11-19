@@ -339,9 +339,11 @@ def materialize_residual_path_constants(model: nn.Module) -> int:
 class MuseSparkQKVOGateParallelLinear(ColumnParallelLinear):
     """Fused [Q, K, V, O-gate] projection with head-aware TP sharding.
 
-    Per-rank rows are [q, k, v, o_gate], so checkpoint tensors are sliced by
-    head group. KV-head padding is not supported.
+    Per-rank rows are [q, k, v, o_gate]: the checkpoint's projections, each
+    sharded by head group on load (`shard_ids`). KV-head padding is not supported.
     """
+
+    shard_ids = ("q", "k", "v", "o_gate")
 
     def __init__(
         self,
@@ -373,37 +375,10 @@ class MuseSparkQKVOGateParallelLinear(ColumnParallelLinear):
         self.num_heads = total_num_heads // self.tp_size
         self.num_kv_heads = total_num_kv_heads // self.tp_size
 
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: str | None = None,
-    ) -> None:
-        if loaded_shard_id is None:
-            assert param.shape == loaded_weight.shape
-            param.data.copy_(loaded_weight)
-            return
-        q_size = self.num_heads * self.head_size
-        kv_size = self.num_kv_heads * self.head_size
-        if loaded_shard_id == "q":
-            shard_offset, shard_size = 0, q_size
-        elif loaded_shard_id == "k":
-            shard_offset, shard_size = q_size, kv_size
-        elif loaded_shard_id == "v":
-            shard_offset, shard_size = q_size + kv_size, kv_size
-        elif loaded_shard_id == "o_gate":
-            shard_offset, shard_size = q_size + 2 * kv_size, q_size
-        else:
-            raise ValueError(
-                f"{self.prefix}: unknown shard id {loaded_shard_id!r} for the "
-                "fused QKV+O-gate projection."
-            )
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
-        param_shard = param.data.narrow(0, shard_offset, shard_size)
-        assert param_shard.shape == loaded_weight.shape
-        param_shard.copy_(loaded_weight)
-
+    def _get_shard_size_mapping(self, loaded_shard_id: str) -> int:
+        """Rows of this rank's parameter that belong to the shard."""
+        kv = loaded_shard_id in ("k", "v")
+        return (self.num_kv_heads if kv else self.num_heads) * self.head_size
 
 
 __all__ = [

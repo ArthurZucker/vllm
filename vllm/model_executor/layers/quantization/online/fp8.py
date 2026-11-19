@@ -68,7 +68,6 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 from vllm.platforms import current_platform
@@ -206,9 +205,6 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
                 torch.empty(scale_shape, dtype=dtype), requires_grad=False
             )
             layer.register_parameter(name, scale)
-        # The quantize op's outputs are this rank's already: copied as they are
-        for name in ("weight", *self.scale_names):
-            getattr(layer, name).weight_loader = default_weight_loader
         layer.quantizes_on_load = True
 
     def quantized_params(self, n: int, k: int) -> list[tuple]:

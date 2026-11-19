@@ -128,7 +128,7 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        # Add PER-GROUP quantization for RoutedExperts.weight_loader.
+        # Add PER-GROUP quantization (the ops loader shards by param attributes).
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
         )

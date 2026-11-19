@@ -32,7 +32,6 @@ from vllm.model_executor.model_loader.checkpoint_weight_patch import (
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
-    initialize_online_processing,
     record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.reload.meta import (
@@ -203,25 +202,6 @@ def test_attention_reload_defers_post_load(default_vllm_config, layer_cls):
     _write(layer.weight, loaded_weight)
 
     assert not layer.post_load_called
-
-    finalize_layerwise_reload(model, default_vllm_config.model_config)
-
-    assert layer.post_load_called
-    assert torch.equal(layer.weight, loaded_weight)
-
-
-@pytest.mark.parametrize(
-    "layer_cls",
-    [_ReloadableMMEncoderAttention, _ReloadableAttentionLayer],
-)
-def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
-    default_vllm_config.model_config = ModelConfig()
-    layer = layer_cls()
-    model = torch.nn.Sequential(layer)
-    loaded_weight = torch.full_like(layer.weight, 7.0)
-
-    initialize_online_processing(layer)
-    _write(layer.weight, loaded_weight)
 
     finalize_layerwise_reload(model, default_vllm_config.model_config)
 
@@ -548,7 +528,8 @@ def test_layerwise_loading_warning_only_checks_new_layers(monkeypatch):
         layer.weight.requires_grad_(False)
         # more to load than three writes: the layers stay buffering
         layer.weight.weight_loader_numel = 64
-        reload_layerwise.initialize_online_processing(layer)
+        reload_layerwise.record_metadata_for_reloading(layer)
+        reload_layerwise.initialize_layerwise_reload(layer)
 
     monkeypatch.setattr(reload_layerwise, "has_device_tensors", lambda _: True)
     get_info_size = Mock(return_value=0)
@@ -621,56 +602,6 @@ def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
     assert torch.equal(layer.A, loaded["A"])
     assert torch.equal(layer.dt_bias, loaded["dt_bias"])
     assert torch.equal(layer.D, loaded["D"])
-
-
-class _RecordingQuantMethod(QuantizeMethodBase):
-    """Records the layer's bias at the moment processing runs."""
-
-    uses_meta_device = True
-
-    def __init__(self):
-        self.bias_at_process = None
-
-    def create_weights(self, layer, *weight_args, **extra_weight_attrs):
-        pass
-
-    def apply(self, layer, *args, **kwargs):
-        raise NotImplementedError
-
-    def process_weights_after_loading(self, layer):
-        self.bias_at_process = layer.bias.detach().clone()
-
-
-class _LateBiasLayer(torch.nn.Module):
-    """Mimics an online-quantized linear: `weight` is created on meta by
-    `create_weights()`, which wraps the loaders, and the linear base registers
-    `bias` afterwards."""
-
-    def __init__(self, quant_method):
-        super().__init__()
-        self.quant_method = quant_method
-        weight = torch.nn.Parameter(torch.empty(4, 2, device="meta"))
-        self.register_parameter("weight", weight)
-        initialize_online_processing(self)
-        bias = torch.nn.Parameter(torch.zeros(4))
-        self.register_parameter("bias", bias)
-
-
-def test_online_processing_waits_for_late_registered_bias():
-    # Regression test: `bias` is skipped by the meta device paths, but it is
-    # still loaded by a weight loader. Excluding it from the processing trigger
-    # finalized the layer one load early, so the trailing bias was written into
-    # an already-processed layer (e.g. over FP8 Marlin's permuted bias).
-    quant_method = _RecordingQuantMethod()
-    layer = _LateBiasLayer(quant_method)
-    loaded_bias = torch.full((4,), 3.0)
-
-    _write(layer.weight, torch.full((4, 2), 2.0))
-    assert quant_method.bias_at_process is None
-
-    _write(layer.bias, loaded_bias)
-    assert quant_method.bias_at_process is not None
-    assert torch.equal(quant_method.bias_at_process, loaded_bias)
 
 
 def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypatch):

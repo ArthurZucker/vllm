@@ -80,8 +80,9 @@ class VllmLayoutQuantizer(VllmFormatQuantizer):
 
 class QuantizeOnLoad(ConversionOps):
     """A full precision tensor quantized as it loads (an online quantization): its
-    quantizer's function of the param, whose outputs fill the param and its scales.
-    Experts are stacked: one call each, unless the function takes them stacked"""
+    quantizer's function of the param, whose outputs fill the param and its scales
+    (or `{param name: tensor}` of the layer's params). Experts are stacked: one call
+    each, unless the function takes them stacked"""
 
     def __init__(self, quantizer: "VllmQuantizeQuantizer"):
         self.quantizer = quantizer
@@ -97,8 +98,10 @@ class QuantizeOnLoad(ConversionOps):
         tensor = tensor.to(getattr(layer, name).device, layer.params_dtype).contiguous()
         if tensor.dim() == 3 and not stacked:  # experts, one at a time
             values, *scales = (torch.stack(o) for o in zip(*map(quantize, tensor)))
+        elif isinstance(quantized := quantize(tensor), dict):
+            return {f"{prefix}.{n}": t for n, t in quantized.items()}
         else:
-            values, *scales = quantize(tensor)
+            values, *scales = quantized
         out = {key: values}
         for scale_name, scale in zip(scale_names, scales):
             param = getattr(layer, scale_name)
@@ -126,6 +129,54 @@ class VllmQuantizeQuantizer(VllmFormatQuantizer):
 
     def get_quantize_ops(self):
         return QuantizeOnLoad(self)
+
+
+class DequantizeOnLoad(ConversionOps):
+    """A quantized checkpoint tensor to full precision as it loads, before the
+    model's ops (e.g. the experts' merge): each weight with its scales, read along,
+    by its quantizer's `dequantize_tensor(weight, *scales)`. The scales are dropped"""
+
+    def __init__(self, hf_quantizer: "VllmRequantizeQuantizer"):
+        self.hf_quantizer = hf_quantizer  # its tensors are read as stored
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        weight, *scales = self.hf_quantizer.serialized_names["weight"]
+        dequantize = self.hf_quantizer.dequantize_tensor
+        out = {}
+        for key, value in input_dict.items():
+            stem = key.removesuffix(weight)
+            if stem != key and all(stem + s in input_dict for s in scales):
+                ss = [input_dict[stem + s] for s in scales]
+                out[key] = (
+                    [dequantize(*t) for t in zip(value, *ss)]
+                    if isinstance(value, list)
+                    else dequantize(value, *ss)
+                )
+            elif not key.endswith(tuple(scales)):
+                out[key] = value  # not quantized, e.g. a bias
+        return out
+
+
+class VllmRequantizeQuantizer(VllmQuantizeQuantizer):
+    """A quantized checkpoint requantized as it loads: `dequantize(weight, *scales)`
+    on each checkpoint weight before the model's ops (`names`: the weight's, then
+    its scales', read along), `targets` quantizing the params after them"""
+
+    requantize = True
+
+    def __init__(self, targets: dict[str, tuple], dequantize, names: list[str]):
+        super().__init__(targets)
+        self.pre_quantized, self.dequantize_tensor = True, dequantize
+        self.quantization_config.dequantize = True  # the plan reads the scales along
+        # the params the plan's ops fill, and the checkpoint's names
+        self.serialized_names = {t: [t] for t in targets} | {"weight": list(names)}
+
+    def get_load_operations(self):
+        return {"dequantize": DequantizeOnLoad}
+
+    def get_weight_conversions(self):
+        return []  # the model's converters read the tensors
 
 
 def checkpoint_plan(model) -> HfQuantizer | None:

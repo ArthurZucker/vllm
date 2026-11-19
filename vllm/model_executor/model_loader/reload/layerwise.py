@@ -130,24 +130,10 @@ def initialize_layerwise_reload(
         restore_layer_on_meta(layer, info)
 
         # Buffer the writes into the layer until it is complete
-        initialize_online_processing(layer)
+        info.load_numel = 0
+        info.load_numel_total = get_layer_size(layer)
+        _track(layer)
         info.defer_processing = defer_processing
-
-
-def initialize_online_processing(layer: torch.nn.Module):
-    """Buffer the writes into `layer`'s tensors (see `reload_load_into`) until all
-    of them are loaded, then process it. Called by `initialize_layerwise_reload`
-    or an online quantization scheme; a no-op on a layer already buffering."""
-    info = get_layerwise_info(layer)
-    if info.can_load():
-        return
-    # Track loading progress to determine when to process/copy
-    info.load_numel = 0
-    info.load_numel_total = get_layer_size(layer)
-    _track(layer)
-    from vllm.model_executor.model_loader.ops_loader import install_load_into
-
-    install_load_into(reload_load_into)
 
 
 # The tensors whose writes a layerwise reload buffers: id -> (tensor, layer, name)
@@ -161,14 +147,16 @@ def _track(layer: torch.nn.Module) -> None:
 
 
 def _untrack(layers: Iterable[torch.nn.Module]) -> None:
-    """Stop buffering writes into `layers`; the last one uninstalls the writer"""
+    """Stop buffering writes into `layers`"""
     layers = set(layers)
     for key in [k for k, (_, layer, _) in _TRACKED.items() if layer in layers]:
         del _TRACKED[key]
-    if not _TRACKED:
-        from vllm.model_executor.model_loader.ops_loader import uninstall_load_into
 
-        uninstall_load_into(reload_load_into)
+
+def reloading() -> bool:
+    """Whether writes are buffered (a layerwise reload in progress): `load_with_ops`
+    then writes through `reload_load_into`"""
+    return bool(_TRACKED)
 
 
 def reload_load_into(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
