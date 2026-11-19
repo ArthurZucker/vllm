@@ -244,9 +244,11 @@ class RoutedExperts(PluggableLayer):
         ):
             return
         # Per-expert scalars ((E,), (E, <=2)) aren't padded.
-        for p in self._parameters.values():
+        for name, p in self._parameters.items():
             if p is not None and p.ndim > 1 and p.numel() > 2 * p.shape[0]:
                 p.fill_on_reload = True
+                # w13: gate and up, each padded
+                p.pad_segments = self.moe_config.w13_num_shards if "w13" in name else 1
 
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):

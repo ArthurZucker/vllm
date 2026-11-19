@@ -272,8 +272,15 @@ def _load_into(param: torch.Tensor, value: torch.Tensor) -> None:
     reload), else a copy: a shape mismatch raises."""
     if value.shape != param.shape and value.numel() == param.numel():
         value = value.reshape(param.shape)
-    elif getattr(param, "weight_loader_numel", None) == value.numel():
-        param = param[: value.shape[0]]  # ponytail: padding is trailing rows only
+    elif getattr(param, "fill_on_reload", False) and value.dim() == param.dim():
+        # padded (rows to a block or a multiple of the ranks): each segment's head
+        # gets its rows, the rest stays zero; w13 pads its gate and up halves each
+        dim = getattr(param, "shard_dim", None) or getattr(param, "output_dim", 0)
+        segments = getattr(param, "pad_segments", 1)
+        param.data.zero_()
+        for v, p in zip(value.chunk(segments, dim), param.data.chunk(segments, dim)):
+            p[tuple(slice(0, n) for n in v.shape)].copy_(v)
+        return
     loader = getattr(param, "weight_loader", None)
     try:
         inspect.signature(loader).bind(param, value)
