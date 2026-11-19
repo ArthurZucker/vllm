@@ -41,6 +41,7 @@ from tests.utils import wait_for_gpu_memory_to_clear
 from vllm import SamplingParams
 from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.model_loader.reload.direct import direct_reload_active
 from vllm.model_executor.model_loader.weight_checksum import _tensors
 from vllm.model_executor.model_loader.weight_utils import (
@@ -205,7 +206,7 @@ def _stream_reload(worker, folder: str) -> dict:
         ]:
             largest_batch = max(largest_batch, sum(t.nbytes for _, t in batch))
             # one call per transfer chunk, so no call sees the whole checkpoint
-            model.load_weights(iter(batch))
+            load_weights(model, iter(batch))
             torch.accelerator.synchronize()
             del batch  # one chunk in flight
     worker.finish_weight_update()

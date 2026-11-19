@@ -5,6 +5,7 @@
 import inspect
 import math
 from dataclasses import dataclass
+from functools import partial
 from itertools import islice
 from typing import TYPE_CHECKING, Any, cast
 
@@ -75,6 +76,7 @@ from vllm.model_executor.layers.quantization.online.base import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
@@ -111,6 +113,7 @@ from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
     supports_norm_residual_norm,
 )
 from vllm.models.muse_spark.common.ops.fused_routing import fused_muse_spark_routing
+from vllm.models.muse_spark.common.qk_layout import interleave_qk
 from vllm.models.muse_spark.nvidia.mega_moe import (
     MuseSparkMegaMoEExperts,
     get_trtllm_token_threshold,
@@ -682,7 +685,7 @@ class MuseSparkMoE(nn.Module):
     def _load_router_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor
     ) -> None:
-        self.router.weight_loader(param, loaded_weight)
+        default_weight_loader(param, loaded_weight)  # replicated
         if self.router_output_multiplier is not None:
             with torch.no_grad():
                 param.mul_(self.router_output_multiplier)
@@ -2037,6 +2040,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         # self.model, built by the model state once the weights are loaded.
         self.specialized_decode_config = specialized_decode_config(vllm_config)
         self.specialized_decode: SpecializedDecode | None = None
+        self.checkpoint_transforms = [partial(interleave_qk, self.model.config)]
 
     def build_specialized_decode(self) -> None:
         from vllm.models.muse_spark.nvidia.specialized_decode.runtime.decode import (

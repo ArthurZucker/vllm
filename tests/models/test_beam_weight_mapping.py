@@ -17,6 +17,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.models.beam import attention
 from vllm.models.beam import model as beam
 from vllm.platforms import current_platform
@@ -94,7 +95,9 @@ def test_attention_output_gate_is_renamed_not_fused():
 
 @pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="CUDA required")
 @torch.inference_mode()
-def test_checkpoint_norm_names_match_sublayer_order(default_vllm_config, monkeypatch):
+def test_checkpoint_norm_names_match_sublayer_order(
+    default_vllm_config, dist_init, monkeypatch
+):
     """Load reference names directly and use each weight on its intended branch."""
 
     class Attention(nn.Module):
@@ -125,7 +128,7 @@ def test_checkpoint_norm_names_match_sublayer_order(default_vllm_config, monkeyp
         f"layers.0.{name}.weight": torch.arange(1, 9, device="cuda").float().roll(i) / 8
         for i, name in enumerate(names)
     }
-    assert model.load_weights(weights.items()) == set(weights)
+    assert load_weights(model, iter(weights.items())) == set(weights)
     x = torch.arange(1, 17, device="cuda").float().view(2, 8) / 16
 
     def norm(value, name):

@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as dsv4_dspark
@@ -166,30 +167,38 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     ]
 
 
-def test_context_kv_weights_are_loaded_as_merged_linear_shards():
+def test_context_kv_weights_are_loaded_as_merged_linear_shards(dist_init):
+    """Each layer's `kv_a_proj_with_mqa` is its `fused_qkv_a_proj` shard 1 and
+    also, in layer order, its shard of the draft's `context_kv_proj`."""
+    model = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList()
+    for _ in range(2):
+        layer = nn.Module()
+        layer.self_attn = nn.Module()
+        layer.self_attn.fused_qkv_a_proj = MergedColumnParallelLinear(
+            5, [2, 3], bias=False, disable_tp=True, params_dtype=torch.float32
+        )
+        model.model.layers.append(layer)
+    model.model.context_kv_proj = MergedColumnParallelLinear(
+        5, [3, 3], bias=False, disable_tp=True, params_dtype=torch.float32
+    )
+    q = [torch.arange(10).view(2, 5).float() - 10 * (i + 1) for i in range(2)]
+    kv = [torch.arange(15).view(3, 5).float() + 15 * i for i in range(2)]
     weights = [
-        (
-            "layers.0.self_attn.kv_a_proj_with_mqa.weight_packed",
-            torch.arange(4),
-        ),
-        (
-            "layers.1.self_attn.kv_a_proj_with_mqa.weight_scale",
-            torch.tensor(0.5),
-        ),
+        (f"layers.{i}.self_attn.{name}.weight", w)
+        for i in range(2)
+        for name, w in (("q_a_proj", q[i]), ("kv_a_proj_with_mqa", kv[i]))
     ]
 
-    duplicated = dspark_mla._duplicate_context_kv_weights(weights, 2)
-    mapped = list(K3DSparkForCausalLM.hf_to_vllm_mapper.apply(duplicated))
+    load_weights(model, iter(weights))
 
-    assert [name for name, _ in mapped] == [
-        "model.layers.0.self_attn.fused_qkv_a_proj.weight_packed",
-        "model.context_kv_proj.weight_packed",
-        "model.layers.1.self_attn.fused_qkv_a_proj.weight_scale",
-        "model.context_kv_proj.weight_scale",
-    ]
-    assert [weight.shard_id for _, weight in mapped] == [1, 0, 1, 1]
-    assert mapped[0][1].data_ptr() == mapped[1][1].data_ptr()
-    assert mapped[2][1].data_ptr() == mapped[3][1].data_ptr()
+    for i, layer in enumerate(model.model.layers):
+        torch.testing.assert_close(
+            layer.self_attn.fused_qkv_a_proj.weight, torch.cat([q[i], kv[i]])
+        )
+    torch.testing.assert_close(model.model.context_kv_proj.weight, torch.cat(kv))
 
 
 @pytest.mark.cpu_test

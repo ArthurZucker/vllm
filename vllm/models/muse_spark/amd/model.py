@@ -4,6 +4,7 @@
 
 import functools
 import math
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -34,11 +35,11 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     sequence_parallel_chunk,
 )
@@ -61,6 +62,7 @@ from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
     fused_norm_residual_norm_fwd,
     supports_norm_residual_norm,
 )
+from vllm.models.muse_spark.common.qk_layout import interleave_qk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.third_party.flash_linear_attention.ops.kda import (
@@ -338,7 +340,7 @@ class MuseSparkMoE(nn.Module):
     def _load_router_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor
     ) -> None:
-        self.router.weight_loader(param, loaded_weight)
+        default_weight_loader(param, loaded_weight)  # replicated
         self._router_multiplier_folded = False
 
     def fold_router_output_multiplier(self) -> None:
@@ -975,22 +977,6 @@ class MuseSparkDecoderLayer(nn.Module):
         )
 
 
-def _drop_gate_up_stacking(base: WeightsMapper) -> WeightsMapper:
-    """Keep Quark's per-expert gate/up names unstacked for `RoutedExperts`."""
-    return WeightsMapper(
-        orig_to_new_renaming=base.orig_to_new_renaming,
-        orig_to_new_regex=base.orig_to_new_regex,
-        orig_to_new_substr=base.orig_to_new_substr,
-        orig_to_new_stacked={
-            source: target
-            for source, target in base.orig_to_new_stacked.items()
-            if source not in (".gate_proj", ".up_proj")
-        },
-        orig_to_new_prefix=base.orig_to_new_prefix,
-        orig_to_new_suffix=base.orig_to_new_suffix,
-    )
-
-
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.
 @ignore_torch_compile
 class MuseSparkModel(LlamaModel):
@@ -1202,6 +1188,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             self.logits_processor.scale = 1.0
 
         self.set_moe_parameters()
+        self.checkpoint_transforms = [partial(interleave_qk, self.model.config)]
 
     def _init_model(
         self,

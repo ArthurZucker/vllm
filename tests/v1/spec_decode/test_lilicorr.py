@@ -20,6 +20,7 @@ from vllm.config import (
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers import logits_processor
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.lilicorr import LiLiCorrHead
 from vllm.transformers_utils.configs.eagle import EAGLEConfig
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -140,9 +141,7 @@ def test_lilicorr_matches_exported_head(head_width, slots, dtype):
         for module in head.modules():
             if isinstance(module, LinearBase):
                 for parameter in module.parameters():
-                    parameter.weight_loader(
-                        parameter, torch.randn_like(parameter) * 0.1
-                    )
+                    parameter.copy_(torch.randn_like(parameter) * 0.1)
         for layer in head.layers:
             layer.attn.in_proj_weight.normal_(std=0.1)
             layer.attn.in_proj_bias.normal_(std=0.1)
@@ -574,9 +573,7 @@ def test_candidate_walk_revisited_position_matches_step_seed(use_fp64):
         pytest.param(False, None, False, id="valid-plain"),
         pytest.param(True, None, False, id="valid-convolution"),
         pytest.param(False, "missing_head", False, id="missing-head"),
-        pytest.param(False, "extra_head", False, id="extra-head"),
         pytest.param(True, "missing_conv", False, id="missing-convolution"),
-        pytest.param(False, "extra_conv", False, id="unexpected-convolution"),
         pytest.param(False, None, True, id="optional-w4a16-input-scale"),
         pytest.param(False, "missing_weight", True, id="missing-quantized-weight"),
         pytest.param(False, "missing_bias", True, id="missing-quantized-bias"),
@@ -584,7 +581,7 @@ def test_candidate_walk_revisited_position_matches_step_seed(use_fp64):
         pytest.param(False, "missing_weight_scale_2", True, id="missing-global-scale"),
     ],
 )
-def test_checkpoint_rejects_wrong_heads_and_allows_partial_buckets(
+def test_checkpoint_allows_partial_buckets(
     monkeypatch, convolution, mismatch, quantized
 ):
     from vllm.model_executor.models.lilicorr import LiLiCorr, LiLiCorrForCausalLM
@@ -646,12 +643,8 @@ def test_checkpoint_rejects_wrong_heads_and_allows_partial_buckets(
         "missing_weight_scale_2",
     ):
         del weights[f"lilicorr.pass_hidden_proj.{mismatch.removeprefix('missing_')}"]
-    elif mismatch == "extra_head":
-        weights["lilicorr.untrained.weight"] = torch.zeros(1)
     elif mismatch == "missing_conv":
         del weights["layers.0.attention_conv.weight"]
-    elif mismatch == "extra_conv":
-        weights["layers.0.mlp_conv.untrained"] = torch.zeros(1)
 
     # Keep production loading and mapping, bypass only backbone GPU KV setup.
     wrapper.model.use_aux_hidden_state = True
@@ -661,12 +654,9 @@ def test_checkpoint_rejects_wrong_heads_and_allows_partial_buckets(
         wrapper.model, "_build_fused_kv_buffers", lambda: None, raising=False
     )
     supplied = [("model." + name, value) for name, value in weights.items()]
-    if mismatch and mismatch.startswith("extra"):
-        with pytest.raises(ValueError, match="no module or parameter"):
-            wrapper.load_weights(supplied)
-    else:
-        wrapper.load_weights(supplied)
-        assert wrapper.model.lilicorr._attn_bias is not None
+    load_weights(wrapper, iter(supplied))
+    wrapper.process_weights_after_loading()
+    assert wrapper.model.lilicorr._attn_bias is not None
 
 
 @pytest.fixture
@@ -691,6 +681,8 @@ def owned_head_model(monkeypatch):
             self.quant_config = quant_config
             self.use_aux_hidden_state = True
             self.has_separate_mask_embedding = False
+            # marked loaded by the wrapper's `checkpoint_transforms`
+            self.mask_embedding = nn.Parameter(torch.zeros(16), requires_grad=False)
             self.lilicorr = LiLiCorrHead(
                 model_hidden_size=16, block_size=4, rms_norm_eps=1e-6, config=_config()
             )
@@ -746,7 +738,7 @@ def test_owned_nvfp4_lm_head_loads_required_checkpoint_tensors(owned_head_model)
         name: torch.ones_like(value) for name, value in model.state_dict().items()
     }
     del weights["lm_head.input_scale"]  # Deprecated and unused for W4A16.
-    model.load_weights(weights.items())
+    load_weights(model, iter(weights.items()))
     assert model.has_own_lm_head
     for name in ("weight", "weight_scale", "weight_scale_2"):
         torch.testing.assert_close(

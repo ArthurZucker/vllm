@@ -232,6 +232,8 @@ MISTRAL_LARGE4 = [
     fused(".shared_experts.gate_up_proj", ".shared_experts.w1", ".shared_experts.w3"),
     fused(".indexer.wk_weights_proj", ".indexer.wk", ".indexer.weights_proj"),
 ]
+# Draft models' vocabulary maps (EAGLE-3, DFlash, DSpark): `t2d` is training only
+DRAFT_VOCAB = [rename("^d2t$", "draft_id_to_target_id"), drop("^t2d$")]
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
 
@@ -277,7 +279,7 @@ def _own_mapper(module: nn.Module) -> list[WeightTransform]:
 
 def _extends(base: str) -> Callable:
     """A class whose mapper extends another's: that class's entry, then its own"""
-    return lambda module: [*_CONVERSION_MAPPING[base], *_own_mapper(module)]
+    return lambda module: [*_CONVERSION_MAPPING.get(base, []), *_own_mapper(module)]
 
 
 def _gemma4(module: nn.Module) -> list[WeightTransform]:
@@ -374,6 +376,15 @@ def _kimi_kda(module: nn.Module) -> list[WeightTransform]:
     ]
 
 
+def _k3_context_kv(module: nn.Module) -> WeightConverter:
+    """K3 DSpark's cross-layer KV projection: every draft layer's
+    `kv_a_proj_with_mqa`, duplicated on the stream (`context_kv_sources`)"""
+    layers = module.model.config.num_hidden_layers
+    return fused(
+        "context_kv_proj.", *(f"context_kv_proj_src.{i}." for i in range(layers))
+    )
+
+
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
@@ -409,7 +420,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "DeepseekV4ForConditionalGeneration": _own_mapper,
     "Dots3NoteForCausalLM": _own_mapper,
     "EmbeddingGemma2Model": _own_mapper,
-    "K3DSparkForCausalLM": _own_mapper,
+    "K3DSparkForCausalLM": lambda m: [*_own_mapper(m), _k3_context_kv(m)],
     "MiniMaxM3SparseForCausalLM": _own_mapper,
     "MuseSparkForConditionalGeneration": _extends("MuseSparkForCausalLM"),
     "Qwen4ExpMultiTokenPredictor": _extends("Qwen3_5Model"),
@@ -2038,7 +2049,7 @@ def get_conversion_mapping(model: nn.Module) -> list[WeightTransform]:
             out.append(transform)
     # Last, the projections almost every model fuses: a model that does not keeps its
     # names, the converter's target not being one of its params
-    return [*out, QKV, GATE_UP]
+    return [*DRAFT_VOCAB, *out, QKV, GATE_UP]
 
 
 def rename_mapper(model) -> "WeightsMapper | None":

@@ -250,6 +250,11 @@ class LiLiCorrHead(nn.Module):
         self._rank_frac_col: torch.Tensor
         self._is_top1_col: torch.Tensor
 
+    def process_weights_after_loading(self) -> None:
+        self.materialize_inference_buffers(
+            self.slot_embedding.device, self.slot_embedding.dtype
+        )
+
     @torch.no_grad()
     def materialize_inference_buffers(
         self, device: torch.device, dtype: torch.dtype
@@ -491,4 +496,3 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
             self.model.lilicorr.candidate_topk,
             return_log_probs=True,
         )
-

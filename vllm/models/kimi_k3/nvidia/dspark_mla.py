@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """K3 dense MLA draft model for DSpark speculative decoding."""
 
+from collections.abc import Iterable
 from dataclasses import replace
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -36,6 +38,20 @@ from vllm.v1.worker.workspace import current_workspace_manager
 _GROUPED_KV_CACHE_DTYPES = frozenset(
     {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
 )
+
+
+def context_kv_sources(
+    weights: Iterable[tuple[str, torch.Tensor]], layers: int
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Each layer's KV projection, and again as a source of the cross-layer
+    `context_kv_proj` (`conversion_mapping._k3_context_kv`)"""
+    for name, weight in weights:
+        yield name, weight
+        prefix, marker, param = name.partition(".self_attn.kv_a_proj_with_mqa.")
+        head, _, index = prefix.rpartition(".")
+        if marker and index.isdecimal() and int(index) < layers:
+            stem = head.removesuffix("layers")
+            yield f"{stem}context_kv_proj_src.{index}.{param}", weight
 
 
 class K3DSparkAttention(MultiHeadLatentAttention):
@@ -466,6 +482,9 @@ class K3DSparkForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        self.checkpoint_transforms = [
+            partial(context_kv_sources, layers=self.model.config.num_hidden_layers)
+        ]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
