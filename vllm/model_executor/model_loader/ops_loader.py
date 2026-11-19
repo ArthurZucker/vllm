@@ -136,22 +136,23 @@ class VllmShard:
         layer, param, shape = self.layer, self.param, _shape(source)
         dim, rank, size = _placement(layer, param)
         target = list(param.shape)
-        if len(shape) != param.dim() and dim is not None and dim < param.dim():
-            # stored at another rank (an old 4D `A_log`, a 2D conv1d): viewed at the
-            # param's, the full length on the sharded dim
-            full = list(param.shape)
-            full[dim] = 1
-            full[dim] = torch.Size(shape).numel() // torch.Size(full).numel()
-            source, shape = _read(source).reshape(full), full
         if getattr(param, "expert_dim", None) is not None:
             if self.expert:  # one checkpoint expert, a slice of the experts
                 if layer._map_global_expert_id_to_local_expert_id(tensor_idx) == -1:
                     return None
                 target, dim = target[1:], None if dim is None else dim - 1
-            elif shape[0] > target[0]:  # all of them, on disk: this rank's
+            elif shape[0] > target[0] and len(shape) == len(target):
+                # all of them, on disk: this rank's
                 ep = layer.moe_config.moe_parallel_config.ep_rank
                 source = _read(source, 0, ep * target[0], target[0])
                 shape = _shape(source)
+        if len(shape) != len(target) and dim is not None and dim < len(target):
+            # stored at another rank (an old 4D `A_log`, a 2D conv1d): viewed at the
+            # param's, the full length on the sharded dim
+            full = list(target)
+            full[dim] = 1
+            full[dim] = torch.Size(shape).numel() // torch.Size(full).numel()
+            source, shape = _read(source).reshape(full), full
         if getattr(param, "partial", False) and rank != 0:  # added once, after reduce
             return torch.zeros(shape, device=device, dtype=dtype or param.dtype)
         if dim is None or len(shape) <= dim or size == 1:
