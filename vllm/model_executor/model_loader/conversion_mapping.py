@@ -2213,24 +2213,21 @@ def _layer_experts(model: nn.Module) -> list[WeightTransform]:
         if hasattr(m, "ckpt_gate_proj_name")
     }
     out: list[WeightTransform] = []
+    w13 = TRANSFORMERS_EXPERTS["experts.gate_up_proj"].removesuffix("weight")
+    w2 = TRANSFORMERS_EXPERTS["experts.down_proj"].removesuffix("weight")
+    # `weight` also takes its scales (`weight_scale_inv`); GPTQ / AWQ's tensors
     for gate, up, down in sorted(names, key=str):
-        sources = [f"experts.*.{gate}.weight"] + (
-            [f"experts.*.{up}.weight"] if up else []
-        )
-        out.append(
-            WeightConverter(
-                sources,
-                TRANSFORMERS_EXPERTS["experts.gate_up_proj"],
-                operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+        for kind in ("weight", "bias", "qweight", "qzeros", "scales"):
+            gate_up = [f"experts.*.{p}.{kind}" for p in (gate, up) if p]
+            merge = [MergeModulelist(dim=0), Concatenate(dim=1)]
+            out.append(WeightConverter(gate_up, w13 + kind, operations=merge))
+            out.append(
+                WeightConverter(
+                    f"experts.*.{down}.{kind}",
+                    w2 + kind,
+                    operations=[MergeModulelist(dim=0)],
+                )
             )
-        )
-        out.append(
-            WeightConverter(
-                f"experts.*.{down}.weight",
-                TRANSFORMERS_EXPERTS["experts.down_proj"],
-                operations=[MergeModulelist(dim=0)],
-            )
-        )
     return out
 
 

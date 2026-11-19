@@ -4,8 +4,8 @@
 from typing import Any
 
 import torch
+from transformers.core_model_loading import ConversionOps
 
-from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -512,131 +512,75 @@ class MoeWNA16Method(FusedMoEMethodBase):
             routing_sink=layer.routing_sink,
         )
 
-    @staticmethod
-    def get_weight_loader(layer, weight_loader):
-        def convert_awq_tensor(tensor, tensor_type):
-            # convert awq qweight/qzeros to a standard format (assume int4)
-            # qweight: (k, n // pack_factor_bit32) -> (n, k // pack_factor_bit8)
-            # qzeros: (k // group_size, n // pack_factor_bit32) ->
-            #         (n // pack_factor_bit8, k // group_size)
-            # pack_factor_bit32 = 32 // weight_bits
-            # pack_factor_bit8 = 8 // weight_bits
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """GPTQ / AWQ experts load into this layout (`MoeWNA16Unpack`)"""
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmLayoutQuantizer,
+        )
 
-            # 0. suppose origin shape (a, b), dtype int32
-            # 1. convert to uint8, shape (a, b) -> (a, 4 * b)
-            size0 = tensor.size(0)
+        names = [
+            f"{p}_{t}" for p in ("w13", "w2") for t in ("qweight", "qzeros", "scales")
+        ]
+        return VllmLayoutQuantizer(MoeWNA16Unpack, names)
+
+
+class MoeWNA16Unpack(ConversionOps):
+    """One expert's GPTQ / AWQ tensor in the layout `MoeWNA16Method` computes with:
+    rows the output channels, int4 packed two to a byte, qzeros / scales repeated
+    to the layer's (reduced) group size. Whole: sharded after, by the experts param"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        self.quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        name = kwargs["full_layer_name"]
+        layer = kwargs["model"].get_submodule(name.rpartition(".")[0])
+        kind = next(k for k in ("qweight", "qzeros", "scales") if name.endswith(k))
+        return {
+            pattern: [_unpack(layer, t, kind) for t in tensors]
+            for pattern, tensors in input_dict.items()
+        }
+
+
+def _unpack(layer: torch.nn.Module, tensor: torch.Tensor, kind: str) -> torch.Tensor:
+    config = layer.quant_config
+    if config.linear_quant_method in ("awq", "awq_marlin"):
+        assert config.weight_bits == 4
+        tensor = _convert_awq_tensor(tensor, kind) if kind != "scales" else tensor.T
+    elif config.linear_quant_method == "gptq":
+        assert config.weight_bits in (4, 8)
+        if kind == "qweight":
+            tensor = tensor.T.contiguous().view(torch.uint8)
+        elif kind == "qzeros":  # GPTQ stores zeros minus one: as AWQ's
             tensor = tensor.view(torch.uint8)
+            int4 = config.weight_bits == 4
+            tensor = _convert_gptq_int4_qzeros(tensor).T if int4 else tensor.T + 1
+        else:
+            tensor = tensor.T
+    if layer.group_size_div_factor > 1 and kind != "qweight":
+        tensor = tensor.repeat_interleave(layer.group_size_div_factor, 1)
+    return tensor
 
-            # 2. unpack to uint4 (only when weight_bits == 4)
-            #    shape (a, 4 * b) -> (a, 4 * b, 2)
-            shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
-            tensor = (tensor[:, :, None] >> shifter) & 0xF
 
-            # 3. change order, see
-            # https://github.com/casper-hansen/AutoAWQ/blob/v0.2.8/awq/utils/quant_utils.py
-            # shape -> (a, 4 * b * pack_factor_bit8)
-            reverse_awq_pack_order = [0, 4, 1, 5, 2, 6, 3, 7]
-            tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
-            tensor = tensor.view(size0, -1)
+def _convert_awq_tensor(tensor: torch.Tensor, kind: str) -> torch.Tensor:
+    """AWQ's int4 qweight `(k, n // 8) int32 -> (n, k // 2) uint8`, qzeros
+    `(k // group, n // 8) -> (n // 2, k // group)`"""
+    size0 = tensor.size(0)
+    tensor = tensor.view(torch.uint8)
+    shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
+    tensor = (tensor[:, :, None] >> shifter) & 0xF
+    # AutoAWQ's pack order (awq/utils/quant_utils.py)
+    tensor = tensor.view(-1, 8)[:, [0, 4, 1, 5, 2, 6, 3, 7]].view(size0, -1)
+    tensor = tensor.T.contiguous()
+    if kind == "qweight":
+        return tensor[:, 1::2] * 16 + tensor[:, ::2]
+    return tensor[1::2, :] * 16 + tensor[::2, :]
 
-            # 4. transpose, shape -> (4 * b * pack_factor_bit8, a)
-            tensor = tensor.T.contiguous()
 
-            # 5. repack (only when weight_bits == 4)
-            # qweight shape -> (4 * b * pack_factor_bit8, a // pack_factor_bit8)
-            # qzeros shape -> (4 * b, a)
-
-            if tensor_type == "qweight":
-                tensor = tensor[:, 1::2] * 16 + tensor[:, ::2]
-            elif tensor_type == "qzeros":
-                tensor = tensor[1::2, :] * 16 + tensor[::2, :]
-            return tensor
-
-        def convert_gptq_int4_qzeros(tensor):
-            tensor = tensor.view(torch.uint8)
-            shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
-            tensor = (tensor[:, :, None] >> shifter) & 0xF
-            tensor = tensor + 1
-            tensor = tensor[:, :, 0] + tensor[:, :, 1] * 16
-            return tensor
-
-        def moe_wna16_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int,
-            return_success: bool = False,
-        ):
-            if not layer.quant_config.has_zp and "qzeros" in weight_name:
-                return False if return_success else None
-
-            device = get_tp_group().device
-            tp_rank = get_tensor_model_parallel_rank()
-            loaded_weight = loaded_weight.to(device)
-            shard_size = layer.intermediate_size_per_partition
-
-            # convert gptq and awq weight to a standard format
-            # awq_marlin uses the same weight format as awq
-            if layer.quant_config.linear_quant_method in ("awq", "awq_marlin"):
-                assert layer.quant_config.weight_bits == 4
-                if "weight" in weight_name:
-                    loaded_weight = convert_awq_tensor(loaded_weight, "qweight")
-                elif "zeros" in weight_name:
-                    loaded_weight = convert_awq_tensor(loaded_weight, "qzeros")
-                else:
-                    loaded_weight = loaded_weight.T
-            elif layer.quant_config.linear_quant_method == "gptq":
-                assert layer.quant_config.weight_bits in [4, 8]
-                if "weight" in weight_name:
-                    loaded_weight = loaded_weight.T.contiguous().view(torch.uint8)
-                elif "zeros" in weight_name:
-                    # add 1 to gptq qzeros to align with awq
-                    loaded_weight = loaded_weight.view(torch.uint8)
-                    if layer.quant_config.weight_bits == 4:
-                        loaded_weight = convert_gptq_int4_qzeros(loaded_weight).T
-                    else:
-                        loaded_weight = loaded_weight.T + 1
-                else:
-                    loaded_weight = loaded_weight.T
-
-            # repeat the qzeros/scales to fit new group size
-            if (
-                layer.group_size_div_factor > 1
-                and "qzeros" in weight_name
-                or "scales" in weight_name
-            ):
-                loaded_weight = loaded_weight.repeat_interleave(
-                    layer.group_size_div_factor, 1
-                )
-
-            if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(
-                    layer.moe_config.tp_size, -1, loaded_weight.size(1)
-                )[tp_rank]
-                # qzeros are packed along the intermediate dim by
-                # bit8_pack_factor, so the w1/w3 boundary is in packed units
-                # (equals shard_size // 2 only for 4-bit).
-                shard_zp_size = shard_size // layer.quant_config.bit8_pack_factor
-                if shard_id == "w1":
-                    param.data[expert_id, :shard_zp_size] = tensor
-                else:
-                    param.data[expert_id, shard_zp_size:] = tensor
-                return True if return_success else None
-            elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.moe_config.tp_size, -1
-                )[:, tp_rank]
-                return True if return_success else None
-            else:
-                # Delegate to the original loader, passing return_success
-                return weight_loader(
-                    param,
-                    loaded_weight,
-                    weight_name,
-                    shard_id,
-                    expert_id,
-                    return_success=return_success,
-                )
-
-        return moe_wna16_weight_loader
+def _convert_gptq_int4_qzeros(tensor: torch.Tensor) -> torch.Tensor:
+    shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
+    tensor = ((tensor[:, :, None] >> shifter) & 0xF) + 1
+    return tensor[:, :, 0] + tensor[:, :, 1] * 16

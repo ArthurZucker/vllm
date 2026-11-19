@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 import torch
+from transformers.core_model_loading import ConversionOps
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
@@ -541,80 +542,15 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
             shared_experts_input=shared_experts_input,
         )
 
-    def get_weight_loader(self, layer: RoutedExperts, weight_loader):
-        def convert_quark_tensor(tensor: torch.Tensor, tensor_type: str):
-            size0 = tensor.size(0)
-            tensor = tensor.view(torch.uint8)
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """Quark's int4 experts load into this layout (`QuarkInt4Unpack`)"""
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmLayoutQuantizer,
+        )
 
-            shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
-            tensor = (tensor[:, :, None] >> shifter) & 0xF
-
-            if self.pack_reorder:
-                reverse_awq_pack_order = [0, 4, 1, 5, 2, 6, 3, 7]
-                tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
-            else:
-                tensor = tensor.view(-1, 8)
-            if self.is_symmetric:
-                tensor = tensor ^ 0x8
-            tensor = tensor.view(size0, -1)
-
-            tensor = tensor.T.contiguous()
-            if tensor_type == "weight":
-                tensor = tensor[:, 1::2] * 16 + tensor[:, ::2]
-            elif tensor_type == "zero_point":
-                tensor = tensor[1::2, :] * 16 + tensor[::2, :]
-            return tensor
-
-        def quark_int4_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int,
-            return_success: bool = False,
-        ):
-            loaded_weight = loaded_weight.to(param.data.device)
-            shard_size = layer.intermediate_size_per_partition
-
-            if weight_name.endswith("_weight"):
-                loaded_weight = convert_quark_tensor(loaded_weight, "weight")
-            elif weight_name.endswith("_weight_zero_point"):
-                loaded_weight = convert_quark_tensor(loaded_weight, "zero_point")
-            elif weight_name.endswith("_weight_scale"):
-                loaded_weight = loaded_weight.T
-
-            if layer.group_size_div_factor > 1 and (
-                "weight_zero_point" in weight_name or "weight_scale" in weight_name
-            ):
-                loaded_weight = loaded_weight.repeat_interleave(
-                    layer.group_size_div_factor, 1
-                )
-
-            if "w13_weight_zero_point" in weight_name:
-                tensor = loaded_weight.view(
-                    layer.moe_config.tp_size, -1, loaded_weight.size(1)
-                )[layer.moe_config.tp_rank]
-                if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
-                else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
-                return True if return_success else None
-            elif "w2_weight_zero_point" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.moe_config.tp_size, -1
-                )[:, layer.moe_config.tp_rank]
-                return True if return_success else None
-
-            return weight_loader(
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-                return_success=return_success,
-            )
-
-        return quark_int4_weight_loader
+        kinds = ("weight", "weight_scale", "weight_zero_point")
+        names = [f"{p}_{k}" for p in ("w13", "w2") for k in kinds]
+        return VllmLayoutQuantizer(QuarkInt4Unpack, names)
 
 
 class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
@@ -2459,3 +2395,52 @@ class QuarkNvfp4MoEMethod(QuarkMoEMethod):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+
+class QuarkInt4Unpack(ConversionOps):
+    """One expert's Quark int4 tensor in `QuarkW4A16Int4MoEMethod`'s layout: rows
+    the output channels, int4 two to a byte (sign-flipped when symmetric), scales
+    and zero points repeated to the layer's group size. Whole: sharded after"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        self.quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        name = kwargs["full_layer_name"]
+        layer = kwargs["model"].get_submodule(name.rpartition(".")[0])
+        method = layer.quant_method
+        kind = next(
+            k
+            for k in ("weight_zero_point", "weight_scale", "weight")
+            if name.endswith(k)
+        )
+
+        def unpack(tensor: torch.Tensor) -> torch.Tensor:
+            if kind == "weight_scale":
+                tensor = tensor.T
+            else:
+                tensor = _unpack_quark_int4(tensor, kind, method)
+            if layer.group_size_div_factor > 1 and kind != "weight":
+                tensor = tensor.repeat_interleave(layer.group_size_div_factor, 1)
+            return tensor
+
+        return {p: [unpack(t) for t in v] for p, v in input_dict.items()}
+
+
+def _unpack_quark_int4(tensor: torch.Tensor, kind: str, method) -> torch.Tensor:
+    size0 = tensor.size(0)
+    tensor = tensor.view(torch.uint8)
+    shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
+    tensor = (tensor[:, :, None] >> shifter) & 0xF
+    tensor = tensor.view(-1, 8)
+    if method.pack_reorder:  # AWQ's pack order
+        tensor = tensor[:, [0, 4, 1, 5, 2, 6, 3, 7]]
+    if method.is_symmetric:
+        tensor = tensor ^ 0x8
+    tensor = tensor.view(size0, -1).T.contiguous()
+    if kind == "weight":
+        return tensor[:, 1::2] * 16 + tensor[:, ::2]
+    return tensor[1::2, :] * 16 + tensor[::2, :]

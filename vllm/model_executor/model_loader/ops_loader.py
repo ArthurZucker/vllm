@@ -297,7 +297,9 @@ def load_weights(
     """Load `weights` into `model`. Returns the params loaded."""
     if (custom := getattr(model, "load_weights", None)) is not None:
         return custom(weights)  # the Transformers backend: its own conversions first
-    return load_with_ops(model, weights)
+    from vllm.model_executor.models.transformers.conversion import checkpoint_plan
+
+    return load_with_ops(model, weights, hf_quantizer=checkpoint_plan(model))
 
 
 def load_with_ops(
@@ -333,7 +335,10 @@ def load_with_ops(
         param = params.get(target)
         param = model.get_parameter(target) if param is None else param  # tied
         if isinstance(converter, WeightConverter):
-            full = any(isinstance(op, NEEDS_FULL) for op in converter.operations)
+            full = any(
+                isinstance(op, NEEDS_FULL) or getattr(op, "needs_full", False)
+                for op in converter.operations
+            )
             if len(converter.target_patterns) > 1 or full:  # each output sharded after
                 if not any(isinstance(op, ShardOutputs) for op in converter.operations):
                     converter.operations = [*converter.operations, ShardOutputs(model)]

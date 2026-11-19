@@ -57,6 +57,44 @@ class VllmFormatQuantizer(HfQuantizer):
         return False
 
 
+class VllmLayoutQuantizer(VllmFormatQuantizer):
+    """A format vLLM loads into its own layout: `op` (a `ConversionOps` taking the
+    quantizer) on each of the tensors `names`, whole, before the model's ops (e.g.
+    GPTQ / AWQ experts repacked before they merge)"""
+
+    load_serialized = False
+    load_before_model_ops = True
+
+    def __init__(self, op: type, names: list[str]):
+        super().__init__(VllmFormatConfig("vllm_layout"))
+        self.op, self.serialized_names = op, {"weight": list(names)}
+
+    def get_load_operations(self):
+        return {"deserialize": self.op}
+
+    def get_weight_conversions(self):
+        return []  # the model's converters read the tensors
+
+
+def checkpoint_plan(model) -> HfQuantizer | None:
+    """The layers whose quant method loads its own layout (`checkpoint_quantizer`),
+    each with its quantizer; the others take the checkpoint's tensors as they are"""
+    from transformers.quantizers.auto import QuantizationPlanHfQuantizer
+
+    plan = {
+        name: quantizer
+        for name, module in model.named_modules()
+        if (method := getattr(module, "quant_method", None)) is not None
+        and hasattr(method, "checkpoint_quantizer")
+        and (quantizer := method.checkpoint_quantizer(module)) is not None
+    }
+    if not plan:
+        return None
+    hf_quantizer = QuantizationPlanHfQuantizer(plan)
+    hf_quantizer.map_module_to_quantizer(model)
+    return hf_quantizer
+
+
 def register_vllm_formats():
     """Every format vLLM reads that Transformers does not, in its registries"""
     for method in QUANTIZATION_METHODS:
