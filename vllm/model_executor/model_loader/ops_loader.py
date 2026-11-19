@@ -186,7 +186,11 @@ class VllmShard:
             return None
         # on the device first: no CPU kernel in the loader's threads (OpenMP's pool is
         # invalid there, in a forked worker)
-        if getattr(param, "keeps_sent_dtype", False):
+        byte_float = tensor.dtype.is_floating_point and tensor.element_size() == 1
+        if param.dtype == torch.uint8 and byte_float:
+            # ue8m0 scales, FP4 packed as fp8: their bytes, a cast converts by value
+            tensor, dtype = tensor.view(torch.uint8), None
+        elif getattr(param, "keeps_sent_dtype", False):
             dtype = None  # FP8 or BF16 as sent (`dequant_linear`)
         elif param.dtype == torch.float32:
             dtype = torch.float32  # an fp32 param (a router bias) is not rounded first
@@ -363,22 +367,49 @@ def _padded_converters(model: nn.Module) -> list[WeightConverter]:
     ]
 
 
+@contextmanager
+def _lora_unwrapped(model: nn.Module):
+    """LoRA-wrapped layers as the layers they wrap (`base_layer`), as the checkpoint
+    names them: a reload with LoRA enabled"""
+    from vllm.lora.layers.base import BaseLayerWithLoRA
+
+    wrapped = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, BaseLayerWithLoRA)
+    ]
+
+    def put(name: str, module: nn.Module) -> None:
+        parent, _, leaf = name.rpartition(".")
+        setattr(model.get_submodule(parent), leaf, module)
+
+    for name, wrapper in wrapped:
+        put(name, wrapper.base_layer)
+    try:
+        yield
+    finally:
+        for name, wrapper in wrapped:
+            put(name, wrapper)
+
+
 def load_weights(
     model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
     """Load `weights` into `model`. Returns the params loaded."""
-    if (custom := getattr(model, "load_weights", None)) is not None:
-        return custom(weights)  # the Transformers backend: its own conversions first
     from vllm.model_executor.models.transformers.conversion import (
         checkpoint_plan,
         read_scales_along,
     )
 
-    conversions, plan = get_conversion_mapping(model), checkpoint_plan(model)
-    if plan is not None:  # a requantization reads the scales along
-        conversions = read_scales_along(conversions, plan)
-        conversions = plan.update_weight_conversions(conversions, model)
-    return load_with_ops(model, weights, conversions, plan)
+    with _lora_unwrapped(model):
+        # the Transformers backend (`TransformersBase`): its own conversions and plan
+        if (custom := getattr(model, "load_weights", None)) is not None:
+            return custom(weights)
+        conversions, plan = get_conversion_mapping(model), checkpoint_plan(model)
+        if plan is not None:  # a requantization reads the scales along
+            conversions = read_scales_along(conversions, plan)
+            conversions = plan.update_weight_conversions(conversions, model)
+        return load_with_ops(model, weights, conversions, plan)
 
 
 def load_with_ops(

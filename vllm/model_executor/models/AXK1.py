@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only A.X K1 model."""
 
+from functools import partial
 from itertools import islice
 
 import torch
@@ -80,6 +81,7 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    split_fused_shared_experts,
 )
 
 logger = init_logger(__name__)
@@ -903,6 +905,7 @@ class AXK1ForCausalLM(
         # Set MoE hyperparameters
         self.num_moe_layers = _get_mlp_layer_types(self.config).count("sparse")
         self.set_moe_parameters()
+        self.checkpoint_transforms = [partial(split_fused_shared_experts, self)]
 
     def set_moe_parameters(self):
         self.num_expert_groups = getattr(self.config, "n_group", 1)

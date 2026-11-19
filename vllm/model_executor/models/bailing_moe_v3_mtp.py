@@ -23,6 +23,7 @@ from vllm.model_executor.models.bailing_moe_v3 import (
     BailingMoeV3MLAAttention,
     BailingMoeV3MoE,
     _configure_ling_fp8_quant_config,
+    ling_checkpoint,
 )
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -236,7 +237,10 @@ class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
             prefix=maybe_prefix(prefix, "model"),
         )
         self.lm_head: nn.Module | None = None
-        self.checkpoint_transforms = [partial(lm_head_into_shared_heads, self)]
+        self.checkpoint_transforms = [
+            partial(lm_head_into_shared_heads, self),
+            partial(ling_checkpoint, self),  # its target's MXFP4 / block-FP8 layout
+        ]
 
     def embed_input_ids(
         self,

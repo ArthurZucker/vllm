@@ -11,6 +11,7 @@ vLLM's parallel linear layers, MLA kernel, KDA kernel and fused MoE loader.
 import copy
 import re
 from collections.abc import Iterable
+from functools import partial
 from math import lcm
 from typing import TypeGuard
 
@@ -390,6 +391,25 @@ def _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
 _LING_MXFP4_SCALE = re.compile(
     r"(\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight_scale)_inv$"
 )
+
+
+def ling_checkpoint(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Checkpoint stream of a Ling model (and its MTP draft): MXFP4 expert scales
+    renamed; block-FP8 shared experts zero-padded to the intermediate size their TP
+    shards hold whole blocks of"""
+    quant_config = model.quant_config
+    mxfp4 = isinstance(quant_config, Fp8Config) and quant_config.store_dtype == "mxfp4"
+    for name, weight in weights:
+        if mxfp4:
+            name = _LING_MXFP4_SCALE.sub(r"\1", name)
+        if ".mlp.shared_experts." in name:
+            weight = weight if isinstance(weight, torch.Tensor) else weight[...]
+            weight = _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
+                quant_config, model.config, name, weight
+            )
+        yield name, weight
 
 
 class _IdentityProjection(nn.Module):
@@ -1439,7 +1459,7 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         _configure_ling_fp8_quant_config(quant_config, config)
         self.config = config
         self.quant_config = quant_config
-        self.checkpoint_transforms = [self._ling_checkpoint]
+        self.checkpoint_transforms = [partial(ling_checkpoint, self)]
         self.model = BailingMoeV3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -1453,25 +1473,6 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
             self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
-
-    def _ling_checkpoint(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Ling's MXFP4 expert scales renamed; block-FP8 shared experts zero-padded
-        to the intermediate size their TP shards hold whole blocks of"""
-        quant_config = self.quant_config
-        mxfp4 = (
-            isinstance(quant_config, Fp8Config) and quant_config.store_dtype == "mxfp4"
-        )
-        for name, weight in weights:
-            if mxfp4:
-                name = _LING_MXFP4_SCALE.sub(r"\1", name)
-            if ".mlp.shared_experts." in name:
-                weight = weight if isinstance(weight, torch.Tensor) else weight[...]
-                weight = _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
-                    quant_config, self.config, name, weight
-                )
-            yield name, weight
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

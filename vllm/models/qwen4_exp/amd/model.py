@@ -3,6 +3,7 @@
 """Inference-only Qwen4Exp model."""
 
 from collections.abc import Iterable
+from functools import partial
 from itertools import islice
 
 import torch
@@ -72,6 +73,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
+from ..common.ngram_embedding import ple_table_shards
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.sequence_parallel import sp_reduce_scatter, sp_shard
@@ -635,6 +637,8 @@ class Qwen4ExpForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
+        # the n-gram tables' row shards, as one table
+        self.checkpoint_transforms = [partial(ple_table_shards, self)]
         enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
 
     @staticmethod
@@ -913,6 +917,8 @@ class Qwen4ExpForConditionalGeneration(
                 "len(deepstack_visual_indexes)"
             )
         self.set_moe_parameters(self.language_model.model.layers)
+        # the n-gram tables' row shards, as one table
+        self.checkpoint_transforms = [partial(ple_table_shards, self)]
 
     def embed_input_ids(
         self,

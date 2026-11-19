@@ -11,6 +11,7 @@ import threading
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
+import regex as re
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -902,3 +903,93 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         weight = table.view(dtype).view(num_embeddings, embedding_dim)
         self._shared_ptrs.add(weight.data_ptr())
         return weight
+
+
+def _rows(tensor) -> int:
+    """Rows of a tensor or of a lazy safetensors slice"""
+    return (
+        tensor.shape[0] if isinstance(tensor, torch.Tensor) else tensor.get_shape()[0]
+    )
+
+
+class PLEShardedTable:
+    """A PLE table stored in row shards, read as one tensor: indexing its rows (as
+    the loader shards it on read) reads only the overlapping rows of each shard"""
+
+    def __init__(self, shards: list):
+        self.shards = shards  # tensors or lazy slices, in row order
+
+    def get_shape(self) -> list[int]:
+        first = self.shards[0]
+        shape = first.shape if isinstance(first, torch.Tensor) else first.get_shape()
+        return [sum(_rows(s) for s in self.shards), *shape[1:]]
+
+    def get_dtype(self):
+        first = self.shards[0]
+        return first.dtype if isinstance(first, torch.Tensor) else first.get_dtype()
+
+    def __getitem__(self, index) -> torch.Tensor:
+        index = index if isinstance(index, tuple) else (index,)
+        rows, rest = slice(None), index
+        if index and isinstance(index[0], slice):
+            rows, rest = index[0], index[1:]
+        start, stop, _ = rows.indices(self.get_shape()[0])
+        pieces, offset = [], 0
+        for shard in self.shards:
+            count = _rows(shard)
+            lo, hi = max(start - offset, 0), min(stop - offset, count)
+            if lo < hi:
+                pieces.append(shard[lo:hi])
+            offset += count
+        table = torch.cat(pieces) if pieces else self.shards[0][0:0]
+        return table[(slice(None), *rest)] if rest and rest != (Ellipsis,) else table
+
+
+_PLE_SHARD = re.compile(r"^(.*\.ngram_embedding)\.shard_(\d+)\.(\w+)$")
+
+
+def _from_layers(name: str) -> str:
+    """`name` from its `layers.`: the same in the checkpoint and in vLLM"""
+    return name[max(name.find("layers."), 0) :]
+
+
+def ple_table_shards(model: nn.Module, weights):
+    """Checkpoint stream (`checkpoint_transforms`): the n-gram tables stored as
+    `ngram_embedding.shard_<i>.<plane>` (`split_ngram_parts` row shards) as one
+    `ngram_embedding.<plane>`, each rank reading its rows; a disk-offloaded table
+    keeps the shards' file views instead (`accept_checkpoint_shard`)"""
+    tables = {
+        _from_layers(name): module
+        for name, module in model.named_modules()
+        if hasattr(module, "split_ngram_parts")
+    }
+    pending: dict[tuple[str, str], dict[int, object]] = {}
+    parts = 0
+    for name, weight in weights:
+        if not tables or (match := _PLE_SHARD.match(name)) is None:
+            yield name, weight
+            continue
+        head, index, plane = match[1], int(match[2]), match[3]
+        module = tables.get(_from_layers(head).rpartition(".")[0])
+        parts = (module or next(iter(tables.values()))).split_ngram_parts
+        if index >= parts:
+            raise ValueError(
+                f"PLE embedding shard {index} exceeds split_ngram_parts={parts}"
+            )
+        embedding = getattr(module, "ngram_embedding", None)
+        if hasattr(embedding, "accept_checkpoint_shard"):  # disk offload
+            shard_size = -(-embedding.org_vocab_size // parts)
+            tensor = weight if isinstance(weight, torch.Tensor) else weight[...]
+            embedding.accept_checkpoint_shard(index, tensor, shard_size, plane)
+            continue
+        shards = pending.setdefault((head, plane), {})
+        shards[index] = weight
+        if len(shards) == parts:
+            del pending[(head, plane)]
+            table = PLEShardedTable([shards[i] for i in range(parts)])
+            yield f"{head}.{plane}", table
+    if pending:
+        raise ValueError(
+            "PLE embedding shards missing: "
+            f"{[(f'{h}.{p}', parts - len(s)) for (h, p), s in pending.items()]}"
+        )

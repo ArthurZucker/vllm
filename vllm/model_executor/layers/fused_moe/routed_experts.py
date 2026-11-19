@@ -223,6 +223,9 @@ class RoutedExperts(PluggableLayer):
         for name, param in self.named_parameters(recurse=False):
             if param.dim() < 2:  # per-expert scalars
                 continue
+            if param.dim() == 2 and param.shape[1] <= 2:  # gate / up scalars: whole
+                param.expert_dim, param.shard_dim = 0, None
+                continue
             w2 = name.startswith("w2_")
             dim = 2 if w2 else 1
             if getattr(param, "is_transposed", False):

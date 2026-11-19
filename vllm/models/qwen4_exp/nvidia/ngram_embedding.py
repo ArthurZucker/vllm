@@ -118,6 +118,8 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
             )
             self._row_ids = torch.arange(rows[0] * rows[1], device=device)
         self._shards: dict[str, dict[int, torch.Tensor]] = {n: {} for n in self._planes}
+        for name in self._planes:  # served from the checkpoint files, never written
+            getattr(self, name).loaded_at_init = True
         self._shard_size = 0
         self._bound = False
         self._fds: dict[str, int] = {}
@@ -131,6 +133,30 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
     ) -> torch.Tensor:
         """Allocate no rows; they stay in the checkpoint files."""
         return torch.empty(0, embedding_dim, dtype=dtype)
+
+    def accept_checkpoint_shard(
+        self,
+        shard_index: int,
+        loaded_weight: torch.Tensor,
+        shard_size: int,
+        name: str,
+    ) -> None:
+        """Keep a checkpoint shard as a zero-copy byte view of its storage
+        (`common.ngram_embedding.ple_table_shards`)."""
+        if self._bound:
+            raise RuntimeError("PLE disk offload does not support weight reload")
+        if name not in self._shards:
+            raise ValueError(f"PLE disk offload has no {name} plane")
+        dtype = getattr(self, name).dtype
+        if loaded_weight.dtype != dtype:
+            raise ValueError(
+                f"PLE shard {name} dtype {loaded_weight.dtype} must match the "
+                f"embedding dtype {dtype}; disk offload serves rows as stored"
+            )
+        if shard_index in self._shards[name]:
+            raise ValueError(f"Duplicate PLE embedding shard {shard_index} {name}")
+        self._shards[name][shard_index] = loaded_weight.view(torch.uint8)
+        self._shard_size = shard_size
 
     def bind_file_shards(self) -> None:
         """Record each shard's file and offset and release the loader's views."""

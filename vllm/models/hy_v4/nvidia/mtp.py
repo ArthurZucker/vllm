@@ -3,6 +3,8 @@
 """Multi-token prediction (MTP) head for HY V4 (NVIDIA)."""
 
 import copy
+from collections.abc import Iterable
+from functools import partial
 
 import torch
 from torch import nn
@@ -109,6 +111,20 @@ def _prepare_mtp_fp8_expert_scale(
             # the bits instead of numerically converting them.
             loaded_weight = loaded_weight.view(torch.float8_e8m0fnu)
     return name, loaded_weight
+
+
+def _mtp_expert_scales(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Checkpoint stream: block-FP8 experts' `.scale` as `weight_scale_inv`, UE8M0
+    exponents stored as `uint8` viewed as such (a cast would take them as values)"""
+    for name, weight in weights:
+        if ".mlp.experts." in name and name.endswith(".scale"):
+            weight = weight if isinstance(weight, torch.Tensor) else weight[...]
+            name, weight = _prepare_mtp_fp8_expert_scale(
+                model.quant_config, name, weight
+            )
+        yield name, weight
 
 
 def _create_mtp_quant_config(
@@ -506,6 +522,7 @@ class HYV4MTP(nn.Module):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.quant_config = self.model.quant_config
+        self.checkpoint_transforms = [partial(_mtp_expert_scales, self)]
 
     def set_topk_indices_buffer(self, topk_indices_buffer: torch.Tensor) -> None:
         """Share the target sparse-index buffer with every draft consumer.

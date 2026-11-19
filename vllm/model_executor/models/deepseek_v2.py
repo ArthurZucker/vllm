@@ -25,6 +25,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import typing
+from functools import partial
 from itertools import islice
 
 import torch
@@ -121,6 +122,7 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    split_fused_shared_experts,
 )
 
 logger = init_logger(__name__)
@@ -1637,6 +1639,7 @@ class DeepseekV2ForCausalLM(
             self.config.num_hidden_layers - self.config.first_k_dense_replace
         )
         self.set_moe_parameters()
+        self.checkpoint_transforms = [partial(split_fused_shared_experts, self)]
 
     def set_moe_parameters(self):
         self.num_expert_groups = getattr(self.config, "n_group", 1)

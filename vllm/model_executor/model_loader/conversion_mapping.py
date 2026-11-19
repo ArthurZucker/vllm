@@ -36,6 +36,7 @@ from vllm.model_executor.model_loader.weight_ops import (
     Deinterleave,
     EqualSources,
     ExpertRows,
+    ExpertScalars,
     Gather,
     GroupedQKV,
     HeadPermute,
@@ -764,6 +765,19 @@ def _flint_experts(module: nn.Module) -> list[WeightTransform]:
     ]
 
 
+# Step 3.5 / Step 5's per-expert scalars stacked on disk (`moe.gate_proj.input_scale`,
+# `[E]` or one for all), NVFP4's `weight_scale_2` alike
+STACKED_EXPERT_SCALARS = [
+    WeightConverter(
+        [rf"\.moe\.{p}_proj\.{kind}$" for p in projs],
+        f".moe.experts.routed_experts.{param}_{kind}",
+        operations=[ExpertScalars()],
+    )
+    for kind in ("input_scale", "weight_scale_2")
+    for param, projs in (("w13", ("gate", "up")), ("w2", ("down",)))
+]
+
+
 def _stacked_experts(
     module: nn.Module, start: int, count: int, total: int, refuse: str | None = None
 ) -> list[WeightTransform]:
@@ -919,11 +933,13 @@ def _mega_moe_shared_expert(module: nn.Module) -> list[WeightTransform]:
 def _fused_shared_expert(module: nn.Module) -> list[WeightTransform]:
     """A MoE block whose AITER experts fuse its shared expert
     (`is_fused_shared_expert_enabled`): the shared expert loads as the routed
-    experts' extra one, `experts.<n_routed_experts>`"""
+    experts' extra one, `experts.<n_routed_experts>`; several (`n_shared_experts`,
+    one widened tensor) are chunked into their slots by the model's stream
+    (`models.utils.split_fused_shared_experts`)"""
     if not getattr(module, "is_fused_shared_expert_enabled", False):
         return []
-    if getattr(module, "n_shared_experts", 1) != 1:
-        raise NotImplementedError("AITER fused shared experts: one shared expert only")
+    if (getattr(module, "n_shared_experts", 1) or 1) > 1:
+        return []
     new = f"experts.{module.n_routed_experts}."
     return [rename(rf"^{name}\.", new) for name in ("shared_expert", "shared_experts")]
 
@@ -1621,11 +1637,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.", "language_model.model."),
         fused(".fc13.", ".fc1.", ".fc3."),
     ],
-    # EAGLE's draft checkpoint names its body's tensors without `model.`
+    # EAGLE's draft checkpoint names its body's tensors without `model.`: its body's
+    # entry (`DeepseekV2Model`, scoped to `model`) sees them prefixed
     "EagleDeepseekV3ForCausalLM": [
-        rename(r"^(?!lm_head\.|model\.)", "model."),
-    ],
-    "EagleLlamaForCausalLM": [
         rename(r"^(?!lm_head\.|model\.)", "model."),
     ],
     "EagleMistralLarge3ForCausalLM": [
@@ -1875,9 +1889,10 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             ".block_sparse_moe.router.layer.weight$", ".block_sparse_moe.gate.weight"
         ),
     ],
+    # straight to vLLM's experts: `FUSED_EXPERTS` (Transformers' names) ran already
     "GraniteMoeModel": [
-        rename("moe.input_linear.weight$", "moe.experts.gate_up_proj"),
-        rename("moe.output_linear.weight$", "moe.experts.down_proj"),
+        rename("moe.input_linear.weight$", "moe.experts.routed_experts.w13_weight"),
+        rename("moe.output_linear.weight$", "moe.experts.routed_experts.w2_weight"),
         rename(".router.layer.weight$", ".gate.weight"),
         rename(".router.weight$", ".gate.weight"),
     ],
@@ -2663,6 +2678,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             )
             for kind in ("weight", "weight_scale")
         ),
+        *STACKED_EXPERT_SCALARS,
     ],
     "Step3p5ForCausalLM": [
         rename(".share_expert.", ".moe.share_expert."),
@@ -2684,6 +2700,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             )
             for kind in ("weight", "weight_scale_inv")
         ),
+        *STACKED_EXPERT_SCALARS,
     ],
     "Step5ForCausalLM": [
         drop("^vit_large_projector.weight$"),

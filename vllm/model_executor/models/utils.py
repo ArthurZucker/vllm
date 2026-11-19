@@ -529,6 +529,39 @@ def get_fused_shared_expert_layers(
     return frozenset(fused_layers)
 
 
+def split_fused_shared_experts(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Checkpoint stream (`checkpoint_transforms`): where AITER fuses
+    `n_shared_experts > 1` shared experts into the routed ones, their one widened
+    tensor (`mlp.shared_experts.*`) chunked into the extra expert slots
+    `mlp.experts.<n_routed_experts + j>`: gate / up on their rows, down on its
+    columns. One shared expert is a rename (`conversion_mapping`)."""
+    # by the name from `layers.`, the same in the checkpoint and in vLLM
+    blocks = {
+        name[max(name.find("layers."), 0) :]: module
+        for name, module in model.named_modules()
+        if getattr(module, "is_fused_shared_expert_enabled", False)
+        and (getattr(module, "n_shared_experts", 1) or 1) > 1
+    }
+    for name, weight in weights:
+        head, found, tail = name.partition(".shared_experts.")
+        block = blocks.get(head[max(head.find("layers."), 0) :]) if found else None
+        if block is None:
+            yield name, weight
+            continue
+        tensor = weight if isinstance(weight, torch.Tensor) else weight[...]
+        dim = 1 if "down_proj.weight" in tail and tensor.dim() > 1 else 0
+        n = block.n_shared_experts
+        if tensor.shape[dim] % n:
+            raise ValueError(
+                f"Shared experts {name!r}: {tensor.shape[dim]} along dim {dim} is "
+                f"not divisible by n_shared_experts={n}"
+            )
+        for j, chunk in enumerate(tensor.chunk(n, dim)):
+            yield f"{head}.experts.{block.n_routed_experts + j}.{tail}", chunk
+
+
 def get_spec_layer_idx_from_weight_name(
     config: "PreTrainedConfig", weight_name: str
 ) -> int | None:

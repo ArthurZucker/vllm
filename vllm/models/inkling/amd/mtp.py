@@ -19,7 +19,7 @@ near-identity trims, unlike the backbone's whitening `embed_norm`).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from functools import partial
 
 import regex as re
 import torch
@@ -32,7 +32,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import SupportsMultiModalEmbeddings
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.models.inkling.common.loading import load_inkling_weights
+from vllm.models.inkling.common.loading import inkling_expert_weights
 from vllm.sequence import IntermediateTensors
 
 from ..configs import InklingModelConfig
@@ -268,6 +268,7 @@ class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
         self.model = InklingMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.checkpoint_transforms = [partial(inkling_expert_weights, self)]
         # The target's (vocab-sharded) LM head, attached by load_eagle_model;
         # never materialized here (same reasoning as model.embed_tokens).
         self.lm_head: ParallelLMHead = None  # type: ignore[assignment]
@@ -347,9 +348,6 @@ class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
         positive scalar, so the argmax is invariant and the scaling is
         skipped entirely."""
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return load_inkling_weights(self, weights)
 
 
 EntryClass = [InklingMTP]

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from functools import partial
 from typing import Any
 
 import regex as re
@@ -31,7 +31,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.models.inkling.common.loading import load_inkling_weights
+from vllm.models.inkling.common.loading import inkling_expert_weights
 from vllm.models.inkling.common.mm_preprocess import (
     InklingDummyInputsBuilder,
     InklingMultiModalProcessor,
@@ -361,6 +361,7 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.checkpoint_transforms = [partial(inkling_expert_weights, self)]
         self.lm_head = ParallelLMHead(
             text_config.padded_vocab_size,
             text_config.hidden_size,
@@ -398,9 +399,6 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return load_inkling_weights(self, weights)
 
 
 class InklingForCausalLM(_TmlForCausalLMBase):

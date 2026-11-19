@@ -374,3 +374,41 @@ class MergeLora(ConversionOps):
             a, b = b, a
         delta = (b @ a).view(weight.shape) * self.scaling
         return {target_patterns[0]: (weight.float() + delta).to(weight.dtype)}
+
+
+class ExpertScalars(ConversionOps):
+    """Per-expert scalars stacked on disk (`[experts]`, or one for all: `[1]`, `[]`;
+    Step 3.5 / Step 5's `moe.gate_proj.input_scale`), one source per shard (gate,
+    up), as the target param: `[local experts, shards]`, or `[local experts]` where
+    the shards share one value (which they must equal). This rank's experts (EP)"""
+
+    needs_full = True  # a scalar for all experts is not the experts' rows yet
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        param = _target(kwargs)
+        rows = param.shape[0]
+        name = kwargs["full_layer_name"]
+        layer = kwargs["model"].get_submodule(name.rpartition(".")[0])
+        ep_rank = layer.moe_config.moe_parallel_config.ep_rank
+
+        def local(t: torch.Tensor) -> torch.Tensor:
+            t = t.reshape(-1).float()
+            if t.numel() == 1:
+                return t.expand(rows)
+            return t if t.numel() == rows else t.narrow(0, ep_rank * rows, rows)
+
+        columns = [
+            local(t[0] if isinstance(t, list) else t)
+            for t in (input_dict[p] for p in source_patterns if p in input_dict)
+        ]
+        if param.dim() == 2:
+            return {target_patterns[0]: torch.stack(columns, dim=1)}
+        first, *others = columns
+        for other in others:
+            if not torch.allclose(other, first, rtol=1e-5):
+                raise ValueError(
+                    f"{kwargs.get('full_layer_name')}: {source_patterns} differ; "
+                    "the param holds one value per expert"
+                )
+        return {target_patterns[0]: first}

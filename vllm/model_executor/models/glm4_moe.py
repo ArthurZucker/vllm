@@ -24,6 +24,7 @@
 """Inference-only GLM-4.5, GLM-4.6, GLM-4.7 model
 compatible with HuggingFace weights."""
 
+from functools import partial
 from itertools import islice
 
 import torch
@@ -70,6 +71,7 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    split_fused_shared_experts,
 )
 
 
@@ -563,6 +565,7 @@ class Glm4MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, Glm4MixtureOfExper
                 self.moe_layers.append(layer.mlp.experts)
 
         self.extract_moe_parameters(example_moe)
+        self.checkpoint_transforms = [partial(split_fused_shared_experts, self)]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
