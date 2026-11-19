@@ -85,7 +85,8 @@ class NegExp(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        return _each(input_dict, lambda t: -torch.exp(t.float()))
+        # on CPU as upstream did: GPU `exp` is 1 ulp off it (`A` is a few hundred values)
+        return _each(input_dict, lambda t: -torch.exp(t.float().cpu()))
 
 
 class Affine(ConversionOps):
