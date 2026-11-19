@@ -316,7 +316,8 @@ class GlmOcrVisionTransformer(Glm4vVisionTransformer):
         )
         self.merger = GlmOcrPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=text_config.intermediate_size,
+            # as Transformers: the patch's channels, not the text MLP's width
+            context_dim=vision_config.out_hidden_size * vision_config.in_channels,
             quant_config=quant_config,
             bias=False,
             prefix=f"{prefix}.merger",
