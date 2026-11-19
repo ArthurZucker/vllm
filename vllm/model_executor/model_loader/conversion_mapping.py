@@ -255,6 +255,7 @@ DRAFT_VOCAB = [rename("^d2t$", "draft_id_to_target_id"), drop("^t2d$")]
 DRAFT_MODEL_PREFIX = rename(r"^(?!lm_head\.|draft_id_to_target_id$|model\.)", "model.")
 QKV = fused(".qkv_proj", ".q_proj", ".k_proj", ".v_proj")
 GATE_UP = fused(".gate_up_proj", ".gate_proj", ".up_proj")
+MLA_QKV_A = fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa")
 
 
 def _cosmos3_edge() -> list[WeightTransform]:
@@ -327,14 +328,19 @@ def _k3_dspark(module: nn.Module) -> list[WeightTransform]:
     embedding and LM head are shared, the confidence head is training only unless
     the draft built one (adaptive verification reads it)"""
     confidence = getattr(module.config, "enable_confidence_head", False)
+    layers = module.model.config.num_hidden_layers
     return [
         *([] if confidence else [drop("confidence_head")]),
         drop("embed_tokens"),
         drop("lm_head"),
         rename("^", "model."),
         GATE_UP,
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
-        _k3_context_kv(module),
+        MLA_QKV_A,
+        # the cross-layer KV projection: every draft layer's `kv_a_proj_with_mqa`,
+        # duplicated on the stream (`context_kv_sources`)
+        fused(
+            "context_kv_proj.", *(f"context_kv_proj_src.{i}." for i in range(layers))
+        ),
     ]
 
 
@@ -575,6 +581,43 @@ def _deepseek_v4_mtp(module: nn.Module) -> list[WeightTransform]:
     ]
 
 
+# Tml / Inkling layers: the MLPs, the routed experts' quantized tensors and the
+# attention's fused projection
+TML_LAYERS = [
+    rename(".w13_dn", ".gate_up_proj"),
+    rename(".w2_md", ".down_proj"),
+    *(
+        rename(
+            f".{w}_weight.{src}$",
+            f".routed_experts.{w}_"
+            + {"scale": "weight_scale", "scale2": "weight_scale_2"}.get(src, src),
+        )
+        for w in ("w13", "w2")
+        for src in (
+            "scale",
+            "scale2",
+            "input_global_scale",
+            "weight_global_scale",
+            "weight_packed",
+            "weight_scale",
+        )
+    ),
+    fused(
+        ".attn.qkvr.", ".attn.wq_du.", ".attn.wk_dv.", ".attn.wv_dv.", ".attn.wr_du."
+    ),
+]
+TML = [
+    rename("^model.llm.layers.", "model.layers."),
+    rename("^model.llm.embed_norm", "model.embed_norm"),
+    rename("^model.llm.embed", "model.embed_tokens"),
+    rename("^model.llm.norm", "model.norm"),
+    rename("^model.llm.unembed", "lm_head"),
+    rename("^language_model.layers.", "model.layers."),
+    rename("^language_model.lm_head.", "lm_head."),
+    *TML_LAYERS,
+]
+
+
 # MiniMax M3's attention: in the param's shard order
 # (`MinimaxM3QKVParallelLinearWithIndexer`)
 MINIMAX_M3_QKV = fused(
@@ -618,8 +661,6 @@ def _gemma4(module: nn.Module) -> list[WeightTransform]:
             )
             for i in k_eq_v
         ),
-        QKV,
-        GATE_UP,
     ]
 
 
@@ -636,8 +677,6 @@ def _mimo_mtp(module: nn.Module) -> list[WeightTransform]:
             rename(rf"^model\.mtp_layers\.{i}\.", f"model.mtp_layers.{i + start}.")
             for i in range(layers)
         ),
-        QKV,
-        GATE_UP,
     ]
 
 
@@ -650,8 +689,6 @@ def _ernie_mtp(module: nn.Module) -> list[WeightTransform]:
             rename(rf"model\.{part}\.0\.", f"model.layers.{layer}.{part}.")
             for part in parts
         ),
-        QKV,
-        GATE_UP,
     ]
 
 
@@ -691,15 +728,6 @@ def _kimi_kda(module: nn.Module) -> list[WeightTransform]:
         fused("in_proj_qkvgfab", *(f"{p}_proj" for p in parts)),
         fused("conv1d", "q_conv1d", "k_conv1d", "v_conv1d"),
     ]
-
-
-def _k3_context_kv(module: nn.Module) -> WeightConverter:
-    """K3 DSpark's cross-layer KV projection: every draft layer's
-    `kv_a_proj_with_mqa`, duplicated on the stream (`context_kv_sources`)"""
-    layers = module.model.config.num_hidden_layers
-    return fused(
-        "context_kv_proj.", *(f"context_kv_proj_src.{i}." for i in range(layers))
-    )
 
 
 def _minicpm_moe(module: nn.Module) -> list[WeightTransform]:
@@ -1055,7 +1083,7 @@ def _longcat_mtp(module: nn.Module) -> list[WeightTransform]:
         rename(
             r"^model\.mtp\.layers\.0\.(?:transformer_layer\.)?", layer + "mtp_block."
         ),
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ]
 
 
@@ -1306,8 +1334,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         # Muse-Glimmer-30B-assistant's aux-hidden-state encoder: same tensors
         rename(r"(?<![A-Za-z0-9_])encoder.output_norm_enc(?=\.|\*|$)", "hidden_norm"),
         rename(r"(?<![A-Za-z0-9_])encoder.fc(?=\.|\*|$)", "fc"),
-        QKV,
-        GATE_UP,
     ],
     "Dots3NoteForCausalLM": _dots3_note,
     # the MTP layer's embedding, stored under `mtp.`
@@ -1318,38 +1344,13 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         ),
         *_CONVERSION_MAPPING["DeepseekV32MTP"](m),
     ],
-    "EmbeddingGemma2Model": [
-        fused(
-            ".self_attn.qkv_proj.weight",
-            ".self_attn.q_proj.weight",
-            ".self_attn.k_proj.weight",
-            ".self_attn.v_proj.weight",
-        ),
-        fused(
-            ".self_attn.qkv_proj.bias",
-            ".self_attn.q_proj.bias",
-            ".self_attn.k_proj.bias",
-            ".self_attn.v_proj.bias",
-        ),
-        fused(
-            ".mlp.gate_up_proj.weight", ".mlp.gate_proj.weight", ".mlp.up_proj.weight"
-        ),
-        fused(".mlp.gate_up_proj.bias", ".mlp.gate_proj.bias", ".mlp.up_proj.bias"),
-    ],
     "K3DSparkForCausalLM": _k3_dspark,
     "MiniMaxM3SparseForCausalLM": [
         drop("mtp."),
         # ModelOpt MXFP8 layers name the checkpoint's block scales this way
         rename("weight_scale_inv", "weight_scale"),
         # in the param's shard order (`MinimaxM3QKVParallelLinearWithIndexer`)
-        fused(
-            ".qkv_proj",
-            ".q_proj",
-            ".k_proj",
-            ".v_proj",
-            ".index_q_proj",
-            ".index_k_proj",
-        ),
+        MINIMAX_M3_QKV,
         GATE_UP,
     ],
     "MuseSparkForConditionalGeneration": MUSE_SPARK_OMNI,
@@ -1367,7 +1368,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: stacked_unparsed
     "AXK1Model": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     "AfmoeForCausalLM": [
         rename(".router.gate.weight$", ".gate.weight"),
@@ -1395,7 +1396,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             r"\.mlp\.experts\.(e_score_correction|expert)_bias$",
             ".mlp.gate.expert_bias",
         ),
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     # a full-attention layer's output projection, `dense` as the linear ones'
     "BailingMoeV25MLAAttention": [
@@ -1406,7 +1407,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "BailingMoeV3MTPModel": [
         rename(".attention.", ".self_attn."),
         rename("^attention.", "self_attn."),
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     "BailingMoeV3VLForConditionalGeneration": [
         rename(".attention.", ".self_attn."),
@@ -1612,17 +1613,17 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "DeepseekV2Eagle3Model": [
         rename("midlayer.", "layers.0."),
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     # TODO: old loader: stacked_unparsed
     "DeepseekV2Model": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     # TODO: old loader: stacked_unparsed
     "DeepseekV32MTP": lambda m: [*_spec_layers(m), *_mla_qkv_a(m)],
     # TODO: old loader: stacked_unparsed
     "DeepseekV32Model": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     "DeepseekVLV2ForCausalLM": [
         rename("^language.", "language_model."),
@@ -1711,7 +1712,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: stacked_unparsed
     "FlashModel": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     "FunASREncoder": [
         fused(
@@ -1813,7 +1814,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: stacked_unparsed
     "Glm4MoeLiteModel": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     "Glm4vForConditionalGeneration": [
         rename("^lm_head.", "language_model.lm_head."),
@@ -1825,7 +1826,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     # TODO: old loader: stacked_unparsed
     "Glm5NextModel": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
         fused(
             ".in_proj_qkvbfg_a",
             ".q_proj",
@@ -1909,59 +1910,18 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^vision_model.", "visual."),
     ],
     "HYV4ForCausalLM": [
-        fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+        MLA_QKV_A,
     ],
     "HrmTextForCausalLM": [
         rename(".attn.", ".self_attn."),
     ],
     "InklingForConditionalGeneration": [
-        rename(".w13_dn", ".gate_up_proj"),
-        rename(".w2_md", ".down_proj"),
-        rename("^model.llm.layers.", "model.layers."),
-        rename("^model.llm.embed_norm", "model.embed_norm"),
-        rename("^model.llm.embed", "model.embed_tokens"),
-        rename("^model.llm.norm", "model.norm"),
-        rename("^model.llm.unembed", "lm_head"),
-        rename("^language_model.layers.", "model.layers."),
-        rename("^language_model.lm_head.", "lm_head."),
+        *TML,
         rename("^model.audio.", "audio."),
         rename("^model.visual.", "visual.vision_encoder."),
-        rename(".w13_weight.scale$", ".routed_experts.w13_weight_scale"),
-        rename(".w13_weight.scale2$", ".routed_experts.w13_weight_scale_2"),
-        rename(".w2_weight.scale$", ".routed_experts.w2_weight_scale"),
-        rename(".w2_weight.scale2$", ".routed_experts.w2_weight_scale_2"),
-        rename(
-            ".w13_weight.input_global_scale$",
-            ".routed_experts.w13_input_global_scale",
-        ),
-        rename(
-            ".w13_weight.weight_global_scale$",
-            ".routed_experts.w13_weight_global_scale",
-        ),
-        rename(".w13_weight.weight_packed$", ".routed_experts.w13_weight_packed"),
-        rename(".w13_weight.weight_scale$", ".routed_experts.w13_weight_scale"),
-        rename(
-            ".w2_weight.input_global_scale$",
-            ".routed_experts.w2_input_global_scale",
-        ),
-        rename(
-            ".w2_weight.weight_global_scale$",
-            ".routed_experts.w2_weight_global_scale",
-        ),
-        rename(".w2_weight.weight_packed$", ".routed_experts.w2_weight_packed"),
-        rename(".w2_weight.weight_scale$", ".routed_experts.w2_weight_scale"),
-        fused(
-            ".attn.qkvr.",
-            ".attn.wq_du.",
-            ".attn.wk_dv.",
-            ".attn.wv_dv.",
-            ".attn.wr_du.",
-        ),
     ],
     "InklingMTP": [
         drop(r"^(?!.*\.mtp\.|model\.llm\.embed_norm\.weight$)"),  # the target's
-        rename(".w13_dn", ".gate_up_proj"),
-        rename(".w2_md", ".down_proj"),
         rename("^model.llm.layers.", "model.layers."),
         # the target's embedding norm, applied before the depth layers
         rename("^model.llm.embed_norm.weight$", "model.backbone_embed_norm.weight"),
@@ -1971,42 +1931,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^language_model.layers.", "model.layers."),
         rename("^language_model.lm_head.", "lm_head."),
         rename("^model.mtp.", "model."),
-        rename(".w13_weight.scale$", ".routed_experts.w13_weight_scale"),
-        rename(".w13_weight.scale2$", ".routed_experts.w13_weight_scale_2"),
-        rename(".w2_weight.scale$", ".routed_experts.w2_weight_scale"),
-        rename(".w2_weight.scale2$", ".routed_experts.w2_weight_scale_2"),
-        rename(
-            ".w13_weight.input_global_scale$",
-            ".routed_experts.w13_input_global_scale",
-        ),
-        rename(
-            ".w13_weight.weight_global_scale$",
-            ".routed_experts.w13_weight_global_scale",
-        ),
-        rename(".w13_weight.weight_packed$", ".routed_experts.w13_weight_packed"),
-        rename(".w13_weight.weight_scale$", ".routed_experts.w13_weight_scale"),
-        rename(
-            ".w2_weight.input_global_scale$",
-            ".routed_experts.w2_input_global_scale",
-        ),
-        rename(
-            ".w2_weight.weight_global_scale$",
-            ".routed_experts.w2_weight_global_scale",
-        ),
-        rename(".w2_weight.weight_packed$", ".routed_experts.w2_weight_packed"),
-        rename(".w2_weight.weight_scale$", ".routed_experts.w2_weight_scale"),
-        fused(
-            ".attn.qkvr.",
-            ".attn.wq_du.",
-            ".attn.wk_dv.",
-            ".attn.wv_dv.",
-            ".attn.wr_du.",
-        ),
+        *TML_LAYERS,
     ],
     "InternLM2ForCausalLM": [
-        fused(".gate_up_proj", ".w1", ".w3"),
-    ],
-    "InternLM2Model": [
         fused(".gate_up_proj", ".w1", ".w3"),
     ],
     "InternS1ForConditionalGeneration": [
@@ -2017,7 +1944,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "InternS2MobiusModel": [
         fused(".in_proj_qkvz", (".in_proj_qkv", 3), ".in_proj_z"),
-        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
         fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
     ],
     "IsaacForConditionalGeneration": [
@@ -2238,8 +2164,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("image_projector.w2", "image_projector.down_proj"),
         rename("att_proj", "qkv_proj"),
         rename("attn_out", "o_proj"),
-        rename("q_norm", "q_norm"),
-        rename("k_norm", "k_norm"),
         rename("ff_proj", "up_gate_proj"),
         rename("ff_out", "down_proj"),
         rename("attn_norm", "input_layernorm"),
@@ -2594,7 +2518,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             "hyper_connection.block_inject_weight.weight",
         ),
         fused("ple.kv_proj", "ple.key_proj", "ple.value_proj"),
-        fused(".in_proj_ba", ".in_proj_b", ".in_proj_a"),
     ],
     "RadioModel": [
         rename(
@@ -2723,48 +2646,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("0.weight", "A.weight"),
         rename("1.weight", "B.weight"),
     ],
-    "_TmlForCausalLMBase": [
-        rename(".w13_dn", ".gate_up_proj"),
-        rename(".w2_md", ".down_proj"),
-        rename("^model.llm.layers.", "model.layers."),
-        rename("^model.llm.embed_norm", "model.embed_norm"),
-        rename("^model.llm.embed", "model.embed_tokens"),
-        rename("^model.llm.norm", "model.norm"),
-        rename("^model.llm.unembed", "lm_head"),
-        rename("^language_model.layers.", "model.layers."),
-        rename("^language_model.lm_head.", "lm_head."),
-        rename(".w13_weight.scale$", ".routed_experts.w13_weight_scale"),
-        rename(".w13_weight.scale2$", ".routed_experts.w13_weight_scale_2"),
-        rename(".w2_weight.scale$", ".routed_experts.w2_weight_scale"),
-        rename(".w2_weight.scale2$", ".routed_experts.w2_weight_scale_2"),
-        rename(
-            ".w13_weight.input_global_scale$",
-            ".routed_experts.w13_input_global_scale",
-        ),
-        rename(
-            ".w13_weight.weight_global_scale$",
-            ".routed_experts.w13_weight_global_scale",
-        ),
-        rename(".w13_weight.weight_packed$", ".routed_experts.w13_weight_packed"),
-        rename(".w13_weight.weight_scale$", ".routed_experts.w13_weight_scale"),
-        rename(
-            ".w2_weight.input_global_scale$",
-            ".routed_experts.w2_input_global_scale",
-        ),
-        rename(
-            ".w2_weight.weight_global_scale$",
-            ".routed_experts.w2_weight_global_scale",
-        ),
-        rename(".w2_weight.weight_packed$", ".routed_experts.w2_weight_packed"),
-        rename(".w2_weight.weight_scale$", ".routed_experts.w2_weight_scale"),
-        fused(
-            ".attn.qkvr.",
-            ".attn.wq_du.",
-            ".attn.wk_dv.",
-            ".attn.wv_dv.",
-            ".attn.wr_du.",
-        ),
-    ],
+    "_TmlForCausalLMBase": TML,
 }
 
 _CONVERSION_MAPPING["ColBERTModernBertModel"] = _CONVERSION_MAPPING["ColBERTLfm2Model"]
@@ -3055,7 +2937,7 @@ def _mla_qkv_a(module: nn.Module) -> list[WeightTransform]:
     """MLA's latent projections fused, when built (a `q_lora_rank`)"""
     if getattr(module.config, "q_lora_rank", None) is None:
         return []
-    return [fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa")]
+    return [MLA_QKV_A]
 
 
 def _step_mtp(module: nn.Module) -> list[WeightTransform]:
@@ -3178,7 +3060,7 @@ _CONVERSION_MAPPING["BailingMoeV25MTPModel"] = [
     rename(".attention.dense.", ".self_attn.o_proj."),
     rename(".attention.", ".self_attn."),
     rename(r"\.mlp\.gate\.e_score_correction_bias$", ".mlp.gate.expert_bias"),
-    fused(".fused_qkv_a_proj", ".q_a_proj", ".kv_a_proj_with_mqa"),
+    MLA_QKV_A,
 ]
 _CONVERSION_MAPPING["BailingMoeV3MultiTokenPredictor"] = [
     rename(r"^word_embeddings\.", "embed_tokens."),
