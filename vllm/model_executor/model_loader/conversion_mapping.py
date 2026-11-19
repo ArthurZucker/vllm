@@ -2661,6 +2661,13 @@ _CONVERSION_MAPPING["BailingMoeV3ForCausalLM"] = _CONVERSION_MAPPING[
 ] + [
     fused(".qkvb_proj", ".q_proj", ".k_proj", ".v_proj", ".b_proj"),
 ]
+# the experts' correction bias: the router's param (`LagunaMoE`)
+_CONVERSION_MAPPING["LagunaForCausalLM"] = [
+    rename(
+        r"\.mlp\.experts\.e_score_correction_bias$",
+        ".mlp.experts.router.e_score_correction_bias",
+    )
+]
 _CONVERSION_MAPPING["CohereAsrForConditionalGeneration"] = (
     [
         # NeMo's names, with or without the `model.` body (Transformers saves it)
