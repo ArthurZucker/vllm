@@ -2213,6 +2213,11 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.language_model.", "language_model.model."),
         rename("^model.whisper_encoder.", "whisper_encoder."),
         rename("^model.vq_adaptor.", "vq_adaptor."),
+        # Transformers' names
+        rename("^model.audio_tower.", "whisper_encoder."),
+        rename("^model.multi_modal_projector.linear_1.", "vq_adaptor.layers.0."),
+        rename("^model.multi_modal_projector.linear_2.", "vq_adaptor.layers.2."),
+        rename("^model.multi_modal_projector.norm.", "vq_adaptor.layers.3."),
         drop("^model."),
     ],
     "MossTranscribeDiarizeWhisperEncoder": [
@@ -2760,8 +2765,10 @@ _CONVERSION_MAPPING["LlavaForConditionalGeneration"] = _CONVERSION_MAPPING[
 _CONVERSION_MAPPING["LlavaNextForConditionalGeneration"] = _CONVERSION_MAPPING[
     "BeeForConditionalGeneration"
 ]
-_CONVERSION_MAPPING["LlavaNextVideoForConditionalGeneration"] = _CONVERSION_MAPPING[
-    "BeeForConditionalGeneration"
+# its vision tower saved bare (`vision_tower.encoder.`), as vLLM's CLIP's `vision_model`
+_CONVERSION_MAPPING["LlavaNextVideoForConditionalGeneration"] = [
+    *_CONVERSION_MAPPING["BeeForConditionalGeneration"],
+    rename(r"^vision_tower\.(?!vision_model\.)", "vision_tower.vision_model."),
 ]
 _CONVERSION_MAPPING["LlavaOnevisionForConditionalGeneration"] = _CONVERSION_MAPPING[
     "BeeForConditionalGeneration"
