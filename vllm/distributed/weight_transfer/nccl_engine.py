@@ -40,6 +40,7 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     packed_nccl_broadcast_consumer,
     packed_nccl_broadcast_producer,
 )
+from vllm.model_executor.model_loader import ops_loader
 
 # NCCLWeightTransferInitInfo is re-exported here for convenience; its canonical
 # home is nccl_common, shared with the sparse backend.
@@ -339,7 +340,9 @@ class NCCLWeightTransferEngine(
             )
         model = self.model
         load_weights = (
-            model.load_weights if plan is None else partial(load_planned, model, plan)
+            partial(ops_loader.load_weights, model)
+            if plan is None
+            else partial(load_planned, model, plan)
         )
         if self.packed:
             # Build iterator of (name, (shape, dtype)) from update_info

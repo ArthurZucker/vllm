@@ -446,7 +446,7 @@ def _get_original_loader(tensor: torch.Tensor) -> Callable:
 
 
 def _get_weight_loader(tensor: torch.Tensor):
-    return getattr(tensor, "weight_loader", default_weight_loader)
+    return getattr(tensor, "weight_loader", None) or default_weight_loader
 
 
 def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):

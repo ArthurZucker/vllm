@@ -844,7 +844,6 @@ class DFlashQwen3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-
     def _tee_context_kv(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
@@ -902,6 +901,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        self.checkpoint_transforms = [self._with_mask_embedding]
 
     def embed_input_ids(
         self,
@@ -985,9 +985,18 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             result = result.squeeze(0)
         return result
 
-
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_kv_buffers()
+
+    def _with_mask_embedding(self, weights):
+        """The stream, then the separately-shipped mask embedding when there is one"""
+        yield from weights
+        mask = self._read_mask_embedding()
+        if mask is None:  # embed_tokens[mask_token_id] is used instead
+            self.model.mask_embedding.loaded_at_init = True
+        else:
+            self.model.has_separate_mask_embedding = True
+            yield "model.mask_embedding", mask
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.
