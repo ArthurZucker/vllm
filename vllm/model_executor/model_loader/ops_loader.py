@@ -190,7 +190,8 @@ class VllmShard:
         elif self.sources == 1:  # the param's own range, e.g. a padded vocab
             local = target[dim]
         else:
-            replicas = _replicas(layer, shards[self.index])
+            shard = shards[self.index] if self.index < len(shards) else None
+            replicas = _replicas(layer, shard)
             local = shape[dim] * replicas // size
         start = min(rank // replicas * local, shape[dim])
         return _read(source, dim, start, min(local, shape[dim] - start))

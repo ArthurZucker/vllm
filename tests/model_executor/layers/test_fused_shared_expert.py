@@ -30,15 +30,12 @@ from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
     is_shared_expert_quant_fse_compatible,
 )
-from vllm.model_executor.model_loader.ops_loader import load_weights
+from vllm.model_executor.model_loader.conversion_mapping import from_mapper
+from vllm.model_executor.model_loader.ops_loader import load_weights, load_with_ops
 from vllm.model_executor.models.qwen3_next import (
     _should_replicate_misaligned_shared_expert,
 )
-from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
-    get_fused_shared_expert_layers,
-)
+from vllm.model_executor.models.utils import get_fused_shared_expert_layers
 from vllm.models.deepseek_v4 import quant_config as deepseek_v4_quant_config
 from vllm.models.minimax_m3.amd import model as minimax_m3_model
 from vllm.platforms import current_platform
@@ -1369,11 +1366,12 @@ class _SingleRankGroup:
 def _load_minimax_m3_weights(
     model: nn.Module, weights: list[tuple[str, torch.Tensor]]
 ) -> set[str]:
-    """Load like `MiniMaxM3SparseForCausalLM`; the inner model has no loader."""
+    """Load like `MiniMaxM3SparseForCausalLM`, whose mapper and fused shared expert
+    redirect live on the wrapper, not on this inner model."""
     redirect = partial(minimax_m3_model._redirect_fused_shared_experts, model=model)
+    model.checkpoint_transforms = [redirect]
     mapper = minimax_m3_model.MiniMaxM3SparseForCausalLM.hf_to_vllm_mapper
-    mapper = mapper | WeightsMapper(weights_transforms=[redirect])
-    return AutoWeightsLoader(model).load_weights(weights, mapper=mapper)
+    return load_with_ops(model, weights, conversions=from_mapper(mapper))
 
 
 @pytest.fixture

@@ -1639,6 +1639,7 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
         ShardedRDTWeightTransferEngine,
         ShardedRDTWeightTransferInitInfo,
     )
+    from vllm.model_executor.model_loader.ops_loader import load_weights
     from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
     from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 
@@ -1700,7 +1701,7 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
                     prm.zero_()
 
     _poison()
-    model.load_weights(_feed())
+    load_weights(model, _feed())
     loaded = {
         n
         for n, prm in model.named_parameters()

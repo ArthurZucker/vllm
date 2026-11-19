@@ -71,9 +71,7 @@ def test_video_input_is_rejected(processor) -> None:
 
 
 def test_weights_mapper_unwraps_vlm_and_drops_expert() -> None:
-    renamings = _CONVERSION_MAPPING[
-        _entry_name(Alpamayo2SuperForConditionalGeneration)
-    ]
+    renamings = _CONVERSION_MAPPING[_entry_name(Alpamayo2SuperForConditionalGeneration)]
     names = [
         "vlm.model.language_model.layers.0.mlp.up_proj.weight",
         "vlm.model.visual.blocks.0.attn.qkv.weight",

@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import (
     _in_own_storage,
     is_weights_pre_processed,
@@ -147,7 +148,9 @@ def _load_weight_in_sent_dtype(layer: torch.nn.Module) -> None:
     param.data = storage_view(
         bf16.untyped_storage(), 0, param.shape, param.stride(), param.dtype
     )
-    layer.checkpoint_weight_loader = param.weight_loader
+    layer.checkpoint_weight_loader = (
+        getattr(param, "weight_loader", None) or default_weight_loader
+    )
     param.weight_loader = MethodType(_weight_loader_in_sent_dtype, layer)
 
 
