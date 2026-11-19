@@ -261,6 +261,15 @@ class VllmShard:
         return torch.cat(pieces, dim=dim)
 
 
+class ReadOnDevice:
+    """A whole tensor, for ops sharding their output (`ShardOutputs`): moved, then
+    cast. Transformers' plain copy casts first, a CPU kernel in the loader's threads
+    (OpenMP's pool is invalid there, in a forked worker)"""
+
+    def shard_tensor(self, source, tensor_idx=None, device=None, dtype=None):
+        return _read(source).to(device=device).to(dtype=dtype)
+
+
 class ShardOutputs(ConversionOps):
     """After a split (e.g. a `qkv` on disk into vLLM's q, k and v), each output
     sharded as its own param is"""
@@ -457,7 +466,7 @@ def load_with_ops(
             if len(converter.target_patterns) > 1 or full:  # each output sharded after
                 if not any(isinstance(op, ShardOutputs) for op in converter.operations):
                     converter.operations = [*converter.operations, ShardOutputs(model)]
-                return None
+                return ReadOnDevice()
             sources = converter.source_patterns
             index, expert = sources.index(source_pattern), "*" in source_pattern
         else:
