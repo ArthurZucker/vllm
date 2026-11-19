@@ -194,11 +194,11 @@ class VllmShard:
             dtype = None  # FP8 or BF16 as sent (`dequant_linear`)
         elif param.dtype == torch.float32:
             dtype = torch.float32  # an fp32 param (a router bias) is not rounded first
-        tensor = tensor.to(device=device).to(dtype=dtype)
-        for op in getattr(param, "load_ops", ()):  # e.g. A_log's `-exp`
+        tensor = tensor.to(device=device)
+        for op in getattr(param, "load_ops", ()):  # e.g. A_log's `-exp`, as saved
             out = next(iter(op.convert({"t": [tensor]}, ["t"], ["t"]).values()))
             tensor = out[0] if isinstance(out, list) else out
-        return tensor
+        return tensor.to(dtype=dtype)
 
     def _slice(self, source, shape, dim, rank, size, target):
         if segments := getattr(self.param, "shard_segments", None):
