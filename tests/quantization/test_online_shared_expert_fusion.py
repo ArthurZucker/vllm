@@ -60,7 +60,6 @@ from vllm.model_executor.model_loader.reload.layerwise import (
     record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.utils import get_model_architecture
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -1011,10 +1010,9 @@ def test_fse_online_quantization_routed_shared_loads_checkpoint_weights(
     checkpoint names (`w1/w2/w3`, `shared_experts.*`, `weight_scale_inv`), as the
     model loader does.
     """
-    from vllm.models.minimax_m3.amd.model import (
-        MiniMaxM3SparseForCausalLM,
-        _redirect_fused_shared_experts,
-    )
+    from vllm.model_executor.model_loader.conversion_mapping import _CONVERSION_MAPPING
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
+    from vllm.models.minimax_m3.amd.model import _redirect_fused_shared_experts
 
     default_vllm_config.model_config = ModelConfig()
     hidden_size = intermediate_size = 64
@@ -1112,10 +1110,10 @@ def test_fse_online_quantization_routed_shared_loads_checkpoint_weights(
         decoder_layer.block_sparse_moe = torch.nn.Module()
         decoder_layer.block_sparse_moe.experts = runner
         model.layers = torch.nn.ModuleList([decoder_layer])
-        redirect = partial(_redirect_fused_shared_experts, model=model)
-        mapper = MiniMaxM3SparseForCausalLM.hf_to_vllm_mapper
-        mapper = mapper | WeightsMapper(weights_transforms=[redirect])
-        AutoWeightsLoader(model).load_weights(weights, mapper=mapper)
+        model.checkpoint_transforms = [
+            partial(_redirect_fused_shared_experts, model=model)
+        ]
+        load_with_ops(model, weights, _CONVERSION_MAPPING["MiniMaxM3SparseForCausalLM"])
         layer.quant_method.process_weights_after_loading(layer)
 
     def check_slot(slot: int, gate, up, down) -> None:
