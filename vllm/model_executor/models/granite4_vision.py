@@ -134,7 +134,8 @@ class WindowQFormerDownsampler(nn.Module):
         else:
             self.downsampler = InterpolateDownsampler(config)
 
-        qformer_config = Blip2QFormerConfig(
+        # Transformers' (sized from the vision tower), else the released one's
+        qformer_config = getattr(config, "qformer_config", None) or Blip2QFormerConfig(
             hidden_size=vision_hidden_size,
             num_attention_heads=vision_hidden_size // 64,
             intermediate_size=3072,
