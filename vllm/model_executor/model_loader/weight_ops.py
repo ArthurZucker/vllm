@@ -16,10 +16,14 @@ def _each(input_dict: dict, fn) -> dict:
     }
 
 
+def _one(value) -> torch.Tensor:
+    """A source's tensor (Transformers passes lists)"""
+    return value[0] if isinstance(value, list) else value
+
+
 def _first(input_dict: dict) -> torch.Tensor:
-    """The one tensor of a single-source op (Transformers passes lists)"""
-    tensor = next(iter(input_dict.values()))
-    return tensor[0] if isinstance(tensor, list) else tensor
+    """The one tensor of a single-source op"""
+    return _one(next(iter(input_dict.values())))
 
 
 class OutputConcatenate(Concatenate):
@@ -322,9 +326,7 @@ class EqualSources(ConversionOps):
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
-        first, *others = (
-            t[0] if isinstance(t, list) else t for t in input_dict.values()
-        )
+        first, *others = map(_one, input_dict.values())
         for other in others:
             if not torch.allclose(other.float(), first.float(), rtol=self.rtol):
                 raise ValueError(
@@ -370,8 +372,7 @@ class MergeLora(ConversionOps):
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
         def get(part: str) -> torch.Tensor:
-            tensor = next(v for k, v in input_dict.items() if part in k)
-            return tensor[0] if isinstance(tensor, list) else tensor
+            return _one(next(v for k, v in input_dict.items() if part in k))
 
         weight, lora_a, lora_b = get("original"), get("lora_A"), get("lora_B")
         a, b = lora_a[self.index].float(), lora_b[self.index].float()
@@ -404,8 +405,7 @@ class ExpertScalars(ConversionOps):
             return t if t.numel() == rows else t.narrow(0, ep_rank * rows, rows)
 
         columns = [
-            local(t[0] if isinstance(t, list) else t)
-            for t in (input_dict[p] for p in source_patterns if p in input_dict)
+            local(_one(input_dict[p])) for p in source_patterns if p in input_dict
         ]
         if param.dim() == 2:
             return {target_patterns[0]: torch.stack(columns, dim=1)}
