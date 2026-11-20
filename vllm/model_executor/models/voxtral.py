@@ -323,7 +323,11 @@ class VoxtralForConditionalGeneration(
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        self.downsample_factor = self.config.audio_config.downsample_factor
+        audio = self.config.audio_config
+        # Transformers' config: the projector's input is that many frames
+        self.downsample_factor = getattr(audio, "downsample_factor", None) or (
+            audio.intermediate_size // audio.d_model
+        )
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
