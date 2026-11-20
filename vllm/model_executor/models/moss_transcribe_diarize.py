@@ -519,9 +519,15 @@ class MossTranscribeDiarizeMultiModalProcessor(
             ]
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
-        audio_start_id = _get_required_token_id(tokenizer, processor.audio_start_token)
+        audio_start_id = _get_required_token_id(
+            tokenizer,
+            getattr(processor, "audio_start_token", None) or processor.audio_bos_token,
+        )
         audio_token_id = int(processor.audio_token_id)
-        audio_end_id = _get_required_token_id(tokenizer, processor.audio_end_token)
+        audio_end_id = _get_required_token_id(
+            tokenizer,
+            getattr(processor, "audio_end_token", None) or processor.audio_eos_token,
+        )
 
         def get_num_tokens(item_idx: int) -> int:
             if item_idx >= len(audio_token_lengths):
