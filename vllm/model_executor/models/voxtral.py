@@ -661,6 +661,16 @@ class VoxtralEncoderModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = cast(WhisperConfig, vllm_config.model_config.hf_config)
+        if not hasattr(self.config, "window_size"):
+            # a Transformers checkpoint: its mel settings are its feature extractor's
+            from vllm.transformers_utils.processor import (
+                cached_feature_extractor_from_config,
+            )
+
+            mel = cached_feature_extractor_from_config(vllm_config.model_config)
+            self.config.window_size = mel.n_fft
+            self.config.hop_length = mel.hop_length
+            self.config.sampling_rate = mel.sampling_rate
         self.dtype: torch.dtype = vllm_config.model_config.dtype
         self.is_causal = getattr(self.config, "is_causal", False)
         WhisperEncoderCls: Callable[..., WhisperEncoder | WhisperCausalEncoder]
