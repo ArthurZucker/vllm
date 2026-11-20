@@ -58,7 +58,6 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     RoutedExperts,
     RoutedScaleMode,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     resolve_layer_fused_shared_expert,
@@ -95,9 +94,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     get_fused_shared_expert_layers,
     init_vllm_registered_model,
@@ -494,7 +491,6 @@ class MiniMaxM3MoE(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(config.num_local_experts, dtype=torch.float32)
         )
-        self.e_score_correction_bias.weight_loader = MiniMaxM3MoE.ebias_weight_loader
 
         # Router weights are stored in fp32; GateLinear upcasts the bf16
         # activations and computes the gate in fp32 (fp32 router logits).
@@ -575,11 +571,6 @@ class MiniMaxM3MoE(nn.Module):
             ckpt_names=("w1", "w2", "w3"),
             prefix=f"{prefix}.experts",
         )
-
-    @staticmethod
-    def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight.to(torch.float32))
 
     def forward(
         self,
@@ -1950,6 +1941,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # MiniMax-M3.1 TP4 glue paths (glue/): None where they do not apply
         self.m3_glue = M3Glue.create(self, vllm_config)
 
+    def process_weights_after_loading(self) -> None:
+        if self.m3_glue is not None:
+            self.m3_glue.after_load_weights()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -2038,21 +2033,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Checkpoint experts use w1=gate, w2=down, w3=up. When fusing the shared
-        # expert, include the appended slot (id == num_local_experts).
-        # NOTE: global despite per-layer FSE; non-fused layers skip the extras.
-        num_experts = self.config.num_local_experts
-        if self.fused_shared_expert_layers:
-            num_experts += 1
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=num_experts,
-        )
-
 
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
@@ -2061,23 +2041,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "mtp.": None,
-            # ModelOpt MXFP8 layers name the checkpoint's block scales this way.
-            "weight_scale_inv": "weight_scale",
-        },
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".index_q_proj": (".qkv_proj", "index_q"),
-            ".index_k_proj": (".qkv_proj", "index_k"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -2102,8 +2065,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             and rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         ):
             redirect = partial(_redirect_fused_shared_experts, model=self.model)
-            transforms = WeightsMapper(weights_transforms=[redirect])
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | transforms
+            self.checkpoint_transforms = [redirect]
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
@@ -2130,16 +2092,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        if self.model.m3_glue is not None:
-            self.model.m3_glue.after_load_weights()
-        return loaded
 
 
 # TODO(refactor): this VL wrapper is platform-agnostic and byte-identical to the
@@ -2173,17 +2125,6 @@ class MiniMaxM3SparseForConditionalGeneration(
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "multi_modal_projector.": "vision_tower.multi_modal_projector.",
-            "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
-        },
-        orig_to_new_substr={
-            ".mlp.fc1": ".fc1",
-            ".mlp.fc2": ".fc2",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -2346,10 +2287,3 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def get_model_state_cls(self):
         return self.language_model.get_model_state_cls()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.language_model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

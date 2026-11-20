@@ -18,7 +18,7 @@
 # limitations under the License.
 """Inference-only NemotronH model."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from itertools import islice
 
 import torch
@@ -42,7 +42,6 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     RoutedScaleMode,
     activation_without_mul,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -80,8 +79,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsReplaySSM,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -664,55 +661,6 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def _get_max_n_routed_experts(self) -> int:
-        """Get max n_routed_experts from config or block_configs for puzzle models.
-
-        For heterogeneous models with varying expert counts per layer,
-        returns the MAX to ensure all expert weights can be loaded.
-        """
-        # First try top-level attribute
-        n_routed_experts = getattr(self.config, "n_routed_experts", None)
-        if n_routed_experts is not None:
-            return n_routed_experts
-
-        # For puzzle models, get MAX from all MoE blocks in block_configs
-        # (different layers may have different expert counts)
-        max_experts = 0
-        block_configs = getattr(self.config, "block_configs", None)
-        if block_configs:
-            for block in block_configs:
-                if isinstance(block, dict):
-                    if block.get("block_type") == "moe":
-                        max_experts = max(max_experts, block.get("n_routed_experts", 0))
-                else:
-                    # HF converts dicts to objects with attributes
-                    if getattr(block, "block_type", "") == "moe":
-                        max_experts = max(
-                            max_experts, getattr(block, "n_routed_experts", 0)
-                        )
-        return max_experts
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Consumed by `get_moe_expert_mapping` (bitsandbytes / LoRA); the main
-        # weight load is self-served by each `RoutedExperts` layer. Sized to the
-        # MAX expert count so heterogeneous puzzle models load every expert.
-        if self.has_moe:
-            # (param_name, weight_name, expert_id, shard_id)
-            return fused_moe_make_expert_params_mapping(
-                # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
-                #   what the activation is applied to
-                # - FusedMoe.w3 (aka up_proj) should be ignored since we're
-                #   using non-gated MoE
-                self,
-                ckpt_gate_proj_name="up_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name=None,
-                num_experts=self._get_max_n_routed_experts(),
-                num_redundant_experts=getattr(self, "num_redundant_experts", 0),
-            )
-
-        return []
-
 
 class NemotronHForCausalLM(
     nn.Module,
@@ -728,16 +676,6 @@ class NemotronHForCausalLM(
 ):
     # Relevant only if self.has_moe is True
     is_non_gated_moe = True
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"backbone": "model", "mtp": None},
-        orig_to_new_substr={"A_log": "A", "embeddings": "embed_tokens"},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        },
-    )
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -912,7 +850,3 @@ class NemotronHForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only AliceAI model."""
 
-from collections.abc import Iterable
 from copy import copy
 from itertools import islice
 from typing import cast
@@ -53,12 +52,9 @@ from vllm.model_executor.models.qwen3_next import (
     _should_replicate_misaligned_shared_expert,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     extract_layer_index,
     get_fused_shared_expert_layers,
     make_layers,
-    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 from vllm.model_executor.offloader import (
@@ -69,38 +65,6 @@ from vllm.model_executor.offloader import (
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
-
-_SPLIT_KDA_CONV_SHARDS = {
-    ".linear_attn.q_conv1d": (".linear_attn.conv1d", 0),
-    ".linear_attn.k_conv1d": (".linear_attn.conv1d", 1),
-    ".linear_attn.v_conv1d": (".linear_attn.conv1d", 2),
-}
-
-
-def _load_split_kda_conv_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    params: dict[str, nn.Parameter],
-    loaded: set[str],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Load split AliceAI conv weights through the upstream fused-conv ABI."""
-    for name, weight in weights:
-        for source_name, (target_name, shard_id) in _SPLIT_KDA_CONV_SHARDS.items():
-            if source_name not in name:
-                continue
-            mapped_name = name.replace(source_name, target_name, 1)
-            param = params.get(mapped_name)
-            if param is None:
-                raise ValueError(f"No target parameter for {name!r}: {mapped_name!r}")
-            weight_loader = getattr(param, "weight_loader", None)
-            if weight_loader is None:
-                raise ValueError(
-                    f"Target parameter {mapped_name!r} has no weight loader"
-                )
-            weight_loader(param, weight, shard_id)
-            loaded.add(mapped_name)
-            break
-        else:
-            yield name, weight
 
 
 def get_attn_res_block_size(hf_config: object) -> int:
@@ -456,24 +420,6 @@ class AliceAIDecoderBlock(nn.Module):
 
 @support_torch_compile
 class AliceAIModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".linear_attn.a_log_bias": ".linear_attn.A_log",
-        },
-        orig_to_new_stacked={
-            ".linear_attn.q_proj": (".linear_attn.in_proj_qkvgfab", 0),
-            ".linear_attn.k_proj": (".linear_attn.in_proj_qkvgfab", 1),
-            ".linear_attn.v_proj": (".linear_attn.in_proj_qkvgfab", 2),
-            ".linear_attn.b_proj": (".linear_attn.in_proj_qkvgfab", 3),
-            ".linear_attn.f_a_proj": (".linear_attn.in_proj_qkvgfab", 4),
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-            ".shared_expert.gate_proj": (".shared_expert.gate_up_proj", 0),
-            ".shared_expert.up_proj": (".shared_expert.gate_up_proj", 1),
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -565,23 +511,10 @@ class AliceAIModel(nn.Module):
         )
         return self.norm(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_fuse_shared_experts(
-            weights=weights,
-            fused_shared_expert_layers=self.fused_shared_expert_layers,
-            n_routed_experts=self.config.num_experts,
-            n_shared_experts=1,
-            ckpt_prefix="mlp.shared_expert",
-        )
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights=weights, mapper=self.hf_to_vllm_mapper)
-
 
 class AliceAIForCausalLM(
     nn.Module, HasInnerState, IsHybrid, SupportsLoRA, MixtureOfExperts
 ):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"mtp.": None})
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -706,16 +639,3 @@ class AliceAIForCausalLM(
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        manually_loaded: set[str] = set()
-        weights = _load_split_kda_conv_weights(
-            weights=weights,
-            params=dict(self.named_parameters()),
-            loaded=manually_loaded,
-        )
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights=weights)
-        loaded.update(manually_loaded)
-        return loaded

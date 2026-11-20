@@ -5,7 +5,6 @@
 """Inference-only ChatGLM model compatible with THUDM weights."""
 
 import json
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -35,8 +34,6 @@ from vllm.transformers_utils.configs.chatglm import ChatGLMConfig
 
 from .interfaces import SupportsLoRA, SupportsPP, SupportsQuant
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -314,10 +311,6 @@ class GLMTransformer(nn.Module):
 
 @support_torch_compile
 class ChatGLMModel(nn.Module, SupportsQuant):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".word_embeddings": ""},
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -380,10 +373,6 @@ class ChatGLMModel(nn.Module, SupportsQuant):
 
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class ChatGLMBaseModel(nn.Module):
     def __init__(
@@ -423,10 +412,6 @@ class ChatGLMBaseModel(nn.Module):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
 
 class ChatGLMForCausalLM(ChatGLMBaseModel, SupportsLoRA, SupportsPP, SupportsQuant):

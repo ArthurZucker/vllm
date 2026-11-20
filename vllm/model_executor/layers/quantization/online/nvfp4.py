@@ -42,8 +42,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
     weight_amax,
 )
-from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
-from vllm.model_executor.offloader import UVAOffloader, get_offloader
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
@@ -102,6 +100,7 @@ class Nvfp4WeightOnlyOnlineLinearMethod(OnlineLinearBase):
     """
 
     activation_quant_key: QuantKey | None = None
+    scale_names = ("weight_scale", "weight_global_scale")
 
     def create_weights(
         self,
@@ -132,22 +131,30 @@ class Nvfp4WeightOnlyOnlineLinearMethod(OnlineLinearBase):
 
         self.kernel = init_nvfp4_linear_kernel(use_a16=True, act_dtype=params_dtype)
 
+    def quantized_params(self, n: int, k: int) -> list[tuple]:
+        scales = ((n, k // NVFP4_BLOCK_SIZE), torch.float8_e4m3fn)
+        return [(torch.uint8, 2), scales, ((), torch.float32)]
+
+    def quantize_weight(
+        self, layer: torch.nn.Module, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        # one global scale over the whole (TP-global) weight
+        amax = amax_for_tp_weight_quant(
+            weight_amax(weight).float().reshape(1), _is_tp_sharded(layer)
+        )
+        return _quantize_nvfp4(weight, amax)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        weight = self.get_weight_for_quantization(layer)
-        amax = amax_for_tp_weight_quant(
-            weight_amax(weight).float().reshape(1), _is_tp_sharded(layer)
-        )
-        packed, scales, global_scale = _quantize_nvfp4(weight, amax)
+        packed, scales, global_scale = self.quantized_weight(layer)
 
         replace_parameter(layer, "weight", packed)
         replace_parameter(layer, "weight_scale", scales)
         replace_parameter(layer, "weight_global_scale", global_scale)
 
         self.kernel.process_weights_after_loading(layer)
-        self.release_requantization_source_weights(layer)
 
         layer._already_called_process_weights_after_loading = True
 
@@ -247,73 +254,37 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
     def per_token_activation(self) -> bool:
         return self.activation_quant_key == kNvfp4DynamicToken
 
-    def create_weights(
-        self,
-        layer: Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        super().create_weights(
-            layer,
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            params_dtype,
-            **extra_weight_attrs,
-        )
-        # UVA offloading of the experts means device memory is short: stage the
-        # full-precision experts on the CPU and quantize one at a time on the
-        # device.
-        # TODO: move this decision to OnlineMoEMethodBase.create_weights, for
-        # the other online MoE methods, once their quantizers take CPU input.
-        offloader = get_offloader()
-        if (
-            self.requantization_source is None
-            and isinstance(offloader, UVAOffloader)
-            and offloader.targets(f"{layer.layer_name}.w13_weight")
-        ):
-            get_layerwise_info(layer).stage_on_cpu = True
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
+        return [
+            ("weight", (rows, cols // 2), torch.uint8),
+            ("weight_scale", (rows, cols // NVFP4_BLOCK_SIZE), torch.float8_e4m3fn),
+            ("weight_scale_2", (), torch.float32),
+        ]
+
+    def expert_scale_names(self, prefix: str) -> list[str]:
+        return [f"{prefix}weight_scale", f"{prefix}weight_scale_2"]
+
+    def quantize_experts(
+        self, layer: Module, name: str, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return _quantize_moe_weight_to_nvfp4(weight, self.moe.tp_size)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        w13_weight, w2_weight = self.get_weights_for_quantization(layer)
-        self._quantize_weights(layer, w13_weight, w2_weight)
-        self._setup_kernel(layer)
-        self.release_requantization_source_weights(layer)
-
-        layer._already_called_process_weights_after_loading = True
-
-    def _quantize_weights(
-        self,
-        layer: Module,
-        w13_weight: torch.Tensor | None = None,
-        w2_weight: torch.Tensor | None = None,
-    ) -> None:
-        w13_weight = layer.w13_weight if w13_weight is None else w13_weight
-        w2_weight = layer.w2_weight if w2_weight is None else w2_weight
-        moe_tp_size = self.moe.tp_size
-        w13, w13_scale, w13_scale_2 = _quantize_moe_weight_to_nvfp4(
-            w13_weight, moe_tp_size
-        )
-        w2, w2_scale, w2_scale_2 = _quantize_moe_weight_to_nvfp4(w2_weight, moe_tp_size)
-
-        replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w13_weight_scale", w13_scale)
-        replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
-        replace_parameter(layer, "w2_weight", w2)
-        replace_parameter(layer, "w2_weight_scale", w2_scale)
-        replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
-
+        for name in self.quantized_names():
+            replace_parameter(layer, name, getattr(layer, name))
         # Neutral (1.0) activation global scales: the kernel derives per-token
         # scales at runtime, so the output scalars reduce to the weight scales.
-        ones = torch.ones(layer.num_experts, device=w13.device, dtype=torch.float32)
+        ones = torch.ones(
+            layer.num_experts, device=layer.w13_weight.device, dtype=torch.float32
+        )
         replace_parameter(layer, "w13_input_scale", ones)
         replace_parameter(layer, "w2_input_scale", ones.clone())
+        self._setup_kernel(layer)
+
+        layer._already_called_process_weights_after_loading = True
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         (

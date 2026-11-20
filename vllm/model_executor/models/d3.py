@@ -21,7 +21,6 @@ from .adapters import as_seq_cls_model
 from .interfaces_base import default_pooling_type
 from .qwen3_5 import Qwen3_5ForConditionalGeneration, Qwen3_5ProcessingInfo
 from .qwen3_vl import Qwen3VLDummyInputsBuilder, Qwen3VLMultiModalProcessor
-from .utils import WeightsMapper
 
 READOUT_WEIGHTS = "readout.safetensors"
 
@@ -63,13 +62,6 @@ else:
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class D3ForSequenceClassification(_D3ForSequenceClassificationBase):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "language_model.": "language_model.model.",
-            "mtp.": None,
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         model_config = vllm_config.model_config

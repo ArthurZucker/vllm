@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -44,9 +43,7 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import HasInnerState, IsHybrid, SupportsLoRA, SupportsPP, SupportsQuant
 from .interfaces_base import attn_type, default_pooling_type
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -225,7 +222,7 @@ class Lfm2AttentionDecoderLayer(nn.Module):
         )
 
         self.feed_forward = Lfm2MLP(
-            dim=config.block_dim,
+            dim=config.hidden_size,
             intermediate_size=config.intermediate_size,
             multiple_of=config.block_multiple_of,
             auto_adjust_ff_dim=config.block_auto_adjust_ff_dim,
@@ -295,7 +292,7 @@ class Lfm2BidirectionalShortConv(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        dim = config.conv_dim
+        dim = config.hidden_size
         self.conv = ColumnParallelLinear(
             config.conv_L_cache, dim, bias=config.conv_bias, prefix=f"{prefix}.conv1d"
         )
@@ -353,7 +350,7 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
         else:
             self.short_conv = ShortConv(
                 config=config,
-                dim=config.conv_dim,
+                dim=config.hidden_size,
                 layer_idx=layer_idx,
                 model_config=model_config,
                 cache_config=cache_config,
@@ -362,7 +359,7 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
             )
 
         self.feed_forward = Lfm2MLP(
-            dim=config.block_dim,
+            dim=config.hidden_size,
             intermediate_size=config.intermediate_size,
             multiple_of=config.block_multiple_of,
             auto_adjust_ff_dim=config.block_auto_adjust_ff_dim,
@@ -401,16 +398,6 @@ class Lfm2Model(nn.Module):
     # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision
     # with the inner .conv.conv child (ShortConv has a child self.conv, so
     # naming the container .conv too makes _match_target_modules match both).
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".conv.": ".short_conv."},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".w1": (".w13", 0),
-            ".w3": (".w13", 1),
-        },
-    )
 
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", bidirectional: bool = False
@@ -492,10 +479,6 @@ class Lfm2Model(nn.Module):
         hidden_states, _ = self.embedding_norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 @attn_type("encoder_only")
 @default_pooling_type(seq_pooling_type="CLS")
@@ -534,7 +517,6 @@ class Lfm2ForCausalLM(
     }
 
     # Reuse the backbone mapper so LoRA/quantization see the same name mapping.
-    hf_to_vllm_mapper = Lfm2Model.hf_to_vllm_mapper
 
     # LoRA specific attributes
     embedding_modules = {
@@ -572,7 +554,7 @@ class Lfm2ForCausalLM(
 
         return MambaStateShapeCalculator.short_conv_state_shape(
             tp_world_size=parallel_config.tensor_parallel_size,
-            intermediate_size=hf_config.conv_dim,
+            intermediate_size=hf_config.hidden_size,
             conv_kernel=hf_config.conv_L_cache,
         )
 
@@ -625,7 +607,3 @@ class Lfm2ForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

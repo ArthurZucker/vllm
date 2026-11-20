@@ -21,7 +21,6 @@ from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLProcessingInfo,
     Qwen3VLProcessor,
 )
-from vllm.model_executor.models.utils import WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.processing import BaseProcessingInfo
 from vllm.transformers_utils.configs.alpamayo2_super import Alpamayo2SuperConfig
@@ -67,16 +66,6 @@ class Alpamayo2SuperProcessingInfo(Qwen3VLProcessingInfo):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class Alpamayo2SuperForConditionalGeneration(Qwen3VLForConditionalGeneration):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "vlm.model.visual.": "visual.",
-            "vlm.lm_head.": "language_model.lm_head.",
-            "vlm.model.language_model.": "language_model.model.",
-            # The trajectory expert is not served by vLLM.
-            "expert.": None,
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_config

@@ -9,11 +9,12 @@ vLLM's parallel linear layers, MLA kernel, KDA kernel and fused MoE loader.
 """
 
 import copy
-from collections.abc import Callable, Iterable
+import re
+from collections.abc import Iterable
+from functools import partial
 from math import lcm
 from typing import TypeGuard
 
-import regex as re
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -38,7 +39,6 @@ from vllm.model_executor.layers.activation import SiluAndMul, SwigluStepAndMul
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -79,11 +79,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-    sharded_weight_loader,
-)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.third_party.flash_linear_attention.ops.kda import (
@@ -100,8 +95,6 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from .interfaces import HasInnerState, IsHybrid, SupportsPP
 from .utils import (
     PPMissingLayer,
-    WeightsMapper,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
 )
@@ -219,17 +212,6 @@ def _get_layer_swiglu_limit(limit_list: list | None, layer_idx: int) -> float | 
     return float(limit)
 
 
-def _load_a_log(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
-    tp_rank = get_tensor_model_parallel_rank()
-    tp_size = get_tensor_model_parallel_world_size()
-    if loaded_weight.ndim == 1:
-        shard_size = loaded_weight.shape[0] // tp_size
-        shard = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
-        param.data.copy_(shard.view_as(param.data))
-    else:
-        sharded_weight_loader(2)(param, loaded_weight)
-
-
 def _is_block_fp8_config(
     quant_config: QuantizationConfig | None,
 ) -> TypeGuard[Fp8Config]:
@@ -270,26 +252,6 @@ def _configure_ling_fp8_quant_config(
         )
 
     quant_config.store_dtype = "mxfp4"
-
-
-_LING_MXFP4_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_regex={
-        re.compile(
-            r"(\.mlp\.experts\.\d+\."
-            r"(?:gate_proj|up_proj|down_proj)\.weight_scale)_inv$"
-        ): r"\1"
-    }
-)
-
-
-def _maybe_remap_ling_mxfp4_weight_names(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    quant_config: QuantizationConfig | None,
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Map Ling's MXFP4 expert scales to Mxfp4MoEMethod parameters."""
-    if isinstance(quant_config, Fp8Config) and quant_config.store_dtype == "mxfp4":
-        return _LING_MXFP4_WEIGHTS_MAPPER.apply(weights)
-    return weights
 
 
 def _is_fp8_module_excluded(
@@ -423,6 +385,31 @@ def _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
         shared_intermediate,
         padded_shared_intermediate,
     )
+
+
+# Ling's MXFP4 experts' scales, under Mxfp4MoEMethod's names
+_LING_MXFP4_SCALE = re.compile(
+    r"(\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight_scale)_inv$"
+)
+
+
+def ling_checkpoint(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Checkpoint stream of a Ling model (and its MTP draft): MXFP4 expert scales
+    renamed; block-FP8 shared experts zero-padded to the intermediate size their TP
+    shards hold whole blocks of"""
+    quant_config = model.quant_config
+    mxfp4 = isinstance(quant_config, Fp8Config) and quant_config.store_dtype == "mxfp4"
+    for name, weight in weights:
+        if mxfp4:
+            name = _LING_MXFP4_SCALE.sub(r"\1", name)
+        if ".mlp.shared_experts." in name:
+            weight = weight if isinstance(weight, torch.Tensor) else weight[...]
+            weight = _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
+                quant_config, model.config, name, weight
+            )
+        yield name, weight
 
 
 class _IdentityProjection(nn.Module):
@@ -740,7 +727,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
         self.dt_bias = nn.Parameter(
             torch.empty(projection_size // self.tp_size, dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         self.q_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -770,7 +757,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": _load_a_log})
+        set_weight_attrs(self.A_log, {"shard_dim": 2})
 
         self.g_proj = ColumnParallelLinear(
             self.hidden_size,
@@ -1457,22 +1444,8 @@ class BailingMoeV3Model(nn.Module):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
-
 
 class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".attention.": ".self_attn."},
-        orig_to_new_prefix={"attention.": "self_attn."},
-    )
-
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1486,6 +1459,7 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         _configure_ling_fp8_quant_config(quant_config, config)
         self.config = config
         self.quant_config = quant_config
+        self.checkpoint_transforms = [partial(ling_checkpoint, self)]
         self.model = BailingMoeV3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -1547,82 +1521,3 @@ class BailingMoeV3ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple:
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        weights = _maybe_remap_ling_mxfp4_weight_names(weights, self.quant_config)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-        stacked_mappings = [
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-            (".qkv_proj", ".q_proj", 0),
-            (".qkv_proj", ".k_proj", 1),
-            (".qkv_proj", ".v_proj", 2),
-            (".qkvb_proj", ".q_proj", 0),
-            (".qkvb_proj", ".k_proj", 1),
-            (".qkvb_proj", ".v_proj", 2),
-            (".qkvb_proj", ".b_proj", 3),
-            (".fused_qkv_a_proj", ".q_a_proj", 0),
-            (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-        ]
-        expert_mappings = list(self.get_expert_mapping())
-
-        def load_param(name: str, tensor: torch.Tensor, shard_id=None) -> bool:
-            if name not in params_dict or is_pp_missing_parameter(name, self):
-                return False
-            param = params_dict[name]
-            weight_loader: Callable[..., None] = getattr(
-                param, "weight_loader", default_weight_loader
-            )
-            if shard_id is None:
-                weight_loader(param, tensor)
-            elif isinstance(shard_id, int):
-                weight_loader(param, tensor, shard_id)
-            else:
-                weight_loader(
-                    param, tensor, name, expert_id=shard_id[0], shard_id=shard_id[1]
-                )
-            loaded_params.add(name)
-            return True
-
-        def normalize_name(name: str) -> str | None:
-            if name.startswith("model.layers."):
-                layer_idx = int(name.split("model.layers.")[1].split(".")[0])
-                if layer_idx >= self.config.num_hidden_layers:
-                    return None
-            return maybe_remap_kv_scale_name(name, params_dict)
-
-        for orig_name, weight in weights:
-            name = normalize_name(orig_name)
-            if name is None:
-                continue
-            weight = _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
-                self.quant_config,
-                self.config,
-                name,
-                weight,
-            )
-            loaded = False
-            for param_suf, weight_suf, stacked_shard_id in stacked_mappings:
-                if weight_suf in name:
-                    mapped = name.replace(weight_suf, param_suf)
-                    if load_param(mapped, weight, stacked_shard_id):
-                        loaded = True
-                        break
-            if loaded:
-                continue
-
-            if ".mlp.experts." in name:
-                for param_name, weight_name, expert_id, shard_id in expert_mappings:
-                    if weight_name in name:
-                        mapped = name.replace(weight_name, param_name)
-                        load_param(mapped, weight, (expert_id, shard_id))
-                        break
-                continue
-
-            load_param(name, weight)
-        return loaded_params

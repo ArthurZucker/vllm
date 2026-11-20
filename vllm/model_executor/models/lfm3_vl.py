@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only LFM3-VL model: images and videos in, text out."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -48,8 +48,6 @@ from .qwen3_vl import (
     Qwen3VLProcessingInfo,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -263,16 +261,6 @@ class Lfm3VlVisionModel(nn.Module):
     layers over the patches of each image or video frame, embedded by a linear
     patchifier."""
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj.": (".qkv_proj.", "q"),
-            ".k_proj.": (".qkv_proj.", "k"),
-            ".v_proj.": (".qkv_proj.", "v"),
-            ".w1.": (".w13.", 0),
-            ".w3.": (".w13.", 1),
-        }
-    )
-
     def __init__(
         self,
         config: Lfm3VlVisionConfig,
@@ -387,11 +375,6 @@ class Lfm3VlVisionModel(nn.Module):
             )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(
-            weights, mapper=self.hf_to_vllm_mapper
-        )
-
 
 class Lfm3VlMultiModalProjector(nn.Module):
     """Merges each block of `spatial_merge_size**2` vision tokens, normalized
@@ -453,15 +436,6 @@ class Lfm3VlDummyInputsBuilder(Qwen3VLDummyInputsBuilder):
 class Lfm3VlForConditionalGeneration(
     nn.Module, HasInnerState, IsHybrid, SupportsMultiModal, SupportsPP
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -554,7 +528,3 @@ class Lfm3VlForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

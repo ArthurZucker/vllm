@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 from copy import copy, deepcopy
 
 import torch
@@ -16,7 +15,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.reload import weight_update_active
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -26,7 +24,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
-    get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
 from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
@@ -34,14 +31,11 @@ from vllm.sequence import IntermediateTensors
 
 from .layernorm import Step5RMSNorm, get_step5_norm_dtype
 from .model import (
-    _STEP5_WEIGHT_SHARDS,
     STEP5_PACKED_MODULES_MAPPING,
     Step5DecoderLayer,
     Step5MoE,
-    _reset_fused_qkv_indexer_load_state,
     _set_step5_moe_protocol_metadata,
     _step5_sp_padding,
-    _validate_fused_qkv_indexer_weights,
 )
 
 logger = init_logger(__name__)
@@ -353,84 +347,3 @@ class Step5MTP(nn.Module, MixtureOfExperts, SupportsMultiModal):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm.model_executor.model_loader.weight_utils import (
-            default_weight_loader,
-        )
-
-        validate_completeness = not weight_update_active()
-        if validate_completeness:
-            _reset_fused_qkv_indexer_load_state(self)
-        params_dict = dict(self.named_parameters())
-
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if name.startswith("layers."):
-                name = f"model.{name}"
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if "embed_tokens" not in name and spec_layer is None:
-                continue
-            name = self._rewrite_spec_layer_name(spec_layer, name)
-            for param_name, weight_name, shard_id in _STEP5_WEIGHT_SHARDS:
-                if weight_name not in name or "experts" in name or "moe" in name:
-                    continue
-                replaced_name = name.replace(weight_name, param_name)
-                if replaced_name not in params_dict:
-                    continue
-                name = replaced_name
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if (
-                    name.endswith(".bias")
-                    and name not in params_dict
-                    or "tok_embeddings" in name
-                ):
-                    continue
-
-                if spec_layer is not None and ".transformer." in name:
-                    name = name.replace(".transformer.", ".")
-                if "shared_head" in name:
-                    name = name.replace("shared_head.output", "shared_head.head")
-                if "embed_tokens" in name:
-                    name = "model.embed_tokens.weight"
-                if name not in params_dict:
-                    logger.warning_once(
-                        "Skipping unexpected MTP checkpoint weight: %s", name
-                    )
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        if validate_completeness:
-            loaded_params.update(_validate_fused_qkv_indexer_weights(self))
-        return loaded_params
-
-    def _rewrite_spec_layer_name(self, spec_layer: int | None, name: str) -> str:
-        """Rewrite the weight name to match the format of the original model.
-        Add .mtp_block for modules in transformer layer block for spec layer
-        """
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "eh_proj",
-            "shared_head",
-        ]
-        spec_layer_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                break
-        if not spec_layer_weight:
-            name = name.replace(
-                f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
-            )
-        return name

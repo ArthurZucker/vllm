@@ -42,8 +42,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -597,17 +595,6 @@ class FlintModel(nn.Module):
 
 
 class FlintForCausalLM(nn.Module, SupportsPP):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_expert.gate_proj": (".shared_expert.gate_up_proj", 0),
-            ".shared_expert.up_proj": (".shared_expert.gate_up_proj", 1),
-        }
-    )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -633,9 +620,10 @@ class FlintForCausalLM(nn.Module, SupportsPP):
                 )
             quant_config = _nvfp4_gguf_quant_config()
             vllm_config.quant_config = quant_config
-            # load_weights reads the GGUF itself and never consumes the default
-            # loader's (lazy) iterator; the pattern just names the right file.
+            # the GGUF is read by `_gguf_weights`, never the default loader's
+            # (lazy) iterator; the pattern just names the right file.
             self.allow_patterns_overrides = ["*.gguf"]
+            self.checkpoint_transforms = [self._gguf_weights]
         if quant_config is not None:
             quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.quant_config = quant_config
@@ -672,16 +660,17 @@ class FlintForCausalLM(nn.Module, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if self.gguf_path is not None:
-            device = next(self.parameters()).device
-            weights = self._apply_dequantized_scales(
-                gguf_nvfp4_weights_iterator(self.gguf_path, device, _GGUF_DEQUANTIZED),
-            )
-            if self.flint_dense:
-                weights = flint_linear.check_merged_global_scales(weights)
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+    def _gguf_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The GGUF's tensors (NVFP4 repacked) instead of the default loader's"""
+        device = next(self.parameters()).device
+        weights = self._apply_dequantized_scales(
+            gguf_nvfp4_weights_iterator(self.gguf_path, device, _GGUF_DEQUANTIZED)
+        )
+        if self.flint_dense:
+            weights = flint_linear.check_merged_global_scales(weights)
+        return weights
 
     def _apply_dequantized_scales(
         self, weights: Iterable[tuple[str, torch.Tensor]]

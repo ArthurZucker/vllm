@@ -10,7 +10,6 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import regex as re
@@ -22,9 +21,6 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -32,7 +28,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -47,7 +42,6 @@ from vllm.models.deepseek_v4.amd.mega_moe import finalize_mega_moe_weights
 
 from .model import (
     DeepseekV4DecoderLayer,
-    DeepseekV4Model,
     _linear_scale_param_name,
     _use_sequence_parallel,
 )
@@ -412,112 +406,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     # --- Weight loading ----------------------------------------------------
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load the `mtp.{0,1,2}.*` draft weights from the target checkpoint.
-
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. `embed_tokens`/`lm_head` are aliased from the target.
-        """
-        # Draft MoE layers use the dspark_* expert counts, not the
-        # backbone's (see the reference ModelArgs.get_moe_config).
-        n_draft_experts = (
-            getattr(self.config, "dspark_n_routed_experts", 0)
-            or self.config.n_routed_experts
-        )
-        expert_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=n_draft_experts,
-            routed_experts_prefix="" if self.use_mega_moe else "routed_experts",
-        )
-        expert_scale_suffix = (
-            ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
-            else ".weight_scale_inv"
-        )
-
-        # (param_name, ckpt_shard_name, shard_id) for non-expert stacked params.
-        stacked_params_mapping = [
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            mapped = self._remap_dspark_name(name)
-            if mapped is None:
-                continue
-            name = mapped
-            # ``.scale`` -> per-method scale suffix.
-            if name.endswith(".scale"):
-                suffix = (
-                    expert_scale_suffix
-                    if _EXPERT_SCALE_RE.search(name)
-                    else f".{self.linear_scale_name}"
-                )
-                name = name.removesuffix(".scale") + suffix
-            if ".shared_experts.w2" in name:
-                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
-            if self.pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
-                    self.quant_config, name, loaded_weight
-                )
-
-            # E8M0 expert scales: keep raw exponent bytes.
-            if ".experts." in name:
-                if (
-                    "weight_scale" in name
-                    and loaded_weight.dtype == torch.float8_e8m0fnu
-                ):
-                    loaded_weight = loaded_weight.view(torch.uint8)
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
-                    if weight_name not in name:
-                        continue
-                    name_mapped = name.replace(weight_name, param_name)
-                    param = params_dict[name_mapped]
-                    success = param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        loaded_params.add(name_mapped)
-                        break
-                continue
-
-            # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/markov_head/confidence_head) load directly —
-            # otherwise e.g. "markov_w1" would collide with the "w1" shard rule.
-            is_layer_param = name.startswith("model.layers.")
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if not is_layer_param or weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if name.endswith(".ffn.gate.bias"):
-                    name = name.replace(
-                        ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
-                    )
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
-        return loaded_params
 
     def process_weights_after_loading(self) -> None:
         if self.use_mega_moe:

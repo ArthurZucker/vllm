@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
-from collections.abc import Callable, Iterable
 from itertools import islice
 
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -29,7 +27,6 @@ from vllm.model_executor.kernels.mhc.tilelang import (
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_MXFP4,
@@ -51,7 +48,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
@@ -60,11 +56,8 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
     spec_decode_needs_target_embed,
@@ -133,6 +126,23 @@ def _use_mega_gate(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _pad_intermediate(mlp: nn.Module, checkpoint_size: int, padded_size: int) -> None:
+    """The intermediate axis (`gate_up_proj`'s gate and up rows, `down_proj`'s
+    columns) padded from the checkpoint's size: each rank reads its rows of the
+    padded axis, the trailing ranks' padding stays zero (`VllmShard._segments`).
+    Block scales alike, in proportion"""
+    for layer, dim_name, shards in (
+        (mlp.gate_up_proj, "output_dim", 2),
+        (mlp.down_proj, "input_dim", 1),
+    ):
+        for param in layer.parameters(recurse=False):
+            if (dim := getattr(param, dim_name, None)) is None:
+                continue
+            full = param.shape[dim] * layer.tp_size // shards  # one source's
+            extra = full - full * checkpoint_size // padded_size
+            param.shard_segments = [(full, extra, False)]
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -154,8 +164,9 @@ class DeepseekV4MLP(nn.Module):
         #
         # Block-FP8 shards in whole 128-blocks; cdiv rounds the per-rank block
         # count up so the linear's even TP split stays block-aligned, with the
-        # trailing ranks zero-filled by load_weights.
+        # trailing ranks zero-filled on load (`_pad_intermediate`).
         block_size = getattr(quant_config, "weight_block_size", None)
+        checkpoint_size = intermediate_size
         if block_size is not None and not is_sequence_parallel:
             tp_size = get_tensor_model_parallel_world_size()
             n_local = cdiv(intermediate_size // block_size[0], tp_size)
@@ -177,6 +188,8 @@ class DeepseekV4MLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
+        if intermediate_size != checkpoint_size:
+            _pad_intermediate(self, checkpoint_size, intermediate_size)
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -191,25 +204,6 @@ class DeepseekV4MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
-
-def make_deepseek_v4_expert_params_mapping(
-    num_experts: int,
-) -> list[tuple[str, str, int, str]]:
-    return [
-        (
-            "experts.w13_" if shard_id in ("w1", "w3") else "experts.w2_",
-            f"experts.{expert_id}.{weight_name}.",
-            expert_id,
-            shard_id,
-        )
-        for expert_id in range(num_experts)
-        for shard_id, weight_name in [
-            ("w1", "w1"),
-            ("w2", "w2"),
-            ("w3", "w3"),
-        ]
-    ]
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1089,162 +1083,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        # Pre-compute expert mapping ONCE.
-        expert_mapping = self.get_expert_mapping()
-
-        # Block-FP8 shared experts: pad the intermediate up to the TP-uniform
-        # block count so the standard loaders below slice it evenly (trailing
-        # ranks land on the zero pad). SP / unquantized ones need no padding.
-        pad_shared_expert = (
-            getattr(self.quant_config, "weight_block_size", None) is not None
-            and not self.use_sequence_parallel
-        )
-
-        for name, loaded_weight in weights:
-            if ".shared_experts." in name:
-                if is_pp_missing_parameter(name, self):
-                    continue
-                experts = self.layers[extract_layer_index(name)].ffn.experts
-                if getattr(experts, "has_fused_shared_experts", False):
-                    loaded_params.add(
-                        experts.load_shared_expert_weight(name, loaded_weight)
-                    )
-                    continue
-            if pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = self._pad_shared_expert_weight(
-                    self.quant_config, name, loaded_weight
-                )
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if ".experts." in name:
-                    continue
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                if is_pp_missing_parameter(name, self):
-                    break
-                if name not in params_dict:
-                    head, _, leaf = name.rpartition(".")
-                    suffixed = f"{head}.base_layer.{leaf}"
-                    if suffixed in params_dict:
-                        name = suffixed
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if ".experts." in name:
-                    # E8M0 scales are stored as float8_e8m0fnu in
-                    # checkpoints but the MoE param is uint8. copy_()
-                    # would do a numeric conversion (e.g. 2^-7 → 0),
-                    # destroying the raw exponent bytes.
-                    if (
-                        "weight_scale" in name
-                        and loaded_weight.dtype == torch.float8_e8m0fnu
-                    ):
-                        loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, expert_shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        param = params_dict[name_mapped]
-                        # We should ask the weight loader to return success or not
-                        # here since otherwise we may skip experts with other
-                        # available replicas.
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=expert_shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
-                    continue
-                else:
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    # Non-LoRA params on a LoRA-wrapped module live at
-                    # ``<head>.base_layer.<leaf>``; the checkpoint is plain.
-                    if name not in params_dict:
-                        head, _, leaf = name.rpartition(".")
-                        suffixed = f"{head}.base_layer.{leaf}"
-                        if suffixed in params_dict:
-                            name = suffixed
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-                    continue
-
-        return loaded_params
-
-    @staticmethod
-    def _pad_shared_expert_weight(
-        quant_config: QuantizationConfig | None,
-        name: str,
-        loaded_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
-        axis so the standard TP loaders split it into even, block-aligned shards
-        (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
-        down (w2 -> down_proj) [H, I] pads dim 1.
-        """
-        block_size = getattr(quant_config, "weight_block_size", None)
-        assert block_size is not None
-        # Round the intermediate axis up to a whole number of TP shards. The axis
-        # is in elements for weights (step = block) and in blocks for scales.
-        step = 1 if name.endswith("weight_scale_inv") else block_size[0]
-        dim = 1 if ".down_proj." in name else 0
-        mult = get_tensor_model_parallel_world_size() * step
-        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
-        if pad == 0:
-            return loaded_weight
-        pad_shape = list(loaded_weight.shape)
-        pad_shape[dim] = pad
-        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_native_mega_moe:
-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=first_layer.ffn.n_redundant_experts,
-        )
-
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
             return
@@ -1259,52 +1097,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 layer.hc_attn_fn_broadcast = broadcast
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
-
-
-def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
-        # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant (LoRA-wrapped experts).
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale",
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant of the above.
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale_inv",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "hc_head": "model.hc_head",
-            "mtp.": "model.mtp.",
-        },
-        orig_to_new_regex=scale_regex,
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-        },
-        orig_to_new_substr={
-            ".shared_experts.w2": ".shared_experts.down_proj",
-            "mtp.": None,
-        },
-    )
 
 
 class DeepseekV4MixtureOfExperts(MixtureOfExperts):
@@ -1353,10 +1145,6 @@ class DeepseekV4ForCausalLM(
 ):
     model_cls = DeepseekV4Model
 
-    # Default mapper assumes the original FP4-expert checkpoint layout.
-    # Overridden per-instance in __init__ when expert_dtype != "fp4".
-    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
-
     packed_modules_mapping = {
         "gate_up_proj": ["w1", "w3"],
         "fused_wqa_wkv": ["wq_a", "wkv"],
@@ -1371,9 +1159,6 @@ class DeepseekV4ForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
-        if expert_dtype != "fp4":
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -1436,12 +1221,5 @@ class DeepseekV4ForCausalLM(
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

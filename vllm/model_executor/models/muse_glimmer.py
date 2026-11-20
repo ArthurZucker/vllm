@@ -32,7 +32,7 @@ adapter/projection stack.
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
 
@@ -95,8 +95,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -1173,43 +1171,6 @@ class MuseGlimmerForCausalLM(
     # rule must precede the ``post_attn_norm`` -> ``post_attention_layernorm``
     # rule so the latter's output is not re-captured by the former (regex rules
     # apply as a single forward pass).
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.vision_tower.patch_embedder.position_embedding_table.weight": (
-                "model.vision_tower.positional_embedding_vlm"
-            ),
-            "model.vision_tower.layers.": "model.vision_tower.transformer.",
-            ".norm1.": ".ln_1.",
-            ".norm2.": ".ln_2.",
-            ".attn.proj.": ".attn.o_proj.",
-            ".mlp.fc1.": ".mlp.c_fc.",
-            ".mlp.fc2.": ".mlp.c_proj.",
-            ".self_attn.gate_proj": ".self_attn.output_gate_proj",
-        },
-        orig_to_new_prefix={
-            "model.rotary_emb.": None,
-            "model.language_model.": "model.",
-            "language_model.": "model.",
-            "model.vision_tower.patch_embedder.patch_embedding.": (
-                "model.vision_tower.conv1_linear."
-            ),
-            "model.vision_tower.": "vision_encoder.",
-            "vision_tower.": "vision_encoder.",
-            "model.vision_encoder.": "vision_encoder.",
-            "model.vision_adapter.fc1.": "model.vision_adapter.c_fc.",
-            "model.vision_adapter.fc2.": "model.vision_adapter.c_proj.",
-            "model.vision_adapter.": "vision_adapter.",
-            "model.vision_projection.": "vision_projection.",
-            "model.perception_emb_norm.": "perception_emb_norm.",
-        },
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1371,10 +1332,6 @@ class MuseGlimmerForCausalLM(
             cap = self.final_logit_softcapping
             logits = cap * torch.tanh(logits / cap)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models"""

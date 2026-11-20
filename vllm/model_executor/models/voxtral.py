@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import cast
 
@@ -24,12 +24,10 @@ from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.inputs import MultiModalDataDict, PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models import SupportsPP
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.whisper import (
     WhisperEncoder,
-    _create_fake_bias_for_k_proj,
 )
 from vllm.model_executor.models.whisper_causal import WhisperCausalEncoder
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -325,7 +323,11 @@ class VoxtralForConditionalGeneration(
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        self.downsample_factor = self.config.audio_config.downsample_factor
+        audio = self.config.audio_config
+        # Transformers' config: the projector's input is that many frames
+        self.downsample_factor = getattr(audio, "downsample_factor", None) or (
+            audio.intermediate_size // audio.d_model
+        )
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
@@ -496,74 +498,6 @@ class VoxtralForConditionalGeneration(
             int(audio_duration_s * stt_config.sample_rate)
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        remapping_rules = [
-            (r"mm_streams_embeddings.embedding_module\.(.*)", r"\1"),
-            (r"mm_whisper_embeddings\.(.*)", r"\1"),
-            (r"audio_language_projection\.(.*)", r"audio_language_adapter.\1"),
-            (
-                r"audio_language_adapter\.0\.weight",
-                r"audio_language_adapter.w_in.weight",
-            ),
-            (
-                r"audio_language_adapter\.2\.weight",
-                r"audio_language_adapter.w_out.weight",
-            ),
-        ]
-
-        audio_params = dict(
-            nn.ModuleDict(
-                {
-                    "audio_language_adapter": self.audio_language_adapter,
-                }
-            ).named_parameters()
-        )
-        weights = _create_fake_bias_for_k_proj(weights, ".wk.weight")
-
-        loaded_weights = set()
-
-        def llm_weights_generator():
-            nonlocal loaded_weights
-            for name, w in weights:
-                is_encoder = False
-                for k in [
-                    "mm_whisper_embeddings",
-                    "mm_streams_embeddings.embedding_module",
-                ]:
-                    is_encoder |= (
-                        name.startswith(k)
-                        and not name.startswith(f"{k}.tok_embeddings")
-                        and not name.startswith(f"{k}.audio_language_projection")
-                    )
-
-                for pattern, repl in remapping_rules:
-                    if re.fullmatch(pattern, name):
-                        name = re.sub(pattern, repl, name)
-
-                if is_encoder:
-                    name = self.whisper_encoder.load_weight((name, w))
-                    loaded_weights.add(f"whisper_encoder.{name}")
-                    continue
-
-                if name in audio_params:
-                    param = audio_params[name]
-                    with torch.no_grad():
-                        default_weight_loader(param, w)
-                    loaded_weights.add(name)
-                else:
-                    yield (name, w)
-
-        for name in self.language_model.load_weights(llm_weights_generator()):
-            loaded_weights.add(f"language_model.{name}")
-
-        # potentially manually add position embeddings
-        sin_key = "whisper_encoder.whisper_encoder.embed_positions.weight"
-        if sin_key not in loaded_weights:
-            # make sure we don't hit an error here
-            loaded_weights.add(sin_key)
-
-        return loaded_weights
-
     def maybe_update_quant_config(
         self, quant_config: QuantizationConfig
     ) -> QuantizationConfig:
@@ -727,6 +661,16 @@ class VoxtralEncoderModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = cast(WhisperConfig, vllm_config.model_config.hf_config)
+        if not hasattr(self.config, "window_size"):
+            # a Transformers checkpoint: its mel settings are its feature extractor's
+            from vllm.transformers_utils.processor import (
+                cached_feature_extractor_from_config,
+            )
+
+            mel = cached_feature_extractor_from_config(vllm_config.model_config)
+            self.config.window_size = mel.n_fft
+            self.config.hop_length = mel.hop_length
+            self.config.sampling_rate = mel.sampling_rate
         self.dtype: torch.dtype = vllm_config.model_config.dtype
         self.is_causal = getattr(self.config, "is_causal", False)
         WhisperEncoderCls: Callable[..., WhisperEncoder | WhisperCausalEncoder]
@@ -834,54 +778,3 @@ class VoxtralEncoderModel(nn.Module):
             chunk_idx += n_chunks
 
         return results
-
-    def load_weight(self, weight: tuple[str, torch.Tensor]) -> str:
-        stacked_params_mapping: list[tuple[str, str, str | int]] = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        params_mapping = []
-
-        if self.is_causal:
-            # For `WhisperCausalEncoder` we need
-            # some more renaming
-            stacked_params_mapping.extend(
-                [
-                    (".mlp.gate_up_proj", ".mlp.fc1", 0),
-                    (".mlp.gate_up_proj", ".mlp.fc3", 1),
-                ]
-            )
-            params_mapping.extend(
-                [
-                    (".mlp.down_proj", ".mlp.fc2"),
-                ]
-            )
-        params_dict = dict(self.named_parameters())
-
-        name, loaded_weight = weight
-        for pattern, repl in self.mistral_remapping:
-            if re.fullmatch(pattern, name):
-                name = re.sub(pattern, repl, name)
-
-        for param_name, weight_name, shard_id in stacked_params_mapping:
-            if weight_name not in name:
-                continue
-            name = name.replace(weight_name, param_name)
-
-            param = params_dict[name]
-            weight_loader = param.weight_loader
-            weight_loader(param, loaded_weight, shard_id)
-            break
-        else:
-            for param_name, weight_name in params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-
-        return name

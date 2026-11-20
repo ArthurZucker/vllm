@@ -20,7 +20,6 @@
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -52,8 +51,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsCrossEncoding, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -185,9 +182,6 @@ class GPT2Block(nn.Module):
 @support_torch_compile
 class GPT2Model(nn.Module):
     # Drop attention mask buffers; NOTE: "c_attn.bias" must not be dropped.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".attn.bias": None, ".attn.masked_bias": None}
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -246,25 +240,6 @@ class GPT2Model(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
-    def _transpose_conv1d(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        # HF's GPT-2 uses Conv1D instead of Linear, so its 2D weights are
-        # stored transposed relative to what vLLM expects.
-        # Note(zhuohan): the logic below might break quantized models.
-        for name, loaded_weight in weights:
-            if name.endswith(".weight") and any(
-                proj in name for proj in ("c_attn", "c_proj", "c_fc")
-            ):
-                loaded_weight = loaded_weight.t()
-            yield name, loaded_weight
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            self._transpose_conv1d(weights), mapper=self.hf_to_vllm_mapper
-        )
-
 
 class GPT2LMHeadModel(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -312,11 +287,6 @@ class GPT2LMHeadModel(nn.Module, SupportsPP):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        weights = _add_transformer_prefix(weights)
-        return loader.load_weights(weights)
-
 
 class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
     """GPT2 Model for sequence classification.
@@ -354,11 +324,6 @@ class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.transformer.embed_input_ids(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        weights = _add_transformer_prefix(weights)
-        return loader.load_weights(weights)
-
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -373,16 +338,3 @@ class GPT2ForSequenceClassification(nn.Module, SupportsCrossEncoding):
             intermediate_tensors=intermediate_tensors,
         )
         return hidden_states
-
-
-def _add_transformer_prefix(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    for name, tensor in weights:
-        if (
-            not name.startswith("transformer.")
-            and not name.startswith("lm_head.")
-            and not name.startswith("score.")
-        ):
-            name = "transformer." + name
-        yield name, tensor

@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only MiniMaxM2 model."""
 
-from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
@@ -58,9 +57,7 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -87,9 +84,6 @@ class MiniMaxM2MoE(nn.Module):
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.num_local_experts, dtype=torch.float32)
             )
-            self.e_score_correction_bias.weight_loader = (
-                MiniMaxM2MoE.ebias_weight_loader
-            )
         else:
             self.e_score_correction_bias = None
 
@@ -115,11 +109,6 @@ class MiniMaxM2MoE(nn.Module):
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
-
-    @staticmethod
-    def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight.to(torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -321,15 +310,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
 class MiniMaxM2Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -370,14 +350,6 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
-
-        # Drop spec-decode (MTP) layers; they are appended after the main
-        # decoder layers and have no destination in the main model.
-        if num_mtp := getattr(config, "num_mtp_modules", 0):
-            base = config.num_hidden_layers
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={f"layers.{base + i}.": None for i in range(num_mtp)}
-            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -420,13 +392,8 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
 
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class MiniMaxM2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
-    hf_to_vllm_mapper = MiniMaxM2Model.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -482,7 +449,3 @@ class MiniMaxM2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

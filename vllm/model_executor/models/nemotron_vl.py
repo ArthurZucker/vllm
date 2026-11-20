@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import math
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -48,8 +46,6 @@ from .interfaces import (
 )
 from .interfaces_base import VllmModelForPooling
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -97,9 +93,6 @@ class NemotronVLProcessingInfo(BaseInternVLProcessingInfo):
 class LlamaNemotronVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
     # Ignore registered buffers, see
     # https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/input_conditioner.py#L28
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={"norm_mean": None, "norm_std": None}
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -388,10 +381,6 @@ class LlamaNemotronVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, Suppor
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
         return MultiModelKeys.from_string_field(
@@ -484,18 +473,6 @@ class LlamaNemotronVLForEmbedding(LlamaNemotronVLChatModel, VllmModelForPooling)
 
     # Weight mapping from checkpoint format to vLLM format
     # Different from parent class due to different vision model structure
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # Language model mapping
-            "language_model.layers.": "language_model.model.layers.",
-            "language_model.embed_tokens.": "language_model.model.embed_tokens.",
-            "language_model.norm.": "language_model.model.norm.",
-            # Vision model mapping (SiglipVisionModel has nested vision_model)
-            "vision_model.encoder.": "vision_model.vision_model.encoder.",
-            "vision_model.embeddings.": "vision_model.vision_model.embeddings.",
-            "vision_model.post_layernorm.": "vision_model.vision_model.post_layernorm.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -559,11 +536,6 @@ class LlamaNemotronVLForEmbedding(LlamaNemotronVLChatModel, VllmModelForPooling)
         ).view(original_shape)
         return self.vision_model(pixel_values)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Override to use different weight mapping for SigLIP."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class LlamaNemotronVLForSequenceClassification(
     LlamaNemotronVLForEmbedding, SupportsCrossEncoding
@@ -572,9 +544,6 @@ class LlamaNemotronVLForSequenceClassification(
 
     # Reranker checkpoint places base model weights under `model.*`,
     # while `score.*` remains at the top level.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.": ""}) | (
-        LlamaNemotronVLForEmbedding.hf_to_vllm_mapper
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -596,24 +565,7 @@ class LlamaNemotronVLForSequenceClassification(
         pooler_config = model_config.pooler_config
         assert pooler_config is not None
         self.pooler = DispatchPooler.for_seq_cls(pooler_config, classifier=self.score)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded_weights = super().load_weights(weights)
-
-        # reranker checkpoint omits the inner LM seq-cls head
-        # (`language_model.score.*`). It is unused by this outer model, but
-        # the default loader expects all parameters to be initialized.
-        for name, param in self.named_parameters():
-            if not name.startswith("language_model.score.") or name in loaded_weights:
-                continue
-
-            if name.endswith(".weight"):
-                torch.nn.init.kaiming_uniform_(param, a=math.sqrt(5))
-            elif name.endswith(".bias"):
-                torch.nn.init.zeros_(param)
-            else:
-                torch.nn.init.normal_(param, mean=0.0, std=0.02)
-
-            loaded_weights.add(name)
-
-        return loaded_weights
+        # the inner LM's own seq-cls head is unused, and not in the checkpoint
+        if (inner := getattr(self.language_model, "score", None)) is not None:
+            for param in inner.parameters():
+                param.loaded_at_init = True

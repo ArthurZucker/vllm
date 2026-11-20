@@ -9,7 +9,7 @@ LoRA support: use --enable-lora --default-mm-loras for LM-only LoRA adapters.
 """
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from fractions import Fraction
 from itertools import islice
 
@@ -48,9 +48,7 @@ from vllm.model_executor.models.llava_next import (
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.siglip import SiglipVisionModel
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -136,7 +134,8 @@ class WindowQFormerDownsampler(nn.Module):
         else:
             self.downsampler = InterpolateDownsampler(config)
 
-        qformer_config = Blip2QFormerConfig(
+        # Transformers' (sized from the vision tower), else the released one's
+        qformer_config = getattr(config, "qformer_config", None) or Blip2QFormerConfig(
             hidden_size=vision_hidden_size,
             num_attention_heads=vision_hidden_size // 64,
             intermediate_size=3072,
@@ -453,16 +452,6 @@ class Granite4VisionForConditionalGeneration(
     # HF: model.language_model.layers.0...
     # vLLM: language_model.model.layers.0...
     # (because GraniteForCausalLM.model = GraniteModel)
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.language_model.": "language_model.model.",
-            "model.layerwise_projectors.": "layerwise_projectors.",
-            "model.spatial_projectors.": "spatial_projectors.",
-            "model.image_newline": "image_newline",
-            "model.vision_tower.": "vision_tower.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -922,7 +911,3 @@ class Granite4VisionForConditionalGeneration(
         # GraniteForCausalLM.compute_logits uses
         # LogitsProcessor(scale=1/logits_scaling)
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

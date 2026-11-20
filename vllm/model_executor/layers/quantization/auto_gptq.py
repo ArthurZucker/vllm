@@ -357,7 +357,6 @@ class AutoGPTQLinearMethod(LinearMethodBase):
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
         is_row_parallel = input_size != input_size_per_partition
-        weight_loader = extra_weight_attrs.get("weight_loader")
 
         mp_linear_kernel_config = MPLinearLayerConfig(
             full_weight_shape=(input_size, output_size),
@@ -392,12 +391,12 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         if marlin_repeat_scales_on_all_ranks(
             self.quant_config.group_size, is_row_parallel
         ):
-            # By setting scale_dim == None, weight_loader will
+            # By setting scale_dim == None, the ops loader will
             # repeat the scales on each GPU in TP>1 case.
             scales_and_zp_input_dim = None
             scales_and_zp_size = input_size // group_size
         else:
-            # By setting scale_dim == 0, weight_loader will
+            # By setting scale_dim == 0, the ops loader will
             # shard the scales in TP>1 case.
             scales_and_zp_input_dim = 0
             scales_and_zp_size = input_size_per_partition // group_size
@@ -413,7 +412,6 @@ class AutoGPTQLinearMethod(LinearMethodBase):
             output_dim=1,
             packed_dim=0,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
         )
 
         qzeros_args = {
@@ -422,7 +420,6 @@ class AutoGPTQLinearMethod(LinearMethodBase):
                 output_size_per_partition // self.quant_config.pack_factor,
                 dtype=torch.int32,
             ),
-            "weight_loader": weight_loader,
         }
         weight_scale_args = {
             "data": torch.empty(
@@ -430,7 +427,6 @@ class AutoGPTQLinearMethod(LinearMethodBase):
                 output_size_per_partition,
                 dtype=params_dtype,
             ),
-            "weight_loader": weight_loader,
         }
 
         if scales_and_zp_input_dim is None:

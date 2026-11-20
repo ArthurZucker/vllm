@@ -16,7 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,11 +42,9 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
-    process_eagle_weight,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -57,9 +55,6 @@ if TYPE_CHECKING:
     class _EagleLlama4ForCausalLMBase(nn.Module):
         def set_moe_parameters(self) -> None: ...
 
-        def permute_qk_weight_for_rotary(
-            self, name: str, loaded_weight: torch.Tensor
-        ) -> tuple[str, torch.Tensor]: ...
 
 else:
     _EagleLlama4ForCausalLMBase = Llama4ForCausalLM
@@ -67,17 +62,6 @@ else:
 
 @support_torch_compile
 class LlamaModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.": ""},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
-
     def __init__(
         self,
         *,
@@ -143,10 +127,6 @@ class LlamaModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states, hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def validate_and_update_config(
         self, start_layer_id: int, quant_config: QuantizationConfig | None = None
     ) -> None:
@@ -203,6 +183,7 @@ class EagleLlama4ForCausalLM(_EagleLlama4ForCausalLMBase, SupportsMultiModalEmbe
 
         # Set MoE hyperparameters
         self.set_moe_parameters()
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def get_language_model(self) -> torch.nn.Module:
         return self.model
@@ -231,15 +212,3 @@ class EagleLlama4ForCausalLM(_EagleLlama4ForCausalLMBase, SupportsMultiModalEmbe
         inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        def transform(inputs):
-            name, loaded_weight = inputs
-            name, weight = self.permute_qk_weight_for_rotary(name, loaded_weight)
-            if "lm_head" not in name:
-                name = "model." + name
-            process_eagle_weight(self, name)
-            return name, weight
-
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(map(transform, weights))

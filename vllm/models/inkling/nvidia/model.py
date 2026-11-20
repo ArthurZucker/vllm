@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from functools import partial
 from typing import Any, TypeAlias
 
 import regex as re
@@ -14,7 +14,6 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
@@ -29,12 +28,11 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+from vllm.models.inkling.common.loading import inkling_expert_weights
 from vllm.models.inkling.common.mm_preprocess import (
     InklingDummyInputsBuilder,
     InklingMultiModalProcessor,
@@ -370,43 +368,6 @@ class InklingModel(nn.Module):
 class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
     """Shared text-backbone causal-LM scaffolding for both entry classes."""
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".w13_dn": ".gate_up_proj",
-            ".w2_md": ".down_proj",
-        },
-        orig_to_new_stacked={
-            ".attn.wq_du.": (".attn.qkvr.", 0),
-            ".attn.wk_dv.": (".attn.qkvr.", 1),
-            ".attn.wv_dv.": (".attn.qkvr.", 2),
-            ".attn.wr_du.": (".attn.qkvr.", 3),
-        },
-        orig_to_new_prefix={
-            "model.llm.layers.": "model.layers.",
-            "model.llm.embed_norm": "model.embed_norm",
-            "model.llm.embed": "model.embed_tokens",
-            "model.llm.norm": "model.norm",
-            "model.llm.unembed": "lm_head",
-            "language_model.layers.": "model.layers.",
-            "language_model.lm_head.": "lm_head.",
-        },
-        orig_to_new_suffix={
-            # ModelOpt NVFP4 scales
-            ".w13_weight.scale": ".w13_weight_scale",
-            ".w13_weight.scale2": ".w13_weight_scale_2",
-            ".w2_weight.scale": ".w2_weight_scale",
-            ".w2_weight.scale2": ".w2_weight_scale_2",
-            # Compressed tensors NVFP4 parameters
-            ".w13_weight.input_global_scale": ".w13_input_global_scale",
-            ".w13_weight.weight_global_scale": ".w13_weight_global_scale",
-            ".w13_weight.weight_packed": ".w13_weight_packed",
-            ".w13_weight.weight_scale": ".w13_weight_scale",
-            ".w2_weight.input_global_scale": ".w2_input_global_scale",
-            ".w2_weight.weight_global_scale": ".w2_weight_global_scale",
-            ".w2_weight.weight_packed": ".w2_weight_packed",
-            ".w2_weight.weight_scale": ".w2_weight_scale",
-        },
-    )
     packed_modules_mapping = {
         "qkvr": ["wq_du", "wk_dv", "wv_dv", "wr_du"],
         "w13": ["w1", "w3"],
@@ -431,6 +392,7 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.checkpoint_transforms = [partial(inkling_expert_weights, self)]
         initialize_lamport_rs_conv(
             text_config.hidden_size,
             text_config.sconv_kernel_size,
@@ -474,9 +436,6 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_inkling_weights(self, weights, self.config)
-
 
 class InklingForCausalLM(_TmlForCausalLMBase):
     """Text-only entry point (`inkling_model` checkpoints)."""
@@ -500,13 +459,6 @@ class InklingForConditionalGeneration(_TmlForCausalLMBase, SupportsMultiModal):
     `forward` / `compute_logits` (the latter already applies muP) and this
     class only adds multimodal embedding + merge.
     """
-
-    hf_to_vllm_mapper = _TmlForCausalLMBase.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={
-            "model.audio.": "audio.",
-            "model.visual.": "visual.vision_encoder.",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -637,71 +589,6 @@ class InklingForConditionalGeneration(_TmlForCausalLMBase, SupportsMultiModal):
 # ===========================================================================
 # Weight loading
 # ===========================================================================
-
-
-_MOE_EXPERT_WEIGHT_RE = re.compile(
-    r"^(?P<mlp>.*\.mlp)\.(?P<rest>(?:shared_)?experts\..+)$"
-)
-
-
-def _load_inkling_weights(
-    module: nn.Module,
-    weights: Iterable[tuple[str, torch.Tensor]],
-    config: InklingModelConfig,
-) -> set[str]:
-    moe_modules = {
-        name: mod for name, mod in module.named_modules() if isinstance(mod, InklingMoE)
-    }
-    loaded: set[str] = set()
-    tp_size = get_tensor_model_parallel_world_size()
-    tp_rank = get_tensor_model_parallel_rank()
-    local_ids = set(config.local_layer_ids)
-
-    def _iter_loadable_weights() -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in module.hf_to_vllm_mapper.apply(weights):
-            shard_id = getattr(weight, "shard_id", None)
-            # Replicate K/V conv-free GQA heads when tp_size > num_kv_heads.
-            if (
-                shard_id in (1, 2)
-                and name.endswith(".attn.qkvr.weight")
-                and weight.shape[0] > 0
-            ):
-                lid = _layer_id(name)
-                if lid is not None:
-                    is_local = lid in local_ids
-                    n_kv = (
-                        config.swa_num_key_value_heads
-                        if is_local
-                        else config.num_key_value_heads
-                    )
-                    head_dim = config.swa_head_dim if is_local else config.head_dim
-                    if tp_size > n_kv and weight.shape[0] == n_kv * head_dim:
-                        kv_idx = (tp_rank * n_kv) // tp_size
-                        weight = weight.narrow(0, kv_idx * head_dim, head_dim)
-                        weight.shard_id = shard_id
-
-            # MoE expert tensors (fused stacked, routed + shared sink): translate
-            # the checkpoint layout to per-expert FusedMoE loads.
-            moe_match = _MOE_EXPERT_WEIGHT_RE.match(name)
-            if moe_match is not None and moe_match.group("mlp") in moe_modules:
-                moe = moe_modules[moe_match.group("mlp")]
-                for rel in moe.load_expert_weight(moe_match.group("rest"), weight):
-                    loaded.add(f"{moe_match.group('mlp')}.{rel}")
-                continue
-
-            yield name, weight
-
-    # The release checkpoint also carries auxiliary prediction-head weights;
-    # they are not part of the causal LM served by this implementation.
-    mapper = WeightsMapper(orig_to_new_prefix={"model.mtp.": None})
-    loader = AutoWeightsLoader(module)
-    loaded |= loader.load_weights(_iter_loadable_weights(), mapper=mapper)
-
-    # Post-load MoE fixups (default input scales, zeroed EP-padding experts).
-    for moe_name, moe in moe_modules.items():
-        for rel in moe.finalize_load():
-            loaded.add(f"{moe_name}.{rel}")
-    return loaded
 
 
 EntryClass = [InklingForCausalLM, InklingForConditionalGeneration]

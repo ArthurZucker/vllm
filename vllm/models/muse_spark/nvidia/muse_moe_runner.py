@@ -590,10 +590,7 @@ class MuseSparkTrtLlmNvFp4ExpertsModular(
 
 
 class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
-    """ModelOpt NVFP4 MoE preserving separate w1/w3 global weight scales.
-
-    The name must contain "ModelOpt": `RoutedExperts.weight_loader` matches it.
-    """
+    """ModelOpt NVFP4 MoE preserving separate w1/w3 global weight scales."""
 
     muse_post_expert_finalize: MusePostExpertFinalize
 
@@ -809,13 +806,6 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
         _attach_post_expert_finalize(self)
 
 
-def _reject_direct_reload(*args, **kwargs) -> None:
-    raise RuntimeError(
-        "MuseSpark online FP8 experts already hold FP8 weights: reload them "
-        "through the layerwise reload, not a direct load_weights."
-    )
-
-
 class MuseSparkFp8FusedMoE(Fp8PtpcOnlineMoEMethod):
     """`fp8_per_channel` on Triton experts, which run Muse Spark's
     post-expert norm as their `post_gemm2_hook`; the FP8 oracle would pick
@@ -868,10 +858,6 @@ class MuseSparkFp8FusedMoE(Fp8PtpcOnlineMoEMethod):
             layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
         )
         _attach_post_expert_finalize(self)
-        # A later direct load_weights would cast BF16 weights into these
-        # FP8 tensors unscaled; the layerwise reload restores its own loaders.
-        layer.w13_weight.weight_loader = _reject_direct_reload
-        layer.w2_weight.weight_loader = _reject_direct_reload
 
 
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):

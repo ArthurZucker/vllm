@@ -25,8 +25,6 @@
 """Inference-only K2Horizon model compatible with HuggingFace weights."""
 
 import math
-import typing
-from collections.abc import Callable, Iterable
 from itertools import islice
 from typing import Any
 
@@ -50,7 +48,6 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     _get_config_dtype_str,
@@ -80,10 +77,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
@@ -93,10 +86,8 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -175,32 +166,6 @@ def apply_partial_rope(
     ).reshape(*k.shape[:-2], -1)
 
     return q, k
-
-
-def _rope_weight_perm(head_dim: int, rope_head_dim: int) -> torch.Tensor:
-    """Per-head gather index that folds K2Horizon's partial-RoPE channel reordering.
-
-    The K2Horizon checkpoint stores each head's channels in a GPT-J-interleaved
-    convention with rope/nope channels interleaved. Applying this fixed
-    (position-independent) permutation to the q/k weight rows lets the runtime
-    use vLLM's *native* NeoX partial-RoPE path (`head_size = head_dim`,
-    `rotary_dim = rope_head_dim`) with no per-forward permutes/all-gather.
-    """
-    D, R = head_dim, rope_head_dim
-    assert R % 2 == 0 and R <= D, (
-        f"partial NeoX RoPE requires an even rope_head_dim <= head_dim, "
-        f"got R={R}, D={D}"
-    )
-    h = D // 2
-    idx = torch.cat(
-        [
-            torch.arange(0, R // 2),  # rope first-half channels
-            torch.arange(h, h + R // 2),  # rope second-half channels
-            torch.arange(R // 2, h),  # nope remainder (first half)
-            torch.arange(h + R // 2, D),  # nope remainder (second half)
-        ]
-    )
-    return idx
 
 
 def calc_router_weights(
@@ -650,6 +615,11 @@ class K2HorizonAttention(nn.Module):
             self.k_norm = K2HorizonRMSNorm(
                 hidden_size=self.kv_size, n_groups=self.num_kv_heads, eps=rms_norm_eps
             )
+            # sharded by heads; a kv head shared by tp / kv-heads ranks
+            self.q_norm.weight.shard_dim = self.k_norm.weight.shard_dim = 0
+            self.k_norm.weight.shard_replicas = max(
+                1, tp_size // self.total_num_kv_heads
+            )
 
         self.gate_func = gate_func
         if self.gate_func is not None:
@@ -762,6 +732,7 @@ class K2HorizonMoVAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qk_proj",
         )
+        self.qk_proj.shard_replicas = {1: max(1, tp_size // self.total_num_kv_heads)}
 
         self.v_router = ReplicatedLinear(
             hidden_size,
@@ -788,6 +759,9 @@ class K2HorizonMoVAAttention(nn.Module):
                 for value in range(num_experts)
             ]
         )
+        # a kv head shared by tp / kv-heads ranks, as `qk_proj`'s k
+        for param in self.v_experts.parameters():
+            param.shard_replicas = max(1, tp_size // self.total_num_kv_heads)
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -835,6 +809,11 @@ class K2HorizonMoVAAttention(nn.Module):
             )
             self.k_norm = K2HorizonRMSNorm(
                 hidden_size=self.kv_size, n_groups=self.num_kv_heads, eps=rms_norm_eps
+            )
+            # sharded by heads; a kv head shared by tp / kv-heads ranks
+            self.q_norm.weight.shard_dim = self.k_norm.weight.shard_dim = 0
+            self.k_norm.weight.shard_replicas = max(
+                1, tp_size // self.total_num_kv_heads
             )
 
         self.gate_func = gate_func
@@ -1133,302 +1112,6 @@ class K2HorizonModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-            num_redundant_experts=self.num_redundant_experts,
-        )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        # Per-head gather index used to fold K2Horizon's partial-RoPE channel
-        # reordering into the q_proj/k_proj rows and the q_norm/k_norm scales,
-        # so the runtime can use vLLM's native partial NeoX RoPE.
-        head_dim = self.config.head_dim or (
-            self.config.hidden_size // self.config.num_attention_heads
-        )
-        rope_head_dim = self.config.rope_head_dim or head_dim
-        rope_perm_idx = _rope_weight_perm(head_dim, rope_head_dim)
-
-        # Attention modules whose q/k projections are dense: only these fold the
-        # RoPE channel permutation into their q/k weights, biases and q/k norm
-        # scales at load time. Attentions with packed/quantized q/k projections
-        # keep the runtime channel-permutation path, so their weights must be
-        # loaded verbatim (folding would misalign per-channel scales).
-        rope_fold_prefixes = tuple(
-            f"{module_name}."
-            for module_name, module in self.named_modules()
-            if isinstance(module, (K2HorizonAttention, K2HorizonMoVAAttention))
-            and getattr(module, "fold_rope_weights", False)
-        )
-
-        # Skip loading extra parameters for GPTQ/modelopt models.
-        # ignore_suffixes = (
-        #     ".bias",
-        #     "_bias",
-        #     ".weight_scale",
-        #     "_weight_scale",
-        #     ".input_scale",
-        #     "_input_scale",
-        # )
-        ignore_suffixes = ()
-
-        params_dict = dict(self.named_parameters())
-
-        loaded_params: set[str] = set()
-        expert_params_mapping = self.get_expert_mapping()
-        for name, loaded_weight in weights:
-            if "scale" in name or "zero_point" in name:
-                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                if remapped_name is None:
-                    continue
-                name = remapped_name
-
-            # QK norm weights
-            if name.endswith(".self_attn.q_norm.weight") or name.endswith(
-                ".self_attn.k_norm.weight"
-            ):
-                if is_pp_missing_parameter(name, self):
-                    continue
-                if name not in params_dict:
-                    continue
-
-                # Fold the per-head RoPE channel permutation into the norm scales.
-                if self.config.query_key_norm and name.startswith(rope_fold_prefixes):
-                    loaded_weight = (
-                        loaded_weight.view(-1, head_dim)[:, rope_perm_idx]
-                        .reshape(-1)
-                        .contiguous()
-                    )
-
-                param = params_dict[name]
-                tp_rank = get_tensor_model_parallel_rank()
-                tp_size = get_tensor_model_parallel_world_size()
-
-                if loaded_weight.shape != param.shape:
-                    if name.endswith(".self_attn.q_norm.weight"):
-                        loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    else:
-                        num_kv_heads = self.config.num_key_value_heads
-                        if num_kv_heads >= tp_size:
-                            loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                        else:
-                            num_kv_head_replicas = tp_size // num_kv_heads
-                            kv_rank = tp_rank // num_kv_head_replicas
-                            loaded_weight = loaded_weight.chunk(num_kv_heads, dim=0)[
-                                kv_rank
-                            ]
-
-                weight_loader: Callable[..., Any] = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-                continue
-
-            # MoVA v experts
-            if ".self_attn.v_experts." in name:
-                if is_pp_missing_parameter(name, self):
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                tp_rank = get_tensor_model_parallel_rank()
-                tp_size = get_tensor_model_parallel_world_size()
-                num_kv_heads = self.config.num_key_value_heads
-
-                if loaded_weight.shape != param.shape:
-                    if num_kv_heads >= tp_size:
-                        loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    else:
-                        num_kv_head_replicas = tp_size // num_kv_heads
-                        kv_rank = tp_rank // num_kv_head_replicas
-                        loaded_weight = loaded_weight.chunk(num_kv_heads, dim=0)[
-                            kv_rank
-                        ]
-
-                default_weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
-                    continue
-                if ".self_attn." in name and param_name == "gate_up_proj":
-                    assert weight_name == "gate_proj"
-                    continue
-
-                # Fold the per-head RoPE channel permutation into the dense
-                # q_proj / k_proj rows (W' = P W), and biases, before TP
-                # sharding.
-                if shard_id in ("q", "k") and name.startswith(rope_fold_prefixes):
-                    if name.endswith(".weight"):
-                        hidden = loaded_weight.shape[-1]
-                        loaded_weight = (
-                            loaded_weight.view(-1, head_dim, hidden)[
-                                :, rope_perm_idx, :
-                            ]
-                            .reshape(-1, hidden)
-                            .contiguous()
-                        )
-                    elif self.config.attention_bias and name.endswith(".bias"):
-                        loaded_weight = (
-                            loaded_weight.view(-1, head_dim)[:, rope_perm_idx]
-                            .reshape(-1)
-                            .contiguous()
-                        )
-
-                if (
-                    ".self_attn." in name
-                    and param_name == "qkv_proj"
-                    and name.replace(weight_name, param_name) not in params_dict
-                ):
-                    qk_name = name.replace(weight_name, "qk_proj")
-                    if is_pp_missing_parameter(qk_name, self):
-                        continue
-                    if qk_name not in params_dict:
-                        continue
-
-                    assert weight_name in ["q_proj", "k_proj"]
-                    if weight_name == "k_proj":
-                        tp_size = get_tensor_model_parallel_world_size()
-                        num_kv_heads = self.config.num_key_value_heads
-                        if num_kv_heads < tp_size:
-                            num_kv_head_replicas = tp_size // num_kv_heads
-                            loaded_weight = (
-                                loaded_weight.reshape(
-                                    num_kv_heads, -1, *loaded_weight.shape[1:]
-                                )
-                                .repeat_interleave(num_kv_head_replicas, dim=0)
-                                .reshape(-1, *loaded_weight.shape[1:])
-                            )
-
-                    param = params_dict[qk_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(
-                        param, loaded_weight, 0 if weight_name == "q_proj" else 1
-                    )
-                    loaded_params.add(qk_name)
-                    break
-
-                name = name.replace(weight_name, param_name)
-
-                # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
-                    continue
-
-                # Skip layers on other devices.
-                if is_pp_missing_parameter(name, self):
-                    continue
-                if name.endswith("scale"):
-                    # Remapping the name of FP8 kv-scale.
-                    remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                    if remapped_name is None:
-                        continue
-                    name = remapped_name
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if weight_loader == default_weight_loader:
-                    weight_loader(param, loaded_weight)
-                else:
-                    weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                is_expert_weight = False
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-
-                    # Anyway, this is an expert weight and should not be
-                    # attempted to load as other weights later
-                    is_expert_weight = True
-
-                    # Do not modify `name` since the loop may continue here
-                    # Instead, create a new variable
-                    name_mapped = name.replace(weight_name, param_name)
-
-                    if is_pp_missing_parameter(name_mapped, self):
-                        continue
-
-                    # Skip loading extra parameters for GPTQ/modelopt models.
-                    if (
-                        name_mapped.endswith(ignore_suffixes)
-                        and name_mapped not in params_dict
-                    ):
-                        continue
-
-                    param = params_dict[name_mapped]
-                    # We should ask the weight loader to return success or not
-                    # here since otherwise we may skip experts with other
-                    # available replicas.
-                    weight_loader = typing.cast(
-                        Callable[..., bool], param.weight_loader
-                    )
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        name = name_mapped
-                        break
-                else:
-                    if is_expert_weight:
-                        # We've checked that this is an expert weight
-                        # However it's not mapped locally to this rank
-                        # So we simply skip it
-                        continue
-
-                    # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
-                        continue
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
-
 
 class K2HorizonForCausalLM(
     nn.Module, SupportsPP, SupportsLoRA, SupportsEagle, SupportsEagle3, MixtureOfExperts
@@ -1537,10 +1220,3 @@ class K2HorizonForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

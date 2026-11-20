@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterator
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -68,6 +68,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
 )
+from vllm.model_executor.layers.quantization.moe_wna16 import unpack_int4
 from vllm.model_executor.layers.quantization.quark.utils import (
     QuarkQTensorHint,
     parse_w4a16_int4_weight_config,
@@ -81,7 +82,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_VALUE_DTYPE,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    dequantize_nvfp4_moe_weights,
+    dequantize_nvfp4_tensor,
 )
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     _ACTIVATION_QUANT_KEY_MAP,
@@ -127,6 +128,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
 )
+from vllm.model_executor.model_loader.weight_ops import WholeOp
 from vllm.model_executor.utils import (
     replace_parameter,
     retire_parameter,
@@ -380,12 +382,6 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
         strategy = FusedMoeWeightScaleSupported.GROUP.value
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": False})
 
-        assert "weight_loader" in extra_weight_attrs
-        weight_loader = extra_weight_attrs["weight_loader"]
-        extra_weight_attrs["weight_loader"] = self.get_weight_loader(
-            layer, weight_loader
-        )
-
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -547,80 +543,15 @@ class QuarkW4A16Int4MoEMethod(QuarkMoEMethod):
             shared_experts_input=shared_experts_input,
         )
 
-    def get_weight_loader(self, layer: RoutedExperts, weight_loader):
-        def convert_quark_tensor(tensor: torch.Tensor, tensor_type: str):
-            size0 = tensor.size(0)
-            tensor = tensor.view(torch.uint8)
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """Quark's int4 experts load into this layout (`QuarkInt4Unpack`)"""
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmLayoutQuantizer,
+        )
 
-            shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
-            tensor = (tensor[:, :, None] >> shifter) & 0xF
-
-            if self.pack_reorder:
-                reverse_awq_pack_order = [0, 4, 1, 5, 2, 6, 3, 7]
-                tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
-            else:
-                tensor = tensor.view(-1, 8)
-            if self.is_symmetric:
-                tensor = tensor ^ 0x8
-            tensor = tensor.view(size0, -1)
-
-            tensor = tensor.T.contiguous()
-            if tensor_type == "weight":
-                tensor = tensor[:, 1::2] * 16 + tensor[:, ::2]
-            elif tensor_type == "zero_point":
-                tensor = tensor[1::2, :] * 16 + tensor[::2, :]
-            return tensor
-
-        def quark_int4_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            weight_name: str,
-            shard_id: str,
-            expert_id: int,
-            return_success: bool = False,
-        ):
-            loaded_weight = loaded_weight.to(param.data.device)
-            shard_size = layer.intermediate_size_per_partition
-
-            if weight_name.endswith("_weight"):
-                loaded_weight = convert_quark_tensor(loaded_weight, "weight")
-            elif weight_name.endswith("_weight_zero_point"):
-                loaded_weight = convert_quark_tensor(loaded_weight, "zero_point")
-            elif weight_name.endswith("_weight_scale"):
-                loaded_weight = loaded_weight.T
-
-            if layer.group_size_div_factor > 1 and (
-                "weight_zero_point" in weight_name or "weight_scale" in weight_name
-            ):
-                loaded_weight = loaded_weight.repeat_interleave(
-                    layer.group_size_div_factor, 1
-                )
-
-            if "w13_weight_zero_point" in weight_name:
-                tensor = loaded_weight.view(
-                    layer.moe_config.tp_size, -1, loaded_weight.size(1)
-                )[layer.moe_config.tp_rank]
-                if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
-                else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
-                return True if return_success else None
-            elif "w2_weight_zero_point" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.moe_config.tp_size, -1
-                )[:, layer.moe_config.tp_rank]
-                return True if return_success else None
-
-            return weight_loader(
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-                return_success=return_success,
-            )
-
-        return quark_int4_weight_loader
+        kinds = ("weight", "weight_scale", "weight_zero_point")
+        names = [f"{p}_{k}" for p in ("w13", "w2") for k in kinds]
+        return VllmLayoutQuantizer(QuarkInt4Unpack, names)
 
 
 class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
@@ -768,7 +699,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            # Add PER-TENSOR quantization for RoutedExperts.weight_loader.
+            # Add PER-TENSOR quantization (the ops loader shards by param attributes).
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
             )
@@ -790,7 +721,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            # Add PER-CHANNEL quantization for RoutedExperts.weight_loader.
+            # Add PER-CHANNEL quantization (the ops loader shards by param attributes).
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
             )
@@ -819,7 +750,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            # Add PER-BLOCK quantization for RoutedExperts.weight_loader.
+            # Add PER-BLOCK quantization (the ops loader shards by param attributes).
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
             )
@@ -2341,20 +2272,19 @@ class QuarkNvfp4MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w2_input_scale_2", w2_input_scale_2)
         set_weight_attrs(w2_input_scale_2, extra_weight_attrs)
 
-    def dequantize_weight(
-        self, layer: torch.nn.Module
-    ) -> Iterator[tuple[slice, torch.Tensor, torch.Tensor]]:
-        """Yield `(experts, w13, w2)` dequantized Quark NVFP4 experts."""
-        return dequantize_nvfp4_moe_weights(
-            layer.w13_weight,
-            layer.w13_weight_scale,
-            layer.w13_weight_scale_2,
-            layer.w2_weight,
-            layer.w2_weight_scale,
-            layer.w2_weight_scale_2,
-            layer.params_dtype,
+    def dequantize_op(self, layer: torch.nn.Module):
+        """Each NVFP4 checkpoint expert as it loads, for requantization: its
+        `weight_scale_2` the decode multiplier"""
+        dequantize = partial(
+            dequantize_nvfp4_tensor,
+            dtype=layer.params_dtype,
             group_size=self.group_size,
-            invert_global_scales=False,
+            invert_global_scale=False,
+        )
+        return (
+            dequantize,
+            ["weight", "weight_scale", "weight_scale_2"],
+            ["input_scale_2"],
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -2465,3 +2395,33 @@ class QuarkNvfp4MoEMethod(QuarkMoEMethod):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+
+class QuarkInt4Unpack(WholeOp):
+    """One expert's Quark int4 tensor in `QuarkW4A16Int4MoEMethod`'s layout: rows
+    the output channels, int4 two to a byte (sign-flipped when symmetric), scales
+    and zero points repeated to the layer's group size. Whole: sharded after"""
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        name = kwargs["full_layer_name"]
+        layer = kwargs["model"].get_submodule(name.rpartition(".")[0])
+        method = layer.quant_method
+        kind = next(
+            k
+            for k in ("weight_zero_point", "weight_scale", "weight")
+            if name.endswith(k)
+        )
+
+        def unpack(tensor: torch.Tensor) -> torch.Tensor:
+            if kind == "weight_scale":
+                tensor = tensor.T
+            else:
+                tensor = unpack_int4(
+                    tensor, kind == "weight", method.pack_reorder, method.is_symmetric
+                )
+            if layer.group_size_div_factor > 1 and kind != "weight":
+                tensor = tensor.repeat_interleave(layer.group_size_div_factor, 1)
+            return tensor
+
+        return {p: [unpack(t) for t in v] for p, v in input_dict.items()}

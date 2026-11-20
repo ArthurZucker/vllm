@@ -23,6 +23,11 @@ from collections.abc import Iterable
 
 import pytest
 import torch
+from transformers.core_model_loading import (
+    Concatenate,
+    MergeModulelist,
+    WeightConverter,
+)
 
 from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -35,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.platforms import current_platform
 
 aiter_available = importlib.util.find_spec("aiter") is not None
@@ -118,6 +124,20 @@ def _make_routed_experts() -> RoutedExperts:
     )
 
 
+# A model's per-expert checkpoint into its experts (`conversion_mapping`'s
+# `_layer_experts`), at the experts' own scope
+EXPERT_CONVERSIONS = [
+    WeightConverter(
+        ["*.gate_proj.weight", "*.up_proj.weight"],
+        "w13_weight",
+        operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+    ),
+    WeightConverter(
+        "*.down_proj.weight", "w2_weight", operations=[MergeModulelist(dim=0)]
+    ),
+]
+
+
 def _expert_weight_iterator(seed: int) -> Iterable[tuple[str, torch.Tensor]]:
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(seed)
@@ -155,7 +175,7 @@ def _expert_weight_iterator(seed: int) -> Iterable[tuple[str, torch.Tensor]]:
 
 
 def _load_expert_weights(layer: RoutedExperts, seed: int) -> set[str]:
-    loaded = set(layer.load_weights(_expert_weight_iterator(seed)))
+    loaded = load_with_ops(layer, _expert_weight_iterator(seed), EXPERT_CONVERSIONS)
     assert {"w13_weight", "w2_weight"} <= loaded
     return loaded
 

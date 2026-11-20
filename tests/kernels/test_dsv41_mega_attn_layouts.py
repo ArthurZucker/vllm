@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.models.deepseek_v41.common.ops.fused_layout import (
     WV_GROUP_SIZE,
     o_fused_chunk_permutation,
@@ -27,12 +27,12 @@ HEAD_DIM = 512
 
 
 def _load(checkpoint: torch.Tensor, perm: torch.Tensor, dim: int) -> torch.Tensor:
-    """Load `checkpoint` into a fresh parameter through a permuting loader."""
-    param = torch.nn.Parameter(torch.empty_like(checkpoint), requires_grad=False)
-    param.weight_loader = default_weight_loader
-    permute_on_load(param, perm, dim)
-    param.weight_loader(param, checkpoint)
-    return param.data
+    """Load `checkpoint` into a fresh parameter, gathered by `perm` on load."""
+    root = torch.nn.Module()
+    root.param = torch.nn.Parameter(torch.empty_like(checkpoint), requires_grad=False)
+    permute_on_load(root.param, perm, dim)
+    load_with_ops(root, iter([("param", checkpoint)]), conversions=[])
+    return root.param.data
 
 
 def test_permuted_wq_b_gemm_matches_permuted_activation():

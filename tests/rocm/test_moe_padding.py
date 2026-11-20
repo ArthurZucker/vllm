@@ -39,6 +39,11 @@ See https://github.com/vllm-project/vllm/issues/54966 ("Test padding").
 import pytest
 import torch
 import torch.nn.functional as F
+from transformers.core_model_loading import (
+    Concatenate,
+    MergeModulelist,
+    WeightConverter,
+)
 
 import vllm.envs as envs
 from vllm._aiter_ops import is_aiter_found_and_supported
@@ -58,6 +63,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -157,6 +163,20 @@ def _make_routed_experts(hidden_size: int, intermediate_size: int) -> RoutedExpe
     )
 
 
+# A model's per-expert checkpoint into its experts (`conversion_mapping`'s
+# `_layer_experts`), at the experts' own scope
+EXPERT_CONVERSIONS = [
+    WeightConverter(
+        ["*.gate_proj.weight", "*.up_proj.weight"],
+        "w13_weight",
+        operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+    ),
+    WeightConverter(
+        "*.down_proj.weight", "w2_weight", operations=[MergeModulelist(dim=0)]
+    ),
+]
+
+
 def _expert_weight_iterator(seed: int, hidden_size: int, intermediate_size: int):
     set_random_seed(seed)
     for expert_id in range(NUM_EXPERTS):
@@ -192,10 +212,10 @@ def _expert_weight_iterator(seed: int, hidden_size: int, intermediate_size: int)
 def _load_and_process_weights(
     layer: RoutedExperts, seed: int, hidden_size: int, intermediate_size: int
 ) -> None:
-    loaded = set(
-        layer.load_weights(
-            _expert_weight_iterator(seed, hidden_size, intermediate_size)
-        )
+    loaded = load_with_ops(
+        layer,
+        _expert_weight_iterator(seed, hidden_size, intermediate_size),
+        EXPERT_CONVERSIONS,
     )
     assert {"w13_weight", "w2_weight"} <= loaded
     layer.quant_method.process_weights_after_loading(layer)

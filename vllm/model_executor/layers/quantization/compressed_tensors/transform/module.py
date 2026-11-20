@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
-from collections.abc import Callable, Hashable
+from collections.abc import Hashable
 
 import torch
 from compressed_tensors.transform import (
@@ -37,7 +37,6 @@ class HadamardTransform(torch.nn.Module):
         self,
         transforms: dict[int, TransformTuple],
         layer: torch.nn.Module,
-        weight_loader: Callable,
         input_size_per_partition: int,
         output_partition_sizes: list[int],
     ):
@@ -51,7 +50,7 @@ class HadamardTransform(torch.nn.Module):
 
         # Similar to row/col parallel params, but tensors are separate
         # to allow for loading with shared memory
-        self.weight = SharedWeightParameter(weight_loader=weight_loader)
+        self.weight = SharedWeightParameter()
 
         # create shared partition data for each partition of the original weight
         input_size = input_size_per_partition

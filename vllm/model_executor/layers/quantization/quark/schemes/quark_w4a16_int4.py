@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -29,6 +28,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt4Static32Asym,
     kInt4StaticAsym,
 )
+from vllm.model_executor.model_loader.weight_ops import PadToParam
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedvLLMParameter,
@@ -79,7 +79,6 @@ class QuarkW4A16Int4(QuarkScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         input_size = kwargs["input_size"]
@@ -115,18 +114,6 @@ class QuarkW4A16Int4(QuarkScheme):
         )
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
 
-        def weight_scale_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            *args,
-            **loader_kwargs,
-        ) -> None:
-            if loaded_weight.shape[1] < param.data.shape[1]:
-                padded_weight = loaded_weight.new_zeros(param.data.shape)
-                padded_weight[:, : loaded_weight.shape[1]] = loaded_weight
-                loaded_weight = padded_weight
-            weight_loader(param, loaded_weight, *args, **loader_kwargs)
-
         weight = PackedvLLMParameter(
             data=torch.empty(
                 input_size_per_partition,
@@ -137,7 +124,6 @@ class QuarkW4A16Int4(QuarkScheme):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.pack_factor,
-            weight_loader=weight_loader,
         )
         num_groups = input_size_per_partition // group_size
         weight_zero_point = PackedvLLMParameter(
@@ -150,7 +136,6 @@ class QuarkW4A16Int4(QuarkScheme):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.pack_factor,
-            weight_loader=weight_loader,
         )
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
@@ -160,7 +145,6 @@ class QuarkW4A16Int4(QuarkScheme):
             ),
             input_dim=0,
             output_dim=1,
-            weight_loader=weight_scale_loader,
         )
 
         layer.register_parameter("weight", weight)
@@ -173,6 +157,19 @@ class QuarkW4A16Int4(QuarkScheme):
             w_s_param_name="weight_scale",
             w_zp_param_name="weight_zero_point" if not self.is_symmetric else None,
         )
+
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """`weight_scale` has a column per packed output slot: this rank's
+        scales load zero-padded to them (`PadScaleColumns`)"""
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmLayoutQuantizer,
+        )
+
+        if layer.output_size_per_partition == layer.weight_scale.shape[1]:
+            return None
+        quantizer = VllmLayoutQuantizer(PadScaleColumns, ["weight_scale"])
+        quantizer.load_before_model_ops = False  # pads the param's own columns
+        return quantizer
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight.data = canonicalize_quark_packed_int4(
@@ -210,3 +207,11 @@ class QuarkW4A16Int4(QuarkScheme):
     ):
         assert self.kernel is not None
         return self.kernel.apply_weights(layer, x, bias)
+
+
+class PadScaleColumns(PadToParam):
+    """This rank's scales (after sharding and any fused-shard concat), zero
+    padded to the param's columns: one per packed output slot"""
+
+    def __init__(self, quantizer=None):
+        self.quantizer = quantizer

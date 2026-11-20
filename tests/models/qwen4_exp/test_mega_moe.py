@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -70,7 +71,7 @@ def _checkpoint(checkpoint_format: str, num_experts: int, generator):
 
 
 def _names(checkpoint_format, ckpt, generator) -> list[tuple[str, torch.Tensor]]:
-    """Per-expert checkpoint tensors in a random order."""
+    """Per-expert checkpoint tensors (in a random order: the loader sorts them)."""
     names = [(f"{e}.{p}.weight", w) for (e, p), (w, _) in ckpt.items()]
     if checkpoint_format != "bf16":
         scale_name = "weight_scale" if "mx" in checkpoint_format else "weight_scale_inv"
@@ -101,11 +102,17 @@ def _experts(cls, fmt, num_local, start, num_logical, checkpoint_format=None):
         return cls(vllm_config, **kwargs)
 
 
+def _load(experts, names) -> set[str]:
+    loaded = load_with_ops(experts, names)
+    experts.quant_method.process_weights_after_loading(experts)
+    return loaded
+
+
 def _expected(checkpoint_format, fmt, ckpt, num_local, start, num_logical):
-    """Experts written shard by shard through the generic MegaMoE loader,
-    requantized with DeepGEMM's own casts."""
+    """Experts loaded in `fmt` through the generic MegaMoE loader, requantized
+    with DeepGEMM's own casts."""
     expected = _experts(DeepGemmMegaMoEExperts, fmt, num_local, start, num_logical)
-    shard_ids = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+    names = []
     for (e, proj), (weight, scale) in ckpt.items():
         if checkpoint_format != fmt.name:
             weight = weight.cuda()
@@ -124,13 +131,12 @@ def _expected(checkpoint_format, fmt, ckpt, num_local, start, num_logical):
                 x = cast_back(weight, sf, gran_k=32)
             weight, sf = CASTS[fmt.name](x, use_ue8m0=True, gran_k=32)
             scale = (sf.view(torch.int32) >> 23).to(torch.uint8)
-        prefix = "w2" if proj == "down_proj" else "w13"
-        for suffix, value in (("weight", weight), ("weight_scale", scale)):
-            if value is not None:
-                name = f"{prefix}_{suffix}"
-                expected.weight_loader(
-                    getattr(expected, name), value, name, shard_ids[proj], e
-                )
+        names += [
+            (f"{e}.{proj}.{suffix}", value)
+            for suffix, value in (("weight", weight), ("weight_scale", scale))
+            if value is not None
+        ]
+    _load(expected, names)
     return expected
 
 
@@ -212,7 +218,8 @@ def test_expert_formats_follow_checkpoint_and_quantization_config():
 def test_experts_load_checkpoint_into_kernel_layout(
     any_device_mega_moe, checkpoint_format, fmt
 ):
-    """Shards in any order, weight and scale apart, only owned experts kept."""
+    """Per-expert or stacked experts, only this rank's kept, requantized when
+    stored in another format."""
     fused = checkpoint_format == "fused_bf16"
     checkpoint_format = "bf16" if fused else checkpoint_format
     generator = torch.Generator().manual_seed(2)
@@ -224,39 +231,22 @@ def test_experts_load_checkpoint_into_kernel_layout(
             for e in range(4)
         ]
         down = [ckpt[e, "down_proj"][0] for e in range(4)]
+        # Renamed so by the model's mapping (`FUSED_EXPERTS`).
         names = [
-            ("gate_up_proj", torch.stack(gate_up)),
-            ("down_proj", torch.stack(down)),
+            ("routed_experts.w13_weight", torch.stack(gate_up)),
+            ("routed_experts.w2_weight", torch.stack(down)),
         ]
     else:
         names = _names(checkpoint_format, ckpt, generator)
     # EP rank 1 of 2 owns logical experts 2 and 3.
     experts = _experts(Qwen4ExpMegaMoEExperts, fmt, 2, 2, 4, checkpoint_format)
-    loaded = experts.load_weights(names)
+    loaded = _load(experts, names)
     assert loaded == {n for n, _ in experts.named_parameters()}
-    experts.quant_method.process_weights_after_loading(experts)
     _assert_same_experts(experts, _expected(checkpoint_format, fmt, ckpt, 2, 2, 4))
 
 
-def test_weight_and_scale_may_arrive_in_separate_calls(any_device_mega_moe):
-    """Chunked weight updates may split an expert's weight from its scale and
-    a rank's experts across calls; a pair still incomplete fails the load."""
-    generator = torch.Generator().manual_seed(3)
-    ckpt = _checkpoint("fp8_block", 2, generator)
-    names = _names("fp8_block", ckpt, generator)
-    experts = _experts(Qwen4ExpMegaMoEExperts, MEGA_MOE_MXFP8, 2, 0, 2, "fp8_block")
-    first = [n for n in names if n[0].startswith("0.") or n[0].endswith(".weight")]
-    experts.load_weights(first)
-    with pytest.raises(ValueError, match="without both weight and scale"):
-        experts.quant_method.process_weights_after_loading(experts)
-    experts.load_weights([n for n in names if n not in first])
-    experts.quant_method.process_weights_after_loading(experts)
-    _assert_same_experts(experts, _expected("fp8_block", MEGA_MOE_MXFP8, ckpt, 2, 0, 2))
-
-
 def test_layerwise_reload_replaces_routed_experts(any_device_mega_moe):
-    """reload_weights / weight transfer put the experts on meta and wrap their
-    loaders; the new experts must land in the original kernel tensors."""
+    """Reloaded experts, requantized, land in the original kernel tensors."""
     checkpoint_format, fmt = "fp8_block", MEGA_MOE_MXFP4
     generator = torch.Generator().manual_seed(5)
     old = _checkpoint(checkpoint_format, 2, generator)
@@ -264,12 +254,11 @@ def test_layerwise_reload_replaces_routed_experts(any_device_mega_moe):
     experts = _experts(Qwen4ExpMegaMoEExperts, fmt, 2, 0, 2, checkpoint_format)
     with torch.device("cuda"):
         record_metadata_for_reloading(experts)
-    experts.load_weights(_names(checkpoint_format, old, generator))
-    experts.quant_method.process_weights_after_loading(experts)
+    _load(experts, _names(checkpoint_format, old, generator))
     pointers = {n: p.data_ptr() for n, p in experts.named_parameters()}
 
     initialize_layerwise_reload(experts)
-    experts.load_weights(_names(checkpoint_format, new, generator))
+    load_with_ops(experts, _names(checkpoint_format, new, generator))
     finalize_layerwise_reload(experts, None)
 
     _assert_same_experts(experts, _expected(checkpoint_format, fmt, new, 2, 0, 2))

@@ -11,6 +11,7 @@ import threading
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
+import regex as re
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -49,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
+from vllm.model_executor.model_loader.weight_utils import tensor_shape
 from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
@@ -358,7 +360,6 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         **extra_weight_attrs,
     ) -> None:
         del input_size, output_size, params_dtype
-        weight_loader = extra_weight_attrs.get("weight_loader")
         weight = ModelWeightParameter(
             data=layer.allocate_embedding_weight(
                 sum(output_partition_sizes),
@@ -367,7 +368,6 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 
@@ -376,7 +376,6 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             output_partition_sizes,
             input_size_per_partition,
             None,
-            weight_loader,
             scale_dtype=torch.float32,
         )
         layer.register_parameter("weight_scale", weight_scale)
@@ -430,7 +429,6 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
                 "NVFP4 PLE embedding dimension must be divisible by "
                 f"{_NVFP4_BLOCK_SIZE}, got {input_size_per_partition}"
             )
-        weight_loader = extra_weight_attrs.get("weight_loader")
         num_rows = sum(output_partition_sizes)
         for name, width, dtype in (
             (
@@ -448,7 +446,6 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
                 data=layer.allocate_embedding_weight(num_rows, width, dtype),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
             )
             layer.register_parameter(name, parameter)
         weight_scale_2 = create_fp8_scale_parameter(
@@ -456,7 +453,6 @@ class Qwen4ExpPLENvFp4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             output_partition_sizes,
             input_size_per_partition,
             None,
-            weight_loader,
             scale_dtype=torch.float32,
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
@@ -873,6 +869,20 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._shared_group = group
         self._shared_ptrs: set[int] = set()
         super().__init__(*args, **kwargs)
+        # a shared table is written by the group's leader alone: the others drop its
+        # tensors (`conversion_mapping`) and wait for it after loading
+        self.leader_written: tuple[str, ...] = tuple(
+            name
+            for name, param in self.named_parameters(recurse=False)
+            if param.data_ptr() in self._shared_ptrs and group.rank_in_group != 0
+        )
+        for name in self.leader_written:
+            getattr(self, name).loaded_at_init = True
+
+    def process_weights_after_loading(self) -> None:
+        """Serve only once the group's leader has written the shared tables"""
+        if self._shared_ptrs:
+            torch.distributed.barrier(group=self._shared_group.cpu_group)
 
     def allocate_embedding_weight(
         self,
@@ -895,17 +905,84 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._shared_ptrs.add(weight.data_ptr())
         return weight
 
-    def weight_loader(
-        self,
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        checkpoint_start: int | None = None,
-    ) -> None:
-        if param.data_ptr() not in self._shared_ptrs:
-            super().weight_loader(param, loaded_weight, checkpoint_start)
-            return
-        if self._shared_group.rank_in_group == 0:
-            super().weight_loader(param, loaded_weight, checkpoint_start)
-        # Read order may differ across ranks. Equal load counts ensure all shared
-        # tables are ready after the last weight-loader call returns.
-        torch.distributed.barrier(group=self._shared_group.cpu_group)
+
+class PLEShardedTable:
+    """A PLE table stored in row shards, read as one tensor: indexing its rows (as
+    the loader shards it on read) reads only the overlapping rows of each shard"""
+
+    def __init__(self, shards: list):
+        self.shards = shards  # tensors or lazy slices, in row order
+
+    def get_shape(self) -> list[int]:
+        shape = tensor_shape(self.shards[0])
+        return [sum(tensor_shape(s)[0] for s in self.shards), *shape[1:]]
+
+    def get_dtype(self):
+        first = self.shards[0]
+        return first.dtype if isinstance(first, torch.Tensor) else first.get_dtype()
+
+    def __getitem__(self, index) -> torch.Tensor:
+        index = index if isinstance(index, tuple) else (index,)
+        rows, rest = slice(None), index
+        if index and isinstance(index[0], slice):
+            rows, rest = index[0], index[1:]
+        start, stop, _ = rows.indices(self.get_shape()[0])
+        pieces, offset = [], 0
+        for shard in self.shards:
+            count = tensor_shape(shard)[0]
+            lo, hi = max(start - offset, 0), min(stop - offset, count)
+            if lo < hi:
+                pieces.append(shard[lo:hi])
+            offset += count
+        table = torch.cat(pieces) if pieces else self.shards[0][0:0]
+        return table[(slice(None), *rest)] if rest and rest != (Ellipsis,) else table
+
+
+_PLE_SHARD = re.compile(r"^(.*\.ngram_embedding)\.shard_(\d+)\.(\w+)$")
+
+
+def _from_layers(name: str) -> str:
+    """`name` from its `layers.`: the same in the checkpoint and in vLLM"""
+    return name[max(name.find("layers."), 0) :]
+
+
+def ple_table_shards(model: nn.Module, weights):
+    """Checkpoint stream (`checkpoint_transforms`): the n-gram tables stored as
+    `ngram_embedding.shard_<i>.<plane>` (`split_ngram_parts` row shards) as one
+    `ngram_embedding.<plane>`, each rank reading its rows; a disk-offloaded table
+    keeps the shards' file views instead (`accept_checkpoint_shard`)"""
+    tables = {
+        _from_layers(name): module
+        for name, module in model.named_modules()
+        if hasattr(module, "split_ngram_parts")
+    }
+    pending: dict[tuple[str, str], dict[int, object]] = {}
+    parts = 0
+    for name, weight in weights:
+        if not tables or (match := _PLE_SHARD.match(name)) is None:
+            yield name, weight
+            continue
+        head, index, plane = match[1], int(match[2]), match[3]
+        module = tables.get(_from_layers(head).rpartition(".")[0])
+        parts = (module or next(iter(tables.values()))).split_ngram_parts
+        if index >= parts:
+            raise ValueError(
+                f"PLE embedding shard {index} exceeds split_ngram_parts={parts}"
+            )
+        embedding = getattr(module, "ngram_embedding", None)
+        if hasattr(embedding, "accept_checkpoint_shard"):  # disk offload
+            shard_size = -(-embedding.org_vocab_size // parts)
+            tensor = weight if isinstance(weight, torch.Tensor) else weight[...]
+            embedding.accept_checkpoint_shard(index, tensor, shard_size, plane)
+            continue
+        shards = pending.setdefault((head, plane), {})
+        shards[index] = weight
+        if len(shards) == parts:
+            del pending[(head, plane)]
+            table = PLEShardedTable([shards[i] for i in range(parts)])
+            yield f"{head}.{plane}", table
+    if pending:
+        raise ValueError(
+            "PLE embedding shards missing: "
+            f"{[(f'{h}.{p}', parts - len(s)) for (h, p), s in pending.items()]}"
+        )

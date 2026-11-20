@@ -33,9 +33,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    sharded_weight_loader,
-)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
@@ -133,16 +130,11 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        delattr(self.conv1d.weight, "weight_loader")
+        # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+        self.conv1d.shard_ids = (0, 1, 2)
         set_weight_attrs(
             self.conv1d.weight,
-            {
-                "weight_loader": _make_fused_conv1d_weight_loader(
-                    [self.key_dim, self.key_dim, self.value_dim],
-                    self.tp_size,
-                    self.tp_rank,
-                )
-            },
+            {"shard_dim": 0},
         )
 
         self.dt_bias = nn.Parameter(
@@ -154,8 +146,8 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         # use eps=1e-5 to match FLA's FusedRMSNormGated
         self.o_norm = RMSNormGated(
@@ -514,27 +506,6 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-
-
-def _make_fused_conv1d_weight_loader(dims, tp_size, tp_rank):
-    """Weight loader for loading separate HF conv weights into a fused conv1d.
-
-    dims: list of original (un-sharded) dims per section,
-          e.g. [key_dim, key_dim, value_dim]
-    """
-    sharded_dims = [d // tp_size for d in dims]
-
-    def weight_loader(param, loaded_weight, loaded_shard_id=None):
-        if loaded_weight.dim() == 2:
-            loaded_weight = loaded_weight.unsqueeze(1)
-        dim = dims[loaded_shard_id]
-        shard_size = dim // tp_size
-        tp_start = tp_rank * shard_size
-        sharded_weight = loaded_weight[tp_start : tp_start + shard_size]
-        offset = sum(sharded_dims[:loaded_shard_id])
-        param.data[offset : offset + shard_size].copy_(sharded_weight)
-
-    return weight_loader
 
 
 @eager_break_during_capture

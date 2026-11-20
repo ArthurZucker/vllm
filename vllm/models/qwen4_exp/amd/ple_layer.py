@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 
 import torch
 from torch import nn
@@ -23,7 +23,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
@@ -347,70 +346,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return output
         return self._sp_shard_embeddings(output)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load hash buffers and checkpoint-split embedding rows."""
-        persistent_buffers = {
-            "layer_multipliers": self.layer_multipliers,
-            "ngram_heads_offsets": self.ngram_heads_offsets,
-            "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
-        }
-        loaded: set[str] = set()
-        regular_weights: list[tuple[str, torch.Tensor]] = []
-        shard_prefix = "ngram_embedding.shard_"
-
-        for name, loaded_weight in weights:
-            leaf_name = name.rsplit(".", 1)[-1]
-            if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
-                continue
-            if name in persistent_buffers:
-                buffer = persistent_buffers[name]
-                if buffer.shape != loaded_weight.shape:
-                    raise ValueError(
-                        f"Shape mismatch for {name}: expected "
-                        f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
-                    )
-                buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
-                loaded.add(name)
-                continue
-            if name.startswith(shard_prefix) and name.endswith(".weight"):
-                shard_text = name[len(shard_prefix) : -len(".weight")]
-                if not shard_text.isdigit():
-                    regular_weights.append((name, loaded_weight))
-                    continue
-                shard_index = int(shard_text)
-                if shard_index >= self.split_ngram_parts:
-                    raise ValueError(
-                        f"PLE embedding shard index {shard_index} exceeds "
-                        f"split_ngram_parts={self.split_ngram_parts}"
-                    )
-                embedding = self.ngram_embedding
-                shard_size = (
-                    embedding.org_vocab_size + self.split_ngram_parts - 1
-                ) // self.split_ngram_parts
-                checkpoint_start = shard_index * shard_size
-                expected_rows = max(
-                    0,
-                    min(shard_size, embedding.org_vocab_size - checkpoint_start),
-                )
-                expected_shape = (expected_rows, embedding.embedding_dim)
-                if tuple(loaded_weight.shape) != expected_shape:
-                    raise ValueError(
-                        f"Shape mismatch for PLE embedding shard {shard_index}: "
-                        f"expected {expected_shape}, got "
-                        f"{tuple(loaded_weight.shape)}"
-                    )
-                embedding.weight.weight_loader(
-                    embedding.weight,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                )
-                loaded.add("ngram_embedding.weight")
-                continue
-            regular_weights.append((name, loaded_weight))
-
-        if regular_weights:
-            loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
-        return loaded
 
 
 class Qwen4ExpPLELayer(nn.Module, MambaBase):

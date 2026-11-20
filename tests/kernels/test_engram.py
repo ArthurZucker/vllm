@@ -12,6 +12,7 @@ from vllm.distributed import parallel_state
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.models.deepseek_v41.amd import engram as rocm_engram_ops
 from vllm.models.deepseek_v41.amd.engram import RocmEngram
 from vllm.models.deepseek_v41.common import engram as engram_ops
@@ -298,8 +299,7 @@ def test_sharded_engram_loads_and_matches_tp1(tp_size, quantized, monkeypatch):
         params = dict(engram.wkv.named_parameters())
         if checkpoint is None:
             checkpoint = {name: _checkpoint_tensor(p) for name, p in params.items()}
-        for name, param in params.items():
-            param.weight_loader(param, checkpoint[name].cuda())
+        load_with_ops(engram.wkv, iter((n, t.cuda()) for n, t in checkpoint.items()))
         engram.wkv.quant_method.process_weights_after_loading(engram.wkv)
         engram.q_weight.data.copy_(q_weight)
         engram.k_weight.data.copy_(k_weight)
@@ -826,9 +826,12 @@ def test_engram_head_shards_reconstruct_checkpoint(
             layer = ParallelEngramEmbedding(
                 num_rows + 7, dim, head_sizes, cpu_offload=cpu_offload
             )
-        layer.weight.weight_loader(layer.weight, weight)
-        layer.weight_scale_inv.weight_loader(
-            layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu)
+        load_with_ops(
+            layer,
+            [
+                ("weight", weight),
+                ("weight_scale_inv", scales.view(torch.float8_e8m0fnu)),
+            ],
         )
         out = torch.empty(
             len(ids),

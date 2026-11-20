@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Callable
 from fractions import Fraction
 
 import torch
@@ -119,7 +118,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -170,7 +168,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         weight = PackedvLLMParameter(
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
             packed_factor=self.pack_factor,
             packed_dim=1,
             data=torch.empty(
@@ -181,7 +178,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         )
 
         weight_scale_args = {
-            "weight_loader": weight_loader,
             "data": torch.empty(
                 output_size_per_partition,
                 scales_and_zp_size,
@@ -191,7 +187,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
         packed_output_dim = math.ceil(output_size_per_partition * self.num_bits / 32)
         zeros_args = {
-            "weight_loader": weight_loader,
             "data": torch.zeros(
                 packed_output_dim,
                 scales_and_zp_size,
@@ -224,9 +219,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
         # A 2D array defining the original shape of the weights
         # before packing
-        weight_shape = BasevLLMParameter(
-            data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
-        )
+        weight_shape = BasevLLMParameter(data=torch.empty(2, dtype=torch.int64))
 
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("weight_scale", weight_scale)

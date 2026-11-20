@@ -106,7 +106,6 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        weight_loader = extra_weight_attrs.get("weight_loader")
         del input_size, output_size
         output_size_per_partition = sum(output_partition_sizes)
 
@@ -125,7 +124,6 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 
@@ -133,7 +131,6 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         weight_scale = ChannelQuantScaleParameter(
             data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
             output_dim=0,
-            weight_loader=weight_loader,
         )
         weight_scale[:] = torch.finfo(torch.float32).min
         layer.register_parameter("weight_scale", weight_scale)

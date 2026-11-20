@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
-from collections.abc import Iterable
-
 import torch
 from torch import nn
 from transformers import Qwen3_5MoeTextConfig, Qwen3_5TextConfig
@@ -34,25 +32,21 @@ from vllm.model_executor.models.qwen3_next import (
     QwenNextMixtureOfExperts,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     _merge_multimodal_embeddings,
     get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
-    maybe_fuse_shared_experts,
     maybe_prefix,
     sequence_parallel_chunk,
 )
 from vllm.sequence import IntermediateTensors
 
-from .model import Qwen3_5DecoderLayer, Qwen3_5Model, Qwen3_5RMSNorm
+from .model import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
 
 logger = init_logger(__name__)
 
 
 class Qwen3_5MultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -188,17 +182,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = hidden_states[: positions.shape[-1]]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_fuse_shared_experts(
-            weights,
-            fused_shared_expert_layers=self.fused_shared_expert_layers,
-            n_routed_experts=getattr(self.config, "num_experts", 0),
-            n_shared_experts=1,
-            ckpt_prefix="mlp.shared_expert",
-        )
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
@@ -303,20 +286,6 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         return not name.startswith("mtp.") and not any(
             key in name for key in ["embed_tokens", "lm_head"]
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def remap_weight_names(weights):
-            for name, weight in weights:
-                if self.is_unused_checkpoint_weight(name):
-                    continue
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif "embed_tokens" in name:
-                    name = name.replace("language_model.", "")
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

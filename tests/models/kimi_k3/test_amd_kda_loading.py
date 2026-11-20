@@ -26,6 +26,8 @@ def test_padded_kda_load_completes_and_clears_padding(
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
+    from vllm.model_executor.model_loader.conversion_mapping import fused
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
     from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 
     default_vllm_config.model_config = ModelConfig(
@@ -53,13 +55,18 @@ def test_padded_kda_load_completes_and_clears_padding(
         )
         if not online:
             layer.weight.fill_(float("nan"))
-        param = layer.weight
+        model = torch.nn.Module()
+        model.probe = torch.nn.Module()
+        model.probe.in_proj_qkvgfab = layer
         shards = [
             torch.full((n, 256), (i + 1) / 16, dtype=torch.bfloat16)
             for i, n in enumerate(rows)
         ]
-        for i in reversed(range(6)) if reverse else range(6):
-            param.weight_loader(param, shards[i], i)
+        order = reversed(range(6)) if reverse else range(6)
+        weights = [(f"probe.shard_{i}.weight", shards[i]) for i in order]
+        sources = [f"probe.shard_{i}." for i in range(6)]
+        conversions = [fused("probe.in_proj_qkvgfab.", *sources)]
+        load_with_ops(model, iter(weights), conversions)
         if online:
             assert layer.weight.device.type == "cuda"
             assert not get_layerwise_info(layer).loaded_weights
@@ -68,4 +75,3 @@ def test_padded_kda_load_completes_and_clears_padding(
                 shards + [torch.zeros(padding, 256, dtype=torch.bfloat16)]
             )
             torch.testing.assert_close(layer.weight, expected, atol=0, rtol=0)
-        assert layer.pop_missing_shards() == []

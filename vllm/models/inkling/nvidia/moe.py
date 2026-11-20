@@ -215,7 +215,8 @@ class InklingGate(nn.Module):
         self.weight = Parameter(
             torch.empty(padded_experts, d_model), requires_grad=False
         )
-        set_weight_attrs(self.weight, {"weight_loader": self._load_weight})
+        # the checkpoint's rows, the padding zeros (`PadToParam`)
+        set_weight_attrs(self.weight, {"pad_value": 0})
         if use_global_scale:
             self.global_scale = Parameter(
                 torch.empty(1, dtype=torch.float32), requires_grad=False
@@ -229,11 +230,6 @@ class InklingGate(nn.Module):
             )
         else:
             self.bias = None
-
-    @staticmethod
-    def _load_weight(param: Parameter, loaded_weight: torch.Tensor) -> None:
-        param.data.zero_()
-        param.data[: loaded_weight.shape[0]].copy_(loaded_weight)
 
     def compute_logits(self, x: torch.Tensor) -> torch.Tensor:
         """fp32 gate logits [T, n_total_experts + pad] (pad columns are junk)."""
@@ -386,15 +382,20 @@ class InklingSinkExpertsLinear(nn.Module):
         return gammas[:, self._col_expert]
 
     def load_weight(self, key: str, weight: torch.Tensor) -> list[str]:
+        """Load one checkpoint sink tensor (stacked over the S experts): this
+        rank's rows of the gate and up halves (columns of w2), as the merged
+        column / row parallel linears shard them"""
         if key == "w13_weight":
             d_model = weight.shape[-1]
-            gate = weight[:, 0::2, :].reshape(-1, d_model).contiguous()
-            up = weight[:, 1::2, :].reshape(-1, d_model).contiguous()
-            self.w13.weight_loader(self.w13.weight, gate, 0)
-            self.w13.weight_loader(self.w13.weight, up, 1)
+            param, rank = self.w13.weight.data, self.w13.tp_rank
+            local = param.shape[0] // 2
+            for half, rows in enumerate((weight[:, 0::2, :], weight[:, 1::2, :])):
+                rows = rows.reshape(-1, d_model).narrow(0, rank * local, local)
+                param[half * local : (half + 1) * local].copy_(rows)
             return ["w13.weight"]
-        w = weight.permute(1, 0, 2).reshape(weight.shape[1], -1).contiguous()
-        self.w2.weight_loader(self.w2.weight, w)
+        w = weight.permute(1, 0, 2).reshape(weight.shape[1], -1)
+        local = self.w2.weight.shape[1]
+        self.w2.weight.data.copy_(w.narrow(1, self.w2.tp_rank * local, local))
         return ["w2.weight"]
 
     def forward(self, x: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:

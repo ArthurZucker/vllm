@@ -17,8 +17,8 @@ class MistralRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 
     LeRoPE multiplies the extrapolated and interpolated inverse frequencies by
     `exp(alpha)`, where `alpha` is a checkpoint parameter shared by all
-    layers. The YaRN ramp keeps using the unscaled frequencies. The cos/sin
-    cache is rebuilt by `set_lerope_alpha` once the weights are loaded.
+    layers (the `lerope.alpha` param). The YaRN ramp keeps using the unscaled
+    frequencies. The cos/sin cache is rebuilt once the weights are loaded.
     """
 
     def __init__(self, config: PreTrainedConfig, rotary_dim: int) -> None:
@@ -46,6 +46,10 @@ class MistralRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         )
         # `apply_scale: false` checkpoints must not rescale cos/sin.
         assert not is_yarn or self.mscale == 1.0
+        if getattr(config, "lerope", False):
+            self.lerope_alpha = torch.nn.Parameter(
+                torch.zeros(rotary_dim // 2, dtype=torch.float32), requires_grad=False
+            )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
@@ -74,8 +78,7 @@ class MistralRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         )
 
     @torch.no_grad()
-    def set_lerope_alpha(self, lerope_alpha: torch.Tensor) -> None:
-        assert lerope_alpha.shape == (self.rotary_dim // 2,)
-        self.lerope_alpha = lerope_alpha.detach().float()
-        cache = self._compute_cos_sin_cache()
-        self.cos_sin_cache.copy_(cache.to(self.cos_sin_cache.dtype))
+    def process_weights_after_loading(self) -> None:
+        if self.lerope_alpha is not None:  # loaded: the cache with it
+            cache = self._compute_cos_sin_cache()
+            self.cos_sin_cache.copy_(cache.to(self.cos_sin_cache.dtype))

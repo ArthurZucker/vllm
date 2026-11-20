@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -67,9 +67,7 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -97,12 +95,12 @@ def _zero_mean_tensor(t: torch.Tensor) -> torch.Tensor:
 
 def _normalized_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterator[tuple[str, torch.Tensor]]:
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The stream, the router's per-expert score bias zero-meaned"""
     for name, w in weights:
         if _is_gate_expert_bias_name(name):
-            yield name, _zero_mean_tensor(w)
-        else:
-            yield name, w
+            w = _zero_mean_tensor(w if isinstance(w, torch.Tensor) else w[...])
+        yield name, w
 
 
 class SarvamMLAAttention(nn.Module):
@@ -462,16 +460,6 @@ class SarvamMLAModel(nn.Module, EagleModelMixin):
 
     supports_aux_hidden_states_over_pp = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         *,
@@ -586,15 +574,6 @@ class SarvamMLAModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _normalized_weights(weights), mapper=self.hf_to_vllm_mapper
-        )
-
 
 class SarvamMixtureOfExperts(MixtureOfExperts):
     moe_layers: list[MoERunner]
@@ -672,6 +651,7 @@ class SarvamMLAForCausalLM(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.checkpoint_transforms = [_normalized_weights]
 
         self.tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         if get_pp_group().is_last_rank:
@@ -736,16 +716,10 @@ class SarvamMLAForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
-
 
 class SarvamMoEForCausalLM(BailingMoeForCausalLM):
     """Same as BailingMoeForCausalLM, but normalizes gate expert_bias pre-load."""
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_normalized_weights(weights))
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.checkpoint_transforms = [_normalized_weights, self._normalize_lm_head]

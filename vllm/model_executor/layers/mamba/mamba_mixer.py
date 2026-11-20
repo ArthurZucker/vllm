@@ -6,12 +6,10 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.parameter import Parameter
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -34,6 +32,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_scan_fn
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
+from vllm.model_executor.model_loader.weight_ops import NegExp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -96,9 +95,6 @@ class MambaMixer(MambaBase, PluggableLayer):
             prefix=f"{prefix}.conv1d",
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
-        # Can't do this in `weight_loader` since it already exists in
-        # `ColumnParallelLinear` and `set_weight_attrs`
-        # doesn't allow to override it
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         self.in_proj = MergedColumnParallelLinear(
@@ -126,18 +122,6 @@ class MambaMixer(MambaBase, PluggableLayer):
             prefix=f"{prefix}.dt_proj",
         )
 
-        def weight_loader(param: Parameter, loaded_weight: torch.Tensor):
-            tp_rank = get_tensor_model_parallel_rank()
-            tp_size = get_tensor_model_parallel_world_size()
-            param.data.copy_(
-                loaded_weight.data.split(loaded_weight.shape[0] // tp_size, dim=0)[
-                    tp_rank
-                ]
-            )
-
-        def A_weight_loader(param: Parameter, loaded_weight: torch.Tensor):
-            weight_loader(param, -torch.exp(loaded_weight.float()))
-
         tp_size = get_tensor_model_parallel_world_size()
         self.A = nn.Parameter(
             torch.empty(
@@ -148,8 +132,8 @@ class MambaMixer(MambaBase, PluggableLayer):
         )
         self.D = nn.Parameter(torch.ones(intermediate_size // tp_size))
 
-        set_weight_attrs(self.D, {"weight_loader": weight_loader})
-        set_weight_attrs(self.A, {"weight_loader": A_weight_loader})
+        set_weight_attrs(self.D, {"shard_dim": 0})
+        set_weight_attrs(self.A, {"shard_dim": 0, "load_ops": [NegExp()]})
 
         self.out_proj = RowParallelLinear(
             intermediate_size,

@@ -15,7 +15,6 @@ subclasses the platform's sparse MLA backend to forward `attn_sink`.
 
 from typing import cast
 
-import regex as re
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PreTrainedConfig
@@ -60,7 +59,6 @@ _SPARSE_LAYER_TYPES = (
     # TODO: Delete below once Transformers 5.18.0 is the minimum required version.
     "deepseek_sparse_attention",
 )
-_WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
 def sparse_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -69,24 +67,6 @@ def sparse_layer_ids(config: PreTrainedConfig) -> set[int]:
         return set()
     layer_types = getattr(config, "layer_types", None) or ()
     return {i for i, t in enumerate(layer_types) if t in _SPARSE_LAYER_TYPES}
-
-
-def is_skip_topk_indexer_weight(weight_name: str, skip_topk_layers: set[int]) -> bool:
-    """Return whether an indexer weight belongs to a top-k sharing layer.
-
-    Args:
-        weight_name: Checkpoint weight name.
-        skip_topk_layers: Result of `compute_skip_topk_layers`.
-
-    Returns:
-        True when the weight is an indexer weight of a layer that has no
-        indexer module and therefore must be dropped.
-
-    """
-    if ".indexer." not in weight_name or not skip_topk_layers:
-        return False
-    match = _WEIGHT_LAYER_INDEX_RE.search(weight_name)
-    return match is not None and int(match.group(1)) in skip_topk_layers
 
 
 class Indexer(nn.Module):
@@ -316,8 +296,7 @@ class HYV4MLAAttention(nn.Module):
         if self.q_lora_rank is not None:
             # ``q_a_proj`` and ``kv_a_proj_with_mqa`` read the same
             # ``hidden_states`` and are both TP-replicated, so they run as one
-            # GEMM. The checkpoint keeps them separate; `load_weights` merges
-            # them through ``stacked_params_mapping``.
+            # GEMM. The checkpoint keeps them separate; loading merges them.
             self.fused_qkv_a_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],

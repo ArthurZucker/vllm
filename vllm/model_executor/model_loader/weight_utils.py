@@ -37,8 +37,6 @@ from vllm.config.load import (
     LoadConfig,
 )
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_world_group,
     in_single_pp_stage,
 )
@@ -1085,6 +1083,30 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def tensor_shape(source) -> list[int]:
+    """Shape of a tensor or of a lazy slice (`LazySlice`)"""
+    return (
+        list(source.shape) if isinstance(source, torch.Tensor) else source.get_shape()
+    )
+
+
+class LazySlice:
+    """A checkpoint tensor read on demand: only the slice indexed, e.g. this rank's
+    shard (`ops_loader`). Like safetensors' own slice, it keeps its file open."""
+
+    def __init__(self, handle, name: str):
+        self.handle, self.name = handle, name
+
+    def get_shape(self) -> list[int]:
+        return self.handle.get_slice(self.name).get_shape()
+
+    def get_dtype(self) -> str:
+        return self.handle.get_slice(self.name).get_dtype()
+
+    def __getitem__(self, index) -> torch.Tensor:
+        return self.handle.get_slice(self.name)[index]
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1217,6 +1239,11 @@ def safetensors_weights_iterator(
                     unflatten_tensor_state_dict(state_dict, metadata)
                 )
             yield from unflattened_state_dict.items()
+        elif safetensors_load_strategy == "slices":
+            handle = safe_open(st_file, framework="pt")  # kept open by its slices
+            for name in handle.keys():  # noqa: SIM118
+                if not should_skip_weight(name, local_expert_ids):
+                    yield name, LazySlice(handle, name)
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
@@ -1576,38 +1603,7 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         raise
 
 
-def row_parallel_weight_loader(
-    param: torch.Tensor, loaded_weight: torch.Tensor
-) -> None:
-    """Load weights that are row-parallelized."""
-    tp_rank = get_tensor_model_parallel_rank()
-    shard_dim = 0 if param.dim() != 1 else None
-
-    if shard_dim is not None:
-        shard_size = param.data.shape[shard_dim]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
-
-    return default_weight_loader(param, loaded_weight)
-
-
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
-
-
-def load_attention_sink(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-    """Load this rank's heads of a global sink; padded heads are set to -inf."""
-    tp_size = get_tensor_model_parallel_world_size()
-    heads = loaded_weight.numel()
-    if heads % tp_size:
-        raise ValueError(
-            f"Attention sink heads ({heads}) must be divisible by tp_size ({tp_size})"
-        )
-    local_heads = heads // tp_size
-    start = get_tensor_model_parallel_rank() * local_heads
-    default_weight_loader(
-        param[:local_heads], loaded_weight.narrow(0, start, local_heads)
-    )
-    param.data[local_heads:].fill_(-float("inf"))
 
 
 def make_attention_sink(
@@ -1617,23 +1613,9 @@ def make_attention_sink(
     sink = torch.nn.Parameter(
         torch.full((num_heads,), -float("inf"), dtype=dtype), requires_grad=False
     )
-    sink.weight_loader = load_attention_sink
+    # this rank's heads of the global sink, padded heads -inf (see `ops_loader`)
+    sink.shard_dim, sink.shard_even, sink.pad_value = 0, True, -float("inf")
     return sink
-
-
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-
-        shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-
-        return default_weight_loader(param, loaded_weight)
-
-    return loader
 
 
 def composed_weight_loader(
@@ -1986,3 +1968,17 @@ def remap_moe_expert_weights(
     for name, weight in weights:
         remapped_name = maybe_remap_moe_expert_param_name(name, params_dict)
         yield (remapped_name, weight)
+
+
+def checkpoint_shapes(pattern: str) -> dict[str, list[int]]:
+    """The shapes of the model being loaded's checkpoint tensors matching `pattern`,
+    from the safetensors headers: for a layer the config does not size (a pooling
+    projection), built before loading"""
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+    if (config := get_current_vllm_config_or_none()) is None:
+        return {}
+    model = config.model_config
+    metadata = get_safetensors_params_metadata(model.model, revision=model.revision)
+    return {k: v["shape"] for k, v in metadata.items() if re.search(pattern, k)}

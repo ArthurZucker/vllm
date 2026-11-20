@@ -30,7 +30,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
 )
-from vllm.model_executor.layers.quantization.online.loading import quantize_on_load
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
@@ -68,7 +68,7 @@ def test_output_padding_reload_keeps_unpadded_parameters_and_addresses(dist_init
         assert not param.any()
     weight = torch.full((8, 4), 2.0)
     bias = torch.full((8,), 3.0)
-    set(model["padded"].load_weights([("weight", weight), ("bias", bias)]))
+    load_weights(model["padded"], iter([("weight", weight), ("bias", bias)]))
     torch.testing.assert_close(model["padded"].weight[:8], weight, rtol=0, atol=0)
     torch.testing.assert_close(model["padded"].bias[:8], bias, rtol=0, atol=0)
     assert not model["padded"].weight[8:].any()
@@ -87,6 +87,17 @@ def test_output_padding_flagged_for_reload_fill(dist_init, bias):
     }
     assert flagged == ({"weight", "bias"} if bias else {"weight"})
     assert not any(hasattr(p, "fill_on_reload") for p in plain.parameters())
+
+
+def _quantize_on_load(layer, quantize):
+    """An online-quantized layer: its weight loader quantizes what it receives"""
+
+    def loader(param, weight):
+        values, scale = quantize(weight.to(layer.params_dtype).contiguous())
+        param.data.copy_(values)
+        layer.weight_scale.data.copy_(scale)
+
+    layer.weight.weight_loader = loader
 
 
 class _Method(QuantizeMethodBase):
@@ -190,7 +201,7 @@ class _ToyModel(torch.nn.Module):
                 parent.register_parameter("weight_scale", scale)
             param = torch.nn.Parameter(torch.empty(shape, dtype=dtype), False)
             parent.register_parameter(local, param)
-        quantize_on_load(self.online, "weight", _quantize_int8, "weight_scale")
+        _quantize_on_load(self.online, _quantize_int8)
 
     def load_weights(self, weights):
         params = dict(self.named_parameters())

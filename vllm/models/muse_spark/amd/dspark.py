@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dense Muse Spark DSpark draft model for AMD ROCm GPUs."""
 
-from collections.abc import Iterable
 from copy import copy
 
 import torch
@@ -24,8 +23,6 @@ from vllm.model_executor.models.qwen3_dspark import (
     Qwen3DSparkForCausalLM,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -293,17 +290,6 @@ class MuseSparkDSparkForCausalLM(Qwen3DSparkForCausalLM):
 
     has_own_lm_head = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj.": (".self_attn.qkv_proj.", "q"),
-            ".self_attn.k_proj.": (".self_attn.qkv_proj.", "k"),
-            ".self_attn.v_proj.": (".self_attn.qkv_proj.", "v"),
-            ".self_attn.o_gate_proj.": (".self_attn.qkv_proj.", "o_gate"),
-            ".feed_forward.gate_proj.": (".feed_forward.gate_up_proj.", 0),
-            ".feed_forward.up_proj.": (".feed_forward.gate_up_proj.", 1),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
         assert vllm_config.speculative_config is not None
@@ -381,27 +367,6 @@ class MuseSparkDSparkForCausalLM(Qwen3DSparkForCausalLM):
         # Target residuals are FP32; the training collator casts features before FC.
         return super().combine_hidden_states(
             hidden_states.to(self.model.fc.weight.dtype)
-        )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        model_weights = {}
-        for name, loaded_weight in weights:
-            if name == "t2d":
-                continue
-            if name == "d2t":
-                name = "draft_id_to_target_id"
-            elif "lm_head" not in name:
-                name = "model." + name
-            model_weights[name] = loaded_weight
-        mapper = WeightsMapper(
-            orig_to_new_substr={
-                "model.embed_tokens": None,
-                "model.mask_embedding": None,
-            },
-            orig_to_new_stacked=self.hf_to_vllm_mapper.orig_to_new_stacked,
-        )
-        return AutoWeightsLoader(self).load_weights(
-            model_weights.items(), mapper=mapper
         )
 
     def process_weights_after_loading(self) -> None:

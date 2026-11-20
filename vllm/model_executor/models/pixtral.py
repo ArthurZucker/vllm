@@ -3,12 +3,11 @@
 
 import importlib.metadata
 import math
-from collections.abc import Hashable, Iterable, Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Annotated, Any, ClassVar, Literal, TypedDict, cast
 
 import numpy as np
-import regex as re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,8 +41,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargsItems
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -94,7 +91,7 @@ from .interfaces import (
     supports_eagle3,
 )
 from .module_mapping import MultiModelKeys
-from .utils import StageMissingLayer, init_vllm_registered_model, maybe_prefix
+from .utils import init_vllm_registered_model, maybe_prefix
 from .vision import (
     VisionEncoderInfo,
     VisionFeatureSelectStrategy,
@@ -211,10 +208,6 @@ def _merge_patches_by_index(
     # (N, D) -> (N / m^2, D * m^2), channel-major like F.unfold.
     merged = features[merge_indices]
     return merged.transpose(1, 2).reshape(merge_indices.shape[0], -1)
-
-
-def _is_layer_none_or_staged(layer: nn.Module) -> bool:
-    return layer is None or isinstance(layer, StageMissingLayer)
 
 
 class PixtralImagePixelInputs(TensorSchema):
@@ -604,41 +597,6 @@ class PixtralForConditionalGeneration(
     SupportsPP,
     PixtralEncoderCudaGraphMixin,
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_regex={
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wq(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.q_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wk(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.k_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wv(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.v_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.attention\.wo(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.attention.o_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.feed_forward\.w1(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.feed_forward.gate_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.feed_forward\.w2(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.feed_forward.down_proj",
-            re.compile(
-                r"^vision_encoder\.transformer\.layers\.(\d+)\.feed_forward\.w3(?=\.|$)"
-            ): r"vision_encoder.transformer.layers.\1.feed_forward.up_proj",
-        },
-        orig_to_new_prefix={
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_encoder.",
-            "model.multi_modal_projector.": "vision_language_adapter.",
-        },
-        orig_to_new_substr={
-            ".linear_1.": ".w_in.",
-            ".linear_2.": ".w_out.",
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -817,126 +775,6 @@ class PixtralForConditionalGeneration(
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         self._require_language_model_eagle3()
         return self.language_model.get_eagle3_aux_hidden_state_layers()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        _vision_encoder_stacked_params = [
-            # (param_name, shard_name, shard_id)
-            # HF format
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-            # Mistral native (consolidated) format
-            (".qkv_proj", ".wq", "q"),
-            (".qkv_proj", ".wk", "k"),
-            (".qkv_proj", ".wv", "v"),
-            (".gate_up_proj", ".w1", 0),
-            (".gate_up_proj", ".w3", 1),
-        ]
-
-        # Remap Mistral native names to HF-style names
-        # used by the vLLM vision encoder modules.
-        _vision_encoder_name_remap = {
-            ".wo.": ".o_proj.",
-            ".w2.": ".down_proj.",
-        }
-
-        def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith(("vision_encoder", "vision_tower"))
-
-        def is_vision_lang_adapter_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith(
-                ("vision_language_adapter", "multi_modal_projector")
-            )
-
-        def is_patch_merger(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("patch_merger")
-
-        def is_pre_mm_projector_norm(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("pre_mm_projector_norm")
-
-        vision_encoder_dict = (
-            dict(self.vision_encoder.named_parameters())
-            if self.vision_encoder is not None
-            else {}
-        )
-        patch_merger_dict = (
-            dict(self.patch_merger.named_parameters())
-            if self.patch_merger is not None
-            else {}
-        )
-        pre_mm_projector_norm_dict = (
-            dict(self.pre_mm_projector_norm.named_parameters())
-            if self.pre_mm_projector_norm is not None
-            else {}
-        )
-        vision_lang_adapter_dict = (
-            dict(self.vision_language_adapter.named_parameters())
-            if self.vision_language_adapter is not None
-            else {}
-        )
-
-        def llm_weights_generator():
-            for name, w in weights:
-                if is_vision_encoder_weights((name, w)):
-                    if _is_layer_none_or_staged(self.vision_encoder):
-                        continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    for (
-                        param_name,
-                        weight_name,
-                        shard_id,
-                    ) in _vision_encoder_stacked_params:
-                        if weight_name in trimmed_name:
-                            trimmed_name = trimmed_name.replace(weight_name, param_name)
-                            param = vision_encoder_dict[trimmed_name]
-                            weight_loader = param.weight_loader
-                            weight_loader(param, w, shard_id)
-                            break
-                    else:
-                        for old, new in _vision_encoder_name_remap.items():
-                            if old in trimmed_name:
-                                trimmed_name = trimmed_name.replace(old, new)
-                                break
-
-                        param = vision_encoder_dict.get(trimmed_name)
-                        if param is not None:
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            weight_loader(param, w)
-                elif is_patch_merger((name, w)):
-                    if _is_layer_none_or_staged(self.patch_merger):
-                        continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    param = patch_merger_dict[trimmed_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, w)
-                elif is_pre_mm_projector_norm((name, w)):
-                    if _is_layer_none_or_staged(self.pre_mm_projector_norm):
-                        continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    param = pre_mm_projector_norm_dict[trimmed_name]
-                    with torch.no_grad():
-                        default_weight_loader(param, w)
-                elif is_vision_lang_adapter_weights((name, w)):
-                    if _is_layer_none_or_staged(self.vision_language_adapter):
-                        continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    param = vision_lang_adapter_dict.get(trimmed_name)
-                    if param is not None:
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, w)
-                else:
-                    name = name.removeprefix("language_model.")
-                    yield (name, w)
-
-        self.language_model.load_weights(llm_weights_generator())
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(
@@ -2067,37 +1905,3 @@ class PixtralHFVisionModel(nn.Module):
 
     # (TODO) Add prefix argument for filtering out weights to be loaded
     #        ref: https://github.com/vllm-project/vllm/pull/7186#discussion_r1734163986
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        layer_count = len(self.transformer.layers)
-
-        for name, loaded_weight in weights:
-            # omit layers when num_hidden_layers_override is set
-            if name.startswith("transformer.layers"):
-                layer_idx = int(name.split(".")[2])
-                if layer_idx >= layer_count:
-                    continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params

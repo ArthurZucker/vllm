@@ -48,7 +48,6 @@ from .qwen2_vl import (
     _create_qwen2vl_field_factory,
 )
 from .utils import (
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -210,16 +209,6 @@ class OpenCUAForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.language_model.": "language_model.model.",
-            "model.visual.": "visual.",
-            "vision_tower.": "visual.",
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        }
-    )
 
     supports_encoder_tp_data = True
 

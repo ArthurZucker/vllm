@@ -15,7 +15,7 @@ DFlash Qwen3 draft (see qwen3_dflash.py). DSpark adds:
 DSparkMarkovHead and DSparkConfidenceHead are shared with the DSV4-style DSpark model.
 """
 
-from collections.abc import Iterable
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -37,10 +37,8 @@ from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
-    process_eagle_weight,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -271,6 +269,9 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        # DSpark embeds masked slots with embed_tokens[mask_token_id] alone
+        self.model.mask_embedding.loaded_at_init = True
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
@@ -317,43 +318,3 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        model_weights = {}
-        includes_embed_tokens = False
-        includes_lm_head = False
-        includes_draft_id_mapping = False
-        for name, loaded_weight in weights:
-            # t2d is training-only; the draft remaps via d2t at sampling time.
-            if "t2d" in name:
-                continue
-            if "d2t" in name:
-                name = name.replace("d2t", "draft_id_to_target_id")
-                includes_draft_id_mapping = True
-            elif "lm_head" not in name:
-                name = "model." + name
-            if "embed_tokens" in name:
-                includes_embed_tokens = True
-            if "lm_head" in name:
-                includes_lm_head = True
-            model_weights[name] = loaded_weight
-            # Sets has_own_embed_tokens / has_own_lm_head so load_dspark_model
-            # knows whether to keep these or alias the target's.
-            process_eagle_weight(self, name)
-
-        # mask_embedding is an unused placeholder param; DSpark masks via the vocab row.
-        # embed_tokens / lm_head are optional; when omitted they are shared from
-        # the target by load_dspark_model, so skip the unloaded params here.
-
-        orig_to_new_substr = {"mask_embedding": None}
-        if not includes_embed_tokens:
-            orig_to_new_substr["embed_tokens"] = None
-        if not includes_lm_head:
-            orig_to_new_substr["lm_head"] = None
-        if not includes_draft_id_mapping:
-            orig_to_new_substr["draft_id_to_target_id"] = None
-        if self.model.confidence_head is None:
-            orig_to_new_substr["confidence_head"] = None
-        mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(model_weights.items(), mapper=mapper)

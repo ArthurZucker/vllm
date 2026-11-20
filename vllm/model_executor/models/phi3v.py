@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
 import regex as re
@@ -68,8 +68,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
@@ -533,15 +531,6 @@ class Phi3VMultiModalProcessor(BaseMultiModalProcessor[Phi3VProcessingInfo]):
     dummy_inputs=Phi3VDummyInputsBuilder,
 )
 class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.vision_embed_tokens.wte": "embed_tokens",
-            "model.vision_embed_tokens.": "vision_embed_tokens.",
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -586,6 +575,13 @@ class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant)
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        # one token embedding (the checkpoint's `model.embed_tokens`), loaded here
+        # and shared with the language model
+        lm_embed = getattr(
+            getattr(self.language_model, "model", None), "embed_tokens", None
+        )
+        if isinstance(lm_embed, VocabParallelEmbedding):
+            lm_embed.weight = self.embed_tokens.weight
 
     def _parse_and_validate_image_input(
         self, **kwargs: object
@@ -680,14 +676,3 @@ class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant)
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        autoloaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-        # The HF config doesn't specify whether these are tied,
-        # so we detect it this way
-        if "embed_tokens.weight" not in autoloaded_weights:
-            self.embed_tokens = self.language_model.model.embed_tokens
-            autoloaded_weights.add("embed_tokens.weight")
-        return autoloaded_weights

@@ -19,8 +19,6 @@
 # limitations under the License.
 """Reusable Ming audio tower and checkpoint-compatible projector."""
 
-from collections.abc import Iterable
-
 import torch
 from torch import nn
 from transformers import WhisperConfig
@@ -28,8 +26,7 @@ from transformers import WhisperConfig
 from vllm.config import VllmConfig
 from vllm.transformers_utils.configs.ming_v3_asr import MingAudioConfig
 
-from .utils import AutoWeightsLoader, WeightsMapper
-from .whisper import WhisperEncoder, _create_fake_bias_for_k_proj
+from .whisper import WhisperEncoder
 
 
 def _get_audio_projector_params(config: MingAudioConfig) -> list[tuple[int, int, int]]:
@@ -71,27 +68,6 @@ def get_audio_token_count(
 
 
 class MingAudioEncoder(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "blocks.": "layers.",
-            ".attn.query.": ".self_attn.q_proj.",
-            ".attn.key.": ".self_attn.k_proj.",
-            ".attn.value.": ".self_attn.v_proj.",
-            ".attn.out.": ".self_attn.out_proj.",
-            ".attn_ln.": ".self_attn_layer_norm.",
-            ".mlp_ln.": ".final_layer_norm.",
-            ".mlp.0.": ".mlp.fc1.",
-            ".mlp.2.": ".mlp.fc2.",
-            "ln_post.": "layer_norm.",
-        },
-        orig_to_new_suffix={"positional_embedding": "embed_positions.weight"},
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-        },
-    )
-
     def __init__(
         self, *, vllm_config: VllmConfig, config: MingAudioConfig, prefix: str
     ) -> None:
@@ -115,15 +91,6 @@ class MingAudioEncoder(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.encoder([features.transpose(0, 1)])[0]
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = _create_fake_bias_for_k_proj(
-            weights, ".attn.key.weight", out_features=self.encoder.conv1.out_channels
-        )
-        loaded = AutoWeightsLoader(self.encoder).load_weights(
-            weights, mapper=self.hf_to_vllm_mapper
-        )
-        return {f"encoder.{name}" for name in loaded}
 
 
 class Transpose(nn.Module):

@@ -17,7 +17,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.beam import BeamConfig
@@ -113,7 +112,7 @@ class BeamAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         # The output gate has a separate bias per head.
         self.gate_bias = nn.Parameter(torch.zeros(self.num_heads))
-        set_weight_attrs(self.gate_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.gate_bias, {"shard_dim": 0})
 
         is_sliding = config.layer_types[self.layer_id] == "sliding_attention"
         self.disable_rope = not is_sliding

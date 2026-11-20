@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable, Set
-from dataclasses import replace
+from collections.abc import Set
 
 import torch
 from torch import nn
@@ -47,7 +46,7 @@ from vllm.v1.pool.metadata import PoolingMetadata
 
 from .interfaces import SupportsCrossEncoding, SupportsLoRA, SupportsQuant
 from .interfaces_base import attn_type, default_pooling_type
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class BertEmbedding(nn.Module):
@@ -379,21 +378,6 @@ class BertModel(nn.Module, SupportsQuant):
 
     packed_modules_mapping = {"qkv_proj": ["query", "key", "value"]}
 
-    hf_to_vllm_mapper = WeightsMapper(
-        # Original google-bert checkpoints use the legacy `gamma`/`beta`
-        # LayerNorm names; rename to vLLM's `weight`/`bias`.
-        orig_to_new_substr={
-            "LayerNorm.gamma": "LayerNorm.weight",
-            "LayerNorm.beta": "LayerNorm.bias",
-        },
-        orig_to_new_stacked={
-            ".self.query": (".self.qkv_proj", "q"),
-            ".self.key": (".self.qkv_proj", "k"),
-            ".self.value": (".self.qkv_proj", "v"),
-        },
-        orig_to_new_prefix={"pooler.": None},
-    )
-
     def __init__(
         self,
         *,
@@ -431,16 +415,11 @@ class BertModel(nn.Module, SupportsQuant):
 
         return self.encoder(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class BertPoolingModel(BertModel):
     is_pooling_model = True
 
     # Unlike `BertModel`, this model has a pooler to load weights into.
-    hf_to_vllm_mapper = replace(BertModel.hf_to_vllm_mapper, orig_to_new_prefix={})
 
     def __init__(
         self,
@@ -456,10 +435,6 @@ class BertPoolingModel(BertModel):
         )
 
         self.pooler = BertPooler(vllm_config.model_config)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @default_pooling_type(seq_pooling_type="CLS")
@@ -481,14 +456,6 @@ class BertEmbeddingModel(nn.Module, SupportsQuant, SupportsLoRA):
     packed_modules_mapping = {"qkv_proj": ["query", "key", "value"]}
     # PEFT adapters name modules relative to the HF backbone (optionally under
     # `bert.`/`roberta.`), while vLLM nests the backbone under `model.`.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "bert.": "model.",
-            "roberta.": "model.",
-            "encoder.": "model.encoder.",
-            "embeddings.": "model.embeddings.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -518,18 +485,6 @@ class BertEmbeddingModel(nn.Module, SupportsQuant, SupportsLoRA):
             inputs_embeds=inputs_embeds,
             intermediate_tensors=intermediate_tensors,
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        weights_list = list(weights)
-
-        orig_to_new_prefix: dict[str, str | None] = {"lm_head.": None}
-        has_model_prefix = any(name.startswith("model.") for name, _ in weights_list)
-        if not has_model_prefix:
-            orig_to_new_prefix[""] = "model."
-        mapper = WeightsMapper(orig_to_new_prefix=orig_to_new_prefix)
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights_list, mapper=mapper)
 
     def _build_model(self, vllm_config: VllmConfig, prefix: str = "") -> BertModel:
         return BertModel(
@@ -749,56 +704,6 @@ class BertSpladeSparseEmbeddingModel(BertEmbeddingModel):
             }
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        if not hasattr(self, "mlm_head"):
-            cfg = self.model.config
-            self.mlm_head = BertMLMHead(
-                hidden_size=cfg.hidden_size,
-                vocab_size=cfg.vocab_size,
-                layer_norm_eps=getattr(cfg, "layer_norm_eps", 1e-12),
-            )
-
-        def _strip(name: str) -> str:
-            for p in ("model.", "bert."):
-                if name.startswith(p):
-                    name = name[len(p) :]
-            return name
-
-        weights_list = list(weights)
-        model_side: list[tuple[str, torch.Tensor]] = []
-        mlm_side: list[tuple[str, torch.Tensor]] = []
-
-        for k, w in weights_list:
-            name = _strip(k)
-            if name.startswith("cls.predictions."):
-                mlm_side.append((name, w))
-            else:
-                model_side.append((name, w))
-
-        loaded: set[str] = set()
-        loaded_model = self.model.load_weights(model_side)
-        loaded.update({"model." + n for n in loaded_model})
-
-        if mlm_side:
-            name_map = {
-                "cls.predictions.transform.dense.weight": "mlm_head.dense.weight",
-                "cls.predictions.transform.dense.bias": "mlm_head.dense.bias",
-                ("cls.predictions.transform.LayerNorm.weight"): (
-                    "mlm_head.layer_norm.weight"
-                ),
-                ("cls.predictions.transform.LayerNorm.bias"): (
-                    "mlm_head.layer_norm.bias"
-                ),
-                "cls.predictions.decoder.weight": "mlm_head.decoder.weight",
-                "cls.predictions.decoder.bias": "mlm_head.decoder.bias",
-            }
-            remapped = [(name_map[n], w) for n, w in mlm_side if n in name_map]
-            if remapped:
-                loaded_mlm = AutoWeightsLoader(self).load_weights(remapped)
-                loaded.update(loaded_mlm)
-
-        return loaded
-
 
 @default_pooling_type(seq_pooling_type="CLS")
 class BertForSequenceClassification(
@@ -849,11 +754,6 @@ class BertForSequenceClassification(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embed_input_ids(input_ids)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights)
-        return loaded_params
 
     def forward(
         self,
@@ -910,11 +810,6 @@ class BertForTokenClassification(nn.Module, SupportsLoRA):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embed_input_ids(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights)
-        return loaded_params
-
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -956,23 +851,6 @@ class BertForMaskedLM(nn.Module):
     # submodule. Order matters: the ``None`` (drop) rules and the more specific
     # names are listed before the broader ``cls.predictions.decoder`` rule so
     # that substring replacement doesn't rewrite them first.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # Next-sentence-prediction head: not part of masked LM.
-            "cls.seq_relationship": None,
-            # Some checkpoints ship an explicit (tied) decoder bias; we load the
-            # canonical ``cls.predictions.bias`` instead, so drop the duplicate.
-            "cls.predictions.decoder.bias": None,
-            # Legacy LayerNorm affine names in the MLM head transform.
-            "cls.predictions.transform.LayerNorm.gamma": "mlm_head.layer_norm.weight",
-            "cls.predictions.transform.LayerNorm.beta": "mlm_head.layer_norm.bias",
-            "cls.predictions.transform.LayerNorm": "mlm_head.layer_norm",
-            "cls.predictions.transform.dense": "mlm_head.dense",
-            "cls.predictions.decoder": "mlm_head.decoder",
-            # In HF ``cls.predictions.bias`` *is* the decoder bias.
-            "cls.predictions.bias": "mlm_head.decoder.bias",
-        }
-    )
 
     embedding_class: type[nn.Module] = BertEmbedding
 
@@ -989,6 +867,8 @@ class BertForMaskedLM(nn.Module):
             vocab_size=config.vocab_size,
             layer_norm_eps=getattr(config, "layer_norm_eps", 1e-12),
         )
+        # checkpoints without a decoder: the word embeddings (`ops_loader`)
+        self.mlm_head.decoder.weight.tied_to = "bert.embeddings.word_embeddings.weight"
 
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
@@ -997,21 +877,6 @@ class BertForMaskedLM(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.embed_input_ids(input_ids)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-        # The MLM decoder shares its weight with the input embeddings. When the
-        # checkpoint relies on `tie_word_embeddings` (e.g. google-bert/*) it
-        # doesn't ship an explicit decoder weight, so tie it here. Copy the
-        # first `vocab_size` rows since VocabParallelEmbedding may pad the vocab.
-        if "mlm_head.decoder.weight" not in loaded:
-            emb = self.bert.embeddings.word_embeddings.weight
-            decoder = self.mlm_head.decoder.weight
-            decoder.data.copy_(emb.data[: decoder.shape[0]])
-            loaded.add("mlm_head.decoder.weight")
-        return loaded
 
     def forward(
         self,

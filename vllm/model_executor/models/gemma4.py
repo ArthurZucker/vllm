@@ -18,7 +18,6 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
-from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
 from typing import ClassVar
@@ -76,60 +75,13 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    ShardIds,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
 )
 
 logger = init_logger(__name__)
-
-
-def _gemma4_layer_weights_mapper(config) -> WeightsMapper:
-    """Stack each decoder layer's projections the way its modules are built.
-
-    gate/up pack into `mlp.gate_up_proj`. Layers with a qkv_proj pack q/k/v
-    into it; `attention_k_eq_v` full-attention layers ship k_proj only, so K
-    is loaded into both the K and V shards and no v_proj is expected. KV-shared
-    layers only have q_proj; the K/V tensors original checkpoints still ship
-    for them are dropped.
-    """
-    num_layers = config.num_hidden_layers
-    first_kv_shared = num_layers - getattr(config, "num_kv_shared_layers", 0)
-    k_eq_v_layers = (
-        {
-            i
-            for i, layer_type in enumerate(config.layer_types[:first_kv_shared])
-            if layer_type == "full_attention"
-        }
-        if getattr(config, "attention_k_eq_v", False)
-        else set()
-    )
-    qkv_shards: tuple[tuple[str, ShardIds], ...] = (("q", "q"), ("k", "k"), ("v", "v"))
-    k_eq_v_shards: tuple[tuple[str, ShardIds], ...] = (("q", "q"), ("k", ["k", "v"]))
-    stacked: dict[str, tuple[str, ShardIds]] = {
-        ".mlp.gate_proj.": (".mlp.gate_up_proj.", 0),
-        ".mlp.up_proj.": (".mlp.gate_up_proj.", 1),
-    }
-    stacked |= {
-        f"layers.{i}.self_attn.{shard}_proj.": (
-            f"layers.{i}.self_attn.qkv_proj.",
-            shard_id,
-        )
-        for i in range(first_kv_shared)
-        for shard, shard_id in (k_eq_v_shards if i in k_eq_v_layers else qkv_shards)
-    }
-    return WeightsMapper(
-        orig_to_new_substr={
-            f"layers.{i}.self_attn.{name}.": None
-            for i in range(first_kv_shared, num_layers)
-            for name in ("k_proj", "v_proj", "k_norm")
-        },
-        orig_to_new_stacked=stacked,
-    )
 
 
 @triton.jit
@@ -1056,7 +1008,6 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.hf_to_vllm_mapper = _gemma4_layer_weights_mapper(config)
 
         # PLE config values (default to 0 if not present — disables PLE)
         self.hidden_size_per_layer_input = getattr(
@@ -1457,32 +1408,12 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class Gemma4ForCausalLM(
     nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts, SupportsEagle3
 ):
     is_3d_moe_weight: ClassVar[bool] = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # Multimodal weights are handled by the multimodal wrapper.
-            "audio_tower.": None,
-            "vision_tower.": None,
-            "embed_audio.": None,
-            "embed_vision.": None,
-        },
-        orig_to_new_prefix={
-            # Gemma4ForConditionalGeneration already loads the text stack
-            # from `model.language_model.*`. We reuse that same checkpoint
-            # and adapter naming for the text-only Gemma4ForCausalLM path,
-            # so LoRA keys from the conditional wrapper map onto `model.*`.
-            "model.language_model.": "model.",
-        },
-    )
     # KV-shared layers only have q_proj, so qkv_proj packing applies to
     # the other layers.
     packed_modules_mapping = {
@@ -1569,7 +1500,3 @@ class Gemma4ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

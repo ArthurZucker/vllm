@@ -20,7 +20,6 @@ its weight loader auto-splits the fused tensor along the output dim by
 `output_sizes` (the same path used by Phi-3's fused gate_up_proj).
 """
 
-from collections.abc import Iterable
 from typing import Literal
 
 import torch
@@ -46,7 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 
 class HrmTextMLP(nn.Module):
@@ -153,9 +152,9 @@ class HrmTextAttention(nn.Module):
         bias = getattr(config, "attention_bias", False)
 
         # gqkv_proj: 4-way fused [gate | q | k | v] matching the on-disk
-        # `attn.gqkv_proj.weight` row layout. MergedColumnParallelLinear's
-        # weight_loader auto-splits the fused disk tensor along the output
-        # dim by `output_sizes` (Phi-3's fused gate_up_proj path). MHA
+        # `attn.gqkv_proj.weight` row layout. The ops loader splits the fused
+        # disk tensor along the output dim by `output_sizes` (MergedColumn's
+        # shard_ids, Phi-3's fused gate_up_proj path). MHA
         # only: GQA (num_kv_heads != num_heads) would need
         # QKVParallelLinear semantics for q/k/v shard replication.
         per_head_size = self.total_num_heads * self.head_dim
@@ -254,11 +253,7 @@ class HrmTextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Attribute name `self_attn` matches HF's model class. The on-disk
-        # `attn.{gqkv_proj,o_proj}.weight` keys are renamed to
-        # `self_attn.{gqkv_proj,o_proj}.weight` by the `WeightsMapper` in
-        # `HrmTextForCausalLM` so vLLM's standard `AutoWeightsLoader`
-        # handles the rest.
+        # Attribute name `self_attn` matches HF's model class.
         self.self_attn = HrmTextAttention(
             config=config,
             layer_idx_in_stack=layer_idx_in_stack,
@@ -466,9 +461,6 @@ class HrmTextForCausalLM(nn.Module):
     # gate/q/k/v) and `mlp.gate_up_proj` (2-way fused gate/up) are loaded
     # directly via MergedColumnParallelLinear's fused-on-disk path; no
     # packed_modules_mapping entries are needed.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".attn.": ".self_attn."},
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -518,7 +510,3 @@ class HrmTextForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

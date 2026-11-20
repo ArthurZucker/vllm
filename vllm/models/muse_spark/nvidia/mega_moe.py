@@ -7,7 +7,6 @@ The ModelOpt NVFP4 checkpoint maps onto the kernel without requantization.
 
 import functools
 import inspect
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -132,12 +131,10 @@ class MuseSparkMegaMoEExperts(nn.Module):
                 f"buffer layouts; got {hidden_size}/{intermediate_size}."
             )
 
-        attrs = {"weight_loader": self.weight_loader}
-
+        # the experts stacked on disk: this rank's, from `experts_start_idx`
+        # (`conversion_mapping`'s `Narrow`)
         def param(*shape: int, dtype: torch.dtype) -> nn.Parameter:
-            p = nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
-            set_weight_attrs(p, attrs)
-            return p
+            return nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
 
         if is_nvfp4:
             e4m3 = torch.float8_e4m3fn
@@ -200,34 +197,6 @@ class MuseSparkMegaMoEExperts(nn.Module):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        **kwargs,
-    ) -> None:
-        shard = loaded_weight[self.experts_start_idx : self.experts_end_idx]
-        if shard.shape != param.data.shape:
-            raise ValueError(
-                f"{self.prefix}: expert weight {weight_name!r} shard "
-                f"{tuple(shard.shape)} does not fit parameter "
-                f"{tuple(param.data.shape)}"
-            )
-        param.data.copy_(shard.to(param.data.dtype))
-
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        for name, tensor in weights:
-            param = getattr(self, name, None)
-            if param is None:
-                raise AttributeError(
-                    f"{self.prefix}: unexpected expert weight {name!r}"
-                )
-            self.weight_loader(param, tensor, name)
-            yield name
 
     def finalize_weights(self) -> None:
         """Repack checkpoint tensors into the layout the kernel reads."""
@@ -466,6 +435,3 @@ class MuseSparkMegaMoEExperts(nn.Module):
             weight_layout=self.weight_layout,
         )
         return y
-
-
-MuseSparkMegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]

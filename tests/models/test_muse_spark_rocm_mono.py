@@ -419,7 +419,6 @@ def tiny_model(checkpoints):
             DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(
                 lm, model_config
             )
-            lm.load_weights([])
             process_weights_after_loading(lm, model_config, device)
             kv = dict(
                 block_size=16,
@@ -437,12 +436,12 @@ def tiny_model(checkpoints):
 
 @requires_gfx950
 def test_layer_guards_follow_the_weight_finalize(tiny_model) -> None:
-    """Refused until load_weights and the quant finalize produced the kernel
-    layouts (folded router, materialized gates, shuffled experts)."""
+    """Refused until the weight finalize produced the kernel layouts
+    (materialized gates, shuffled experts); the router multiplier is folded as
+    the router weight loads (`conversion_mapping`)."""
     before = tiny_model.refusals_before_finalize
     for reason in (
         "layer 1: add_attn coefficients not materialized",
-        "layer 1: router multiplier not folded",
         "layer 1: expert weights not shuffled",
     ):
         assert reason in before

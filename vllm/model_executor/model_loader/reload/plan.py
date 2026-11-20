@@ -29,6 +29,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
+)
 from vllm.model_executor.utils import storage_view
 
 from .bake import Copy, Targets, Traced, trace_loads
@@ -164,7 +167,7 @@ def load_planned(
             part = full[tuple(slice(start, stop) for start, stop in box)]
             tensor.copy_(part.reshape(tensor.shape))
     if fallbacks:
-        model.load_weights(fallbacks)
+        load_model_weights(model, fallbacks)
 
 
 def check_plannable(model: torch.nn.Module) -> None:

@@ -1,22 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
-
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.models.gemma2 import Gemma2Model
-from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 
 class MyGemma2Embedding(nn.Module):
     is_pooling_model = True
-
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.": ""})
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -53,10 +49,3 @@ class MyGemma2Embedding(nn.Module):
 
         # Return all-zero embeddings
         return torch.zeros_like(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        weights = (
-            (name, data) for name, data in weights if not name.startswith("lm_head.")
-        )
-        return self.model.load_weights(weights)

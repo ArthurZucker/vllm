@@ -233,7 +233,10 @@ class IPCWeightTransferEngine(
                 weight = rebuild_cuda_tensor(*list_args)
                 weights.append((name, weight))
 
-        self.model.load_weights(weights)
+        from vllm.model_executor.model_loader.ops_loader import (
+            load_weights as load_model_weights,
+        )
+        load_model_weights(self.model, weights)
 
     def shutdown(self) -> None:
         self._packed_importer.close()

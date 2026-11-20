@@ -130,9 +130,11 @@ class WorkerLoRAManager:
             # correct loading of lora weights. We only need to know about renames for
             # this, so we use get_rename_mapper() to ignore stacking and deletions.
             model = self._adapter_manager.model
-            hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
-            if hf_to_vllm_mapper is not None:
-                hf_to_vllm_mapper = hf_to_vllm_mapper.get_rename_mapper()
+            from vllm.model_executor.model_loader.conversion_mapping import (
+                rename_mapper,
+            )
+
+            hf_to_vllm_mapper = rename_mapper(model)
 
             # Get model-defined prefixes to skip during LoRA loading.
             lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)

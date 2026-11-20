@@ -4,7 +4,6 @@
 
 import mmap
 import os
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -17,7 +16,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter, sp_shard
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import round_up
@@ -120,6 +118,8 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
             )
             self._row_ids = torch.arange(rows[0] * rows[1], device=device)
         self._shards: dict[str, dict[int, torch.Tensor]] = {n: {} for n in self._planes}
+        for name in self._planes:  # served from the checkpoint files, never written
+            getattr(self, name).loaded_at_init = True
         self._shard_size = 0
         self._bound = False
         self._fds: dict[str, int] = {}
@@ -141,9 +141,12 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
         shard_size: int,
         name: str,
     ) -> None:
-        """Keep a checkpoint shard as a zero-copy byte view of its storage."""
+        """Keep a checkpoint shard as a zero-copy byte view of its storage
+        (`common.ngram_embedding.ple_table_shards`)."""
         if self._bound:
             raise RuntimeError("PLE disk offload does not support weight reload")
+        if name not in self._shards:
+            raise ValueError(f"PLE disk offload has no {name} plane")
         dtype = getattr(self, name).dtype
         if loaded_weight.dtype != dtype:
             raise ValueError(
@@ -642,97 +645,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             output=self._prefetch_ids[: input_ids.numel()],
         )
         embedding.start_prefetch(ngram_ids)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load hash buffers and checkpoint-split embedding rows."""
-        persistent_buffers = {
-            "layer_multipliers": self.layer_multipliers,
-            "ngram_heads_offsets": self.ngram_heads_offsets,
-            "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
-        }
-        loaded: set[str] = set()
-        regular_weights: list[tuple[str, torch.Tensor]] = []
-        shard_prefix = "ngram_embedding.shard_"
-        embedding = self.ngram_embedding
-        method = getattr(embedding, "embedding_method", None)
-        nvfp4_method = (
-            method if isinstance(method, Qwen4ExpPLENvFp4EmbeddingMethod) else None
-        )
-        # NVFP4 tables split their block scales into shards like the rows.
-        shard_parameters = ("weight", "weight_scale") if nvfp4_method else ("weight",)
-        shard_size = (
-            embedding.org_vocab_size + self.split_ngram_parts - 1
-        ) // self.split_ngram_parts
-
-        for name, loaded_weight in weights:
-            leaf_name = name.rsplit(".", 1)[-1]
-            if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
-                continue
-            if name in persistent_buffers:
-                buffer = persistent_buffers[name]
-                if buffer.shape != loaded_weight.shape:
-                    raise ValueError(
-                        f"Shape mismatch for {name}: expected "
-                        f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
-                    )
-                buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
-                loaded.add(name)
-                continue
-            if name.startswith(shard_prefix):
-                shard_text, _, suffix = name[len(shard_prefix) :].partition(".")
-                if not shard_text.isdigit() or suffix not in shard_parameters:
-                    regular_weights.append((name, loaded_weight))
-                    continue
-                shard_index = int(shard_text)
-                if shard_index >= self.split_ngram_parts:
-                    raise ValueError(
-                        f"PLE embedding shard index {shard_index} exceeds "
-                        f"split_ngram_parts={self.split_ngram_parts}"
-                    )
-                checkpoint_start = shard_index * shard_size
-                expected_rows = max(
-                    0,
-                    min(shard_size, embedding.org_vocab_size - checkpoint_start),
-                )
-                parameter = getattr(embedding, suffix)
-                expected_shape = (expected_rows, parameter.shape[1])
-                if tuple(loaded_weight.shape) != expected_shape:
-                    raise ValueError(
-                        f"Shape mismatch for PLE embedding shard {shard_index} "
-                        f"{suffix}: expected {expected_shape}, got "
-                        f"{tuple(loaded_weight.shape)}"
-                    )
-                # A cast would silently reinterpret packed E2M1 bytes.
-                if nvfp4_method is not None and loaded_weight.dtype != parameter.dtype:
-                    raise ValueError(
-                        f"NVFP4 PLE shard {shard_index} {suffix} requires "
-                        f"{parameter.dtype}, got {loaded_weight.dtype}"
-                    )
-                if isinstance(embedding, Qwen4ExpPLEDiskOffloadEmbedding):
-                    embedding.accept_checkpoint_shard(
-                        shard_index, loaded_weight, shard_size, suffix
-                    )
-                else:
-                    parameter.weight_loader(
-                        parameter,
-                        loaded_weight,
-                        checkpoint_start=checkpoint_start,
-                    )
-                loaded.add(f"ngram_embedding.{suffix}")
-                continue
-            if nvfp4_method is not None and name in (
-                "ngram_embedding.weight",
-                "ngram_embedding.weight_scale",
-            ):
-                raise ValueError(
-                    f"NVFP4 PLE tables must be stored as {shard_prefix}<i>.weight "
-                    f"and {shard_prefix}<i>.weight_scale shards, got unsharded {name}"
-                )
-            regular_weights.append((name, loaded_weight))
-
-        if regular_weights:
-            loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
-        return loaded
 
 
 def stage_checkpoint_rows(

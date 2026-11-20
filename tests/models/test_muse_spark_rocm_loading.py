@@ -7,17 +7,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.core_model_loading import WeightConverter, rename_source_key
 
 import vllm.models.muse_spark.amd.model as amd_model
-from vllm.models.muse_spark.amd.model import (
-    MuseSparkForCausalLM,
-    MuseSparkModel,
+from vllm.model_executor.model_loader import ops_loader
+from vllm.model_executor.model_loader.conversion_mapping import (
+    _CONVERSION_MAPPING,
+    GATE_UP,
+    QKV,
+    _layer_experts,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
+from vllm.models.muse_spark.amd.model import MuseSparkForCausalLM
 from vllm.models.muse_spark.amd.multimodal import MuseSparkForConditionalGeneration
-from vllm.models.muse_spark.amd.muse_moe_runner import (
-    MuseSparkRoutedExperts,
-)
-from vllm.models.muse_spark.common.moe import MuseSparkConsolidatedRoutedExperts
 from vllm.platforms import current_platform
 
 
@@ -28,27 +30,37 @@ def test_rocm_mapper_retains_quark_dense_and_individual_expert_scales() -> None:
     dense_scale = f"{layer}.self_attn.o_proj.weight_scale"
     stacked_dense_scale = f"{layer}.self_attn.q_proj.weight_scale"
 
-    amd_mapped = list(
-        MuseSparkForConditionalGeneration.hf_to_vllm_mapper.apply(
-            [
-                (expert_scale, torch.ones(1)),
-                (dense_scale, torch.ones(1)),
-                (stacked_dense_scale, torch.ones(1)),
-            ]
-        )
+    # what `get_conversion_mapping` gives the model: its experts' (RoutedExperts'
+    # checkpoint names), its entry, then the fused projections
+    experts = SimpleNamespace(
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_up_proj_name="up_proj",
+        ckpt_down_proj_name="down_proj",
     )
+    model = SimpleNamespace(
+        hf_to_vllm_mapper=MuseSparkForConditionalGeneration.hf_to_vllm_mapper,
+        modules=lambda: [experts],
+    )
+    entry = _CONVERSION_MAPPING["MuseSparkForConditionalGeneration"]
+    transforms = [*_layer_experts(model), *entry(model), QKV, GATE_UP]
+    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
+    converters = [t for t in transforms if isinstance(t, WeightConverter)]
+
+    amd_mapped = [
+        rename_source_key(name, renamings, converters)
+        for name in (expert_scale, dense_scale, stacked_dense_scale)
+    ]
 
     assert [name for name, _ in amd_mapped] == [
         "model.layers.0.feed_forward.experts.7.gate_proj.weight_scale",
         "model.layers.0.self_attn.o_proj.weight_scale",
         "model.layers.0.self_attn.qkv_proj.weight_scale",
     ]
-    assert amd_mapped[2][1].shard_id == "q"
+    # the q shard: the first source of the fused qkv_proj
+    assert QKV.source_patterns.index(amd_mapped[2][1]) == 0
 
 
-def test_load_weights_moves_per_row_qk_scales_with_the_interleaved_rows(
-    monkeypatch,
-) -> None:
+def test_load_weights_moves_per_row_qk_scales_with_the_interleaved_rows() -> None:
     """A PTPC-FP8 q/k projection dequantizes unchanged across the row interleave."""
     head_dim, q_rows, k_rows, hidden = 8, 4 * 8, 2 * 8, 16
     torch.manual_seed(0)
@@ -60,15 +72,6 @@ def test_load_weights_moves_per_row_qk_scales_with_the_interleaved_rows(
     per_channel_input = torch.rand(k_rows)
     o_proj = torch.randn(hidden, q_rows)
     layer = "model.language_model.layers.3.self_attn"
-    seen: dict[str, torch.Tensor] = {}
-
-    class RecordingLoader:
-        def __init__(self, module) -> None:
-            pass
-
-        def load_weights(self, weights, *, mapper=None) -> set[str]:
-            seen.update(dict(weights))
-            return set(seen)
 
     model = object.__new__(MuseSparkForCausalLM)
     model.model = SimpleNamespace(
@@ -76,22 +79,18 @@ def test_load_weights_moves_per_row_qk_scales_with_the_interleaved_rows(
             head_dim=head_dim, num_attention_heads=4, num_key_value_heads=2
         )
     )
-    with monkeypatch.context() as patch:
-        patch.setattr(amd_model, "AutoWeightsLoader", RecordingLoader)
-        patch.setattr(
-            amd_model, "materialize_residual_path_constants", lambda _model: 0
-        )
-        MuseSparkForCausalLM.load_weights(
-            model,
-            [
-                (f"{layer}.k_proj.weight", weight),
-                (f"{layer}.k_proj.weight_scale", scale),
-                (f"{layer}.k_proj.weight_scale_block", block_scale),
-                (f"{layer}.k_proj.input_scale", input_scale),
-                (f"{layer}.k_proj.input_channel_scale", per_channel_input),
-                (f"{layer}.o_proj.weight", o_proj),
-            ],
-        )
+    weights = [
+        (f"{layer}.k_proj.weight", weight),
+        (f"{layer}.k_proj.weight_scale", scale),
+        (f"{layer}.k_proj.weight_scale_block", block_scale),
+        (f"{layer}.k_proj.input_scale", input_scale),
+        (f"{layer}.k_proj.input_channel_scale", per_channel_input),
+        (f"{layer}.o_proj.weight", o_proj),
+    ]
+    # what `load_with_ops` runs on the stream before its conversions
+    for transform in getattr(model, "checkpoint_transforms", []):
+        weights = transform(weights)
+    seen = dict(weights)
 
     def interleave(t: torch.Tensor) -> torch.Tensor:
         return (
@@ -114,23 +113,6 @@ def test_load_weights_moves_per_row_qk_scales_with_the_interleaved_rows(
     assert seen[f"{layer}.o_proj.weight"] is o_proj
 
 
-def test_rocm_nested_mapper_preserves_individual_expert_projections() -> None:
-    weights = [
-        ("layers.0.feed_forward.experts.7.gate_proj.weight", torch.ones(1)),
-        ("layers.0.feed_forward.experts.7.up_proj.weight", torch.ones(1)),
-        ("layers.0.self_attn.q_proj.weight", torch.ones(1)),
-    ]
-
-    mapped = list(MuseSparkModel.hf_to_vllm_mapper.apply(weights))
-
-    assert [name for name, _ in mapped] == [
-        "layers.0.feed_forward.experts.7.gate_proj.weight",
-        "layers.0.feed_forward.experts.7.up_proj.weight",
-        "layers.0.self_attn.qkv_proj.weight",
-    ]
-    assert mapped[2][1].shard_id == "q"
-
-
 def test_public_entry_point_selects_rocm_model(monkeypatch) -> None:
     import vllm.models.muse_spark as muse_spark
 
@@ -149,78 +131,25 @@ def test_public_entry_point_selects_rocm_model(monkeypatch) -> None:
     assert reloaded.MuseSparkForConditionalGeneration is original_omni_model
 
 
-def _individual_quark_expert_weights(
-    num_experts: int,
-) -> list[tuple[str, torch.Tensor]]:
-    return [
-        (f"{expert_id}.{projection}.{suffix}", torch.empty(1))
-        for expert_id in range(num_experts)
-        for projection in ("gate_proj", "up_proj", "down_proj")
-        for suffix in ("weight", "weight_scale")
-    ]
-
-
-def test_unquantized_loader_routes_per_expert_names_to_expert_mapping(
-    monkeypatch,
-) -> None:
-    """Quark exports keep some layers in BF16 but still store them per expert."""
-    consolidated_calls: list[list[str]] = []
-    per_expert_calls: list[list[str]] = []
-
-    def _consolidated(self, weights):
-        consolidated_calls.append([name for name, _ in weights])
-        return iter(())
-
-    def _per_expert(self, weights):
-        per_expert_calls.append([name for name, _ in weights])
-        return iter(())
-
-    monkeypatch.setattr(
-        MuseSparkConsolidatedRoutedExperts, "load_weights", _consolidated
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts."
-        "load_weights",
-        _per_expert,
-    )
-    experts = MuseSparkRoutedExperts.__new__(MuseSparkRoutedExperts)
-    object.__setattr__(experts, "quant_method", SimpleNamespace())
-
-    stacked = [("w13_weight", torch.empty(1)), ("w2_weight", torch.empty(1))]
-    list(MuseSparkRoutedExperts.load_weights(experts, stacked))
-    assert consolidated_calls == [["w13_weight", "w2_weight"]]
-    assert per_expert_calls == []
-
-    individual = [
-        (name, tensor)
-        for name, tensor in _individual_quark_expert_weights(2)
-        if name.endswith(".weight")
-    ]
-    list(MuseSparkRoutedExperts.load_weights(experts, individual))
-    assert consolidated_calls == [["w13_weight", "w2_weight"]]
-    assert per_expert_calls == [[name for name, _ in individual]]
-
-
 def test_router_weight_reload_refolds_and_preserves_planes(monkeypatch) -> None:
-    from vllm.model_executor.layers.linear import ReplicatedLinear
     from vllm.models.muse_spark.amd.model import MuseSparkMoE
 
     moe = MuseSparkMoE.__new__(MuseSparkMoE)
     torch.nn.Module.__init__(moe)
     moe.router = torch.nn.Linear(4, 2, bias=False)
-    moe.router.weight_loader = ReplicatedLinear.weight_loader.__get__(moe.router)
-    moe.router.weight.weight_loader = moe._load_router_weight
     moe.router_output_multiplier = 0.25
-    moe._router_multiplier_folded = False
-    moe.moe_router = SimpleNamespace(router_output_multiplier=0.25)
+    moe.moe_router = SimpleNamespace(router_output_multiplier=None)
     monkeypatch.setattr(amd_model, "_supports_router_bf16x3_device", lambda: True)
     monkeypatch.setattr(amd_model, "supports_router_bf16x3", lambda *args: True)
+    # single rank: the router is replicated
+    monkeypatch.setattr(ops_loader, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(ops_loader, "get_tensor_model_parallel_world_size", lambda: 1)
 
     weight_ptr = moe.router.weight.data_ptr()
     planes_ptr = None
     for value in (1.0, 3.0):
         raw = torch.full_like(moe.router.weight, value)
-        moe.router.weight.weight_loader(moe.router.weight, raw)
+        load_with_ops(moe, iter([("router.weight", raw)]))
         moe.fold_router_output_multiplier()
         expected = raw * 0.25
         torch.testing.assert_close(moe.router.weight, expected)

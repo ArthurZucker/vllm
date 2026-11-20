@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
-import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -19,12 +18,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.reload import (
-    support_quantized_model_reload_from_hp_weights,
-)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import supports_any_eagle
 from vllm.multimodal import NestedTensors
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -215,289 +208,6 @@ class WeightsMapper:
         )
 
 
-def _get_tied_embedding_params(module: nn.Module) -> dict[str, str]:
-    """Map each tied word embedding qualname to the first name it aliases."""
-    canonical = dict[int, str]()
-    aliased = dict[str, str]()
-    for prefix, submodule in module.named_modules(remove_duplicate=False):
-        if not isinstance(submodule, VocabParallelEmbedding):
-            continue
-        for name, param in submodule.named_parameters(remove_duplicate=False):
-            qualname = f"{prefix}.{name}" if prefix else name
-            if (first_name := canonical.setdefault(id(param), qualname)) != qualname:
-                aliased[qualname] = first_name
-    return aliased
-
-
-class AutoWeightsLoader:
-    """Helper class to load weights into a [`torch.nn.Module`][]. It is able
-    to automatically detect child modules and parameters while iterating over
-    the weights only once.
-
-    The weight loading logic for individual modules can be overridden
-    by defining a `load_weights` method.
-
-    Similarly, the weight loading logic for individual parameters can be
-    overridden by defining a `weight_loader` method.
-
-    Detailed weight loading information can be viewed by setting the
-    environment variable `VLLM_LOGGING_LEVEL=DEBUG`.
-    """
-
-    # Models trained using early version ColossalAI or quantized by
-    # GPTQModel may include these tensors in checkpoint. Drop them.
-    REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER = WeightsMapper(
-        orig_to_new_substr={
-            "rotary_pos_emb.inv_freq": None,
-            "rotary_emb.inv_freq": None,
-            "rotary_emb.cos_cached": None,
-            "rotary_emb.sin_cached": None,
-        }
-    )
-
-    def __init__(
-        self,
-        module: nn.Module,
-        *,
-        ignore_unexpected_prefixes: list[str] | None = None,
-        ignore_unexpected_suffixes: list[str] | None = None,
-    ) -> None:
-        super().__init__()
-
-        self.module = module
-        self.ignore_unexpected_prefixes = ignore_unexpected_prefixes or []
-        self.ignore_unexpected_suffixes = ignore_unexpected_suffixes or []
-
-        # Weight tying makes two qualnames point at the same `nn.Parameter`
-        # (e.g. `lm_head.weight` and `model.embed_tokens.weight`). Loading both
-        # would write the same storage twice, so only the first name reached by
-        # module traversal is loaded and the rest are skipped.
-        self.aliased_params = _get_tied_embedding_params(module)
-
-    def _groupby_prefix(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> Iterable[tuple[str, Iterable[tuple[str, torch.Tensor]]]]:
-        weights_by_parts = (
-            (weight_name.split(".", 1), weight_data)
-            for weight_name, weight_data in weights
-        )
-
-        for prefix, group in itertools.groupby(weights_by_parts, key=lambda x: x[0][0]):
-            yield (
-                prefix,
-                # Because maxsplit=1 in weight_name.split(...),
-                # the length of `parts` must either be 1 or 2
-                (
-                    ("" if len(parts) == 1 else parts[1], weights_data)
-                    for parts, weights_data in group
-                ),
-            )
-
-    def _get_qualname(self, prefix: str, rest: str) -> str:
-        if prefix == "":
-            return rest
-        if rest == "":
-            return prefix
-
-        return ".".join((prefix, rest))
-
-    def _can_skip(self, qualname: str) -> bool:
-        return qualname in self.aliased_params
-
-    def _can_ignore_unexpected(self, qualname: str) -> bool:
-        iup = (qualname.startswith(p) for p in self.ignore_unexpected_prefixes)
-        ius = (qualname.endswith(s) for s in self.ignore_unexpected_suffixes)
-        return any(iup) or any(ius)
-
-    def _load_param(
-        self,
-        base_prefix: str,
-        param: nn.Parameter,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> Iterable[str]:
-        for weight_name, weight_data in weights:
-            weight_qualname = self._get_qualname(base_prefix, weight_name)
-
-            if self._can_skip(weight_qualname):
-                logger.debug("Skipping weight %s", weight_qualname)
-
-                continue
-
-            if weight_name != "":
-                if self._can_ignore_unexpected(weight_qualname):
-                    logger.debug("Ignoring weight %s", weight_qualname)
-
-                    continue
-
-                raise ValueError(
-                    f"Attempted to load nested weight {weight_qualname!r} "
-                    f"into a single parameter {base_prefix!r}"
-                )
-
-            if param.dtype != weight_data.dtype:
-                # An exact widening -- an fp32 accumulator reading a bf16
-                # table, say -- keeps every stored value, so it is a debug
-                # line. Every other mismatch still warns.
-                exact_widening = weight_data.dtype in (
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float32,
-                ) and param.dtype in (torch.float32, torch.float64)
-                (logger.debug if exact_widening else logger.warning)(
-                    "Attempted to load weight %s with dtype %s into "
-                    "parameter with dtype %s",
-                    weight_qualname,
-                    weight_data.dtype,
-                    param.dtype,
-                )
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight_data)
-
-            logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
-
-            yield weight_qualname
-
-    def _add_loadable_non_param_tensors(
-        self, module: nn.Module, child_params: dict[str, torch.Tensor]
-    ):
-        """Add tensor names that are not in the model params that may be in the
-        safetensors, e.g., batch normalization stats and registered buffers.
-        """
-        # Add persistent registered buffers.
-        # Non-persistent buffers are excluded, matching PyTorch state_dict().
-        non_persistent: set[str] = getattr(module, "_non_persistent_buffers_set", set())
-        for buf_name, buf in module.named_buffers(recurse=False):
-            if buf_name not in child_params and buf_name not in non_persistent:
-                child_params[buf_name] = buf
-
-        if isinstance(
-            module,
-            (
-                nn.BatchNorm1d,
-                nn.BatchNorm2d,
-                nn.BatchNorm3d,
-                nn.LazyBatchNorm1d,
-                nn.LazyBatchNorm2d,
-                nn.LazyBatchNorm3d,
-                nn.SyncBatchNorm,
-            ),
-        ):
-            module_state_dict = module.state_dict()
-            for stat_name in ("running_mean", "running_var", "num_batches_tracked"):
-                child_params[stat_name] = module_state_dict[stat_name]
-
-    def _load_module(
-        self,
-        base_prefix: str,
-        module: nn.Module,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> Iterable[str]:
-        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
-            return
-
-        # Avoid infinite recursion since this function is typically
-        # called inside load_weights of the module itself
-        if module != self.module:
-            module_load_weights = getattr(module, "load_weights", None)
-            if callable(module_load_weights):
-                loaded_params = module_load_weights(weights)
-                if loaded_params is None:
-                    logger.warning(
-                        "Unable to collect loaded parameters for module %s", module
-                    )
-                else:
-                    yield from map(
-                        lambda x: self._get_qualname(base_prefix, x),
-                        loaded_params,
-                    )
-
-        child_modules = dict(module.named_children())
-        child_params = dict(module.named_parameters(recurse=False))
-
-        # Add missing tensors the weight loader needs to be able to load
-        # that aren't registered as params, e.g., batchnorm statistics.
-        self._add_loadable_non_param_tensors(module, child_params)
-
-        for child_prefix, child_weights in self._groupby_prefix(weights):
-            prefix = self._get_qualname(base_prefix, child_prefix)
-
-            if child_prefix in child_modules:
-                yield from self._load_module(
-                    prefix, child_modules[child_prefix], child_weights
-                )
-            elif child_prefix in child_params:
-                if self._can_skip(prefix):
-                    logger.debug("Skipping param %s", prefix)
-
-                    continue
-
-                yield from self._load_param(
-                    prefix, child_params[child_prefix], child_weights
-                )
-            else:
-                if self._can_skip(prefix):
-                    logger.debug("Skipping missing %s", prefix)
-
-                    continue
-
-                can_ignore_module = self._can_ignore_unexpected(prefix + ".")
-                can_ignore_param = self._can_ignore_unexpected(prefix)
-                if can_ignore_module or can_ignore_param:
-                    logger.debug("Ignoring missing %s", prefix)
-
-                    continue
-
-                named_parameters = module.named_parameters(recurse=True)
-                desc_param_keys = {
-                    maybe_prefix(base_prefix, k) for k, _ in named_parameters
-                }
-                msg = (
-                    f"There is no module or parameter named {prefix!r} "
-                    f"in {self.module._get_name()}. "
-                    f"The available parameters belonging to {base_prefix} "
-                    f"({module._get_name()}) are: {desc_param_keys}"
-                )
-                raise ValueError(msg)
-
-    @support_quantized_model_reload_from_hp_weights
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-        *,
-        mapper: WeightsMapper | None = None,
-    ) -> set[str]:
-        # Ignore unexpected biases (typically from GPTQ models)
-        self.ignore_unexpected_suffixes.append(".bias")
-
-        mapper = mapper or WeightsMapper()
-        # Many models store quant_config in the base model instead of the causal model.
-        # We look at the causal model's direct children for this reason.
-        modules = (self.module, *self.module.children())
-        iterator = (m.quant_config for m in modules if hasattr(m, "quant_config"))
-        if quant_config := next(iterator, None):
-            # Apply mappings for quantization-specific checkpoint tensors.
-            mapper |= quant_config.get_cache_scale_mapper()
-            mapper |= quant_config.get_checkpoint_weight_mapper()
-            ignore_unexpected_suffixes = quant_config._ignore_unexpected_suffixes
-            self.ignore_unexpected_suffixes.extend(ignore_unexpected_suffixes)
-        mapper |= self.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
-
-        weights = mapper.apply(weights)
-        weights = self._filter_skipped(weights)
-
-        return set(self._load_module("", self.module, weights))
-
-    def _filter_skipped(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in weights:
-            if self._can_skip(name):
-                continue
-
-            yield name, weight
-
-
 def get_fused_shared_expert_layers(
     module: nn.Module,
     moe_cls: type[nn.Module],
@@ -573,72 +283,37 @@ def get_fused_shared_expert_layers(
     return frozenset(fused_layers)
 
 
-def maybe_fuse_shared_experts(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    n_routed_experts: int,
-    n_shared_experts: int,
-    fused_shared_expert_layers: frozenset[int],
-    ckpt_prefix: str = "mlp.shared_experts",
+def split_fused_shared_experts(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    """Route AITER fused-shared-expert checkpoint weights into fused slots.
-
-    When AITER fused-shared-experts is active, shared experts are packed into
-    the routed expert tensor. The checkpoint stores them under `ckpt_prefix`
-    as a single (possibly widened) tensor; this splits it into
-    `n_shared_experts` chunks named `mlp.experts.{n_routed_experts + j}` so
-    the `RoutedExperts` loader treats them as extra experts. Yields the input
-    unchanged when the fusion is inactive, so callers can wrap unconditionally.
-
-    Args:
-        weights: Iterable of `(name, tensor)` checkpoint pairs.
-        n_routed_experts: Number of routed experts; offsets the fused slots.
-        n_shared_experts: Number of shared experts packed into the tensor.
-        ckpt_prefix: Checkpoint module name of the shared experts.
-        fused_shared_expert_layers: Layer indices whose shared expert was fused
-            at construction time, as returned by
-            `get_fused_shared_expert_layers`. Only weights belonging to these
-            layers are routed to fused slots.
-
-    Yields:
-        `(name, tensor)` pairs with shared experts routed to fused slots.
-
-    """
-    if not fused_shared_expert_layers:
-        yield from weights
-        return
-
-    # Match on the dotted boundary so e.g. "mlp.shared_expert." does not also
-    # catch a sibling "mlp.shared_expert_gate".
-    prefix = f"{ckpt_prefix}."
-    for name, loaded_weight in weights:
-        if prefix not in name:
-            yield name, loaded_weight
+    """Checkpoint stream (`checkpoint_transforms`): where AITER fuses
+    `n_shared_experts > 1` shared experts into the routed ones, their one widened
+    tensor (`mlp.shared_experts.*`) chunked into the extra expert slots
+    `mlp.experts.<n_routed_experts + j>`: gate / up on their rows, down on its
+    columns. One shared expert is a rename (`conversion_mapping`)."""
+    # by the name from `layers.`, the same in the checkpoint and in vLLM
+    blocks = {
+        name[max(name.find("layers."), 0) :]: module
+        for name, module in model.named_modules()
+        if getattr(module, "is_fused_shared_expert_enabled", False)
+        and (getattr(module, "n_shared_experts", 1) or 1) > 1
+    }
+    for name, weight in weights:
+        head, found, tail = name.partition(".shared_experts.")
+        block = blocks.get(head[max(head.find("layers."), 0) :]) if found else None
+        if block is None:
+            yield name, weight
             continue
-        if extract_layer_index(name) not in fused_shared_expert_layers:
-            yield name, loaded_weight
-            continue
-        # gate/up split on the output dim; down_proj on the input dim.
-        split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0
-        total = loaded_weight.shape[split_dim]
-        if total % n_shared_experts != 0:
+        tensor = weight if isinstance(weight, torch.Tensor) else weight[...]
+        dim = 1 if "down_proj.weight" in tail and tensor.dim() > 1 else 0
+        n = block.n_shared_experts
+        if tensor.shape[dim] % n:
             raise ValueError(
-                f"FSE shared-expert weight {name!r} has size {total} along axis "
-                f"{split_dim}, not divisible by n_shared_experts={n_shared_experts}."
+                f"Shared experts {name!r}: {tensor.shape[dim]} along dim {dim} is "
+                f"not divisible by n_shared_experts={n}"
             )
-        chunk = total // n_shared_experts
-        for j in range(n_shared_experts):
-            sl = slice(j * chunk, (j + 1) * chunk)
-            if loaded_weight.ndim == 1:
-                chunk_weight = loaded_weight[sl]
-            elif split_dim == 0:
-                chunk_weight = loaded_weight[sl, :]
-            else:
-                chunk_weight = loaded_weight[:, sl]
-            yield (
-                name.replace(prefix, f"mlp.experts.{n_routed_experts + j}."),
-                chunk_weight,
-            )
+        for j, chunk in enumerate(tensor.chunk(n, dim)):
+            yield f"{head}.experts.{block.n_routed_experts + j}.{tail}", chunk
 
 
 def get_spec_layer_idx_from_weight_name(
@@ -668,26 +343,6 @@ def get_spec_layer_idx_from_weight_name(
         ):
             return base + i
     return None
-
-
-def skip_spec_layers(
-    weights: Iterable[tuple[str, torch.Tensor]], config: "PreTrainedConfig"
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Drop MTP spec-layer weights (loaded by the MTP head, not the base model).
-
-    Args:
-        weights: Iterable of `(name, tensor)` checkpoint pairs.
-        config: The model config, passed to `get_spec_layer_idx_from_weight_name`.
-
-    Yields:
-        `(name, tensor)` pairs whose weight is not an MTP-layer weight.
-
-    """
-    return (
-        (name, w)
-        for name, w in weights
-        if get_spec_layer_idx_from_weight_name(config, name) is None
-    )
 
 
 def init_vllm_registered_model(
@@ -1010,39 +665,6 @@ def make_layers(
     return start_layer, end_layer, modules
 
 
-# NOTE: don't use lru_cache here because it can prevent garbage collection
-_model_to_pp_missing_layer_names: dict[int, list[str]] = {}
-
-
-def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
-    """Get the names of the missing layers in a pipeline parallel model."""
-    model_id = id(model)
-    if model_id in _model_to_pp_missing_layer_names:
-        return _model_to_pp_missing_layer_names[model_id]
-
-    missing_layer_names = []
-    for name, module in model.named_modules():
-        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
-            # NOTE: the trailing dot is used to match the prefix of the layer.
-            # without the dot, we could match a layer that is not missing,
-            # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
-            missing_layer_names.append(name + ".")
-    _model_to_pp_missing_layer_names[model_id] = missing_layer_names
-
-    return missing_layer_names
-
-
-def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
-    """Check if a parameter is missing in a pipeline parallel model."""
-    if isinstance(model, (StageMissingLayer, PPMissingLayer)):
-        return True
-
-    return any(
-        name.startswith(missing_layer_name)
-        for missing_layer_name in get_pp_missing_layer_names(model)
-    )
-
-
 def compute_skip_topk_layers(config: "PreTrainedConfig") -> set[int]:
     """Backbone layers that reuse the top-k of the closest preceding indexer
     layer instead of building their own indexer."""
@@ -1358,29 +980,6 @@ direct_register_custom_op(
 )
 
 
-def process_eagle_weight(
-    model: nn.Module,
-    name: str,
-) -> None:
-    """Update EAGLE model flags based on loaded weight name.
-    This should be called during weight loading to detect if a model
-    has its own lm_head or embed_tokens weight.
-
-    Args:
-        model: The model instance (must support EAGLE)
-        name: The name of the weight to process
-
-    """
-    if not supports_any_eagle(model):
-        return
-
-    # To prevent overriding with target model's layers
-    if "lm_head" in name:
-        model.has_own_lm_head = True
-    if "embed_tokens" in name:
-        model.has_own_embed_tokens = True
-
-
 def get_layer_index(feature_layer_index: int, num_hidden_layers: int) -> int:
     """Given a signed vision feature layer, get the number of hidden layers
        needed to leverage it.
@@ -1431,3 +1030,18 @@ def parse_diarized_speaker(speaker: str) -> str | None:
     ):
         return None
     return speaker
+
+
+def observe_eagle_weights(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """An EAGLE draft's checkpoint stream (a `checkpoint_transforms` entry, with
+    `functools.partial(observe_eagle_weights, model)`): a draft shipping its own
+    `lm_head` / `embed_tokens` keeps them (`has_own_lm_head`,
+    `has_own_embed_tokens`), else it shares the target's"""
+    for name, weight in weights:
+        if "lm_head" in name:
+            model.has_own_lm_head = True
+        if "embed_tokens" in name:
+            model.has_own_embed_tokens = True
+        yield name, weight

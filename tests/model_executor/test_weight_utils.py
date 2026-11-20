@@ -14,87 +14,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     drop_checkpoint_cache,
     initialize_single_dummy_weight,
-    load_attention_sink,
     maybe_remap_kv_scale_name,
 )
 from vllm.platforms import current_platform
-
-
-@pytest.mark.parametrize(
-    "checkpoint_heads,runtime_heads,tp_size",
-    [(8, 4, 2), (8, 8, 1), (8, 6, 2), (16, 12, 4)],
-)
-def test_attention_sink_loader_shapes(
-    monkeypatch, checkpoint_heads, runtime_heads, tp_size
-):
-    """Each rank loads its checkpoint heads and disables only padded heads."""
-    monkeypatch.setattr(
-        weight_utils, "get_tensor_model_parallel_world_size", lambda: tp_size
-    )
-    checkpoint = torch.arange(checkpoint_heads, dtype=torch.float32)
-    for tp_rank in range(tp_size):
-        monkeypatch.setattr(
-            weight_utils, "get_tensor_model_parallel_rank", lambda rank=tp_rank: rank
-        )
-        param = torch.nn.Parameter(torch.zeros(runtime_heads), requires_grad=False)
-        load_attention_sink(param, checkpoint)
-        local_heads = checkpoint.chunk(tp_size)[tp_rank]
-        expected = torch.cat(
-            (
-                local_heads,
-                torch.full((runtime_heads - local_heads.numel(),), -torch.inf),
-            )
-        )
-        assert torch.equal(param, expected)
-
-
-@pytest.mark.parametrize(
-    "checkpoint_shape,runtime_shape,error",
-    [
-        ((2, 4), (4,), RuntimeError),
-        ((8,), (2, 2), AssertionError),
-        ((7,), (4,), ValueError),
-        ((8,), (3,), AssertionError),
-    ],
-)
-def test_attention_sink_loader_rejects_invalid_shapes(
-    monkeypatch, checkpoint_shape, runtime_shape, error
-):
-    """Invalid sink shapes fail before changing the runtime parameter."""
-    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_rank", lambda: 0)
-    param = torch.nn.Parameter(torch.ones(runtime_shape), requires_grad=False)
-    with pytest.raises(error):
-        load_attention_sink(param, torch.zeros(checkpoint_shape))
-    assert torch.equal(param, torch.ones(runtime_shape))
-
-
-@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float32])
-def test_attention_sink_loader_keeps_param_dtype(monkeypatch, param_dtype):
-    """A checkpoint dtype different from the runtime parameter is cast, not copied."""
-    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_rank", lambda: 0)
-    param = torch.nn.Parameter(torch.zeros(4, dtype=param_dtype), requires_grad=False)
-    load_attention_sink(param, torch.arange(4, dtype=torch.float32))
-    assert param.dtype == param_dtype
-    assert torch.equal(param.float(), torch.arange(4, dtype=torch.float32))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_attention_sink_loader_accepts_cpu_checkpoint(monkeypatch):
-    """Sinks are normally loaded from CPU checkpoints into device parameters."""
-    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_rank", lambda: 1)
-    param = torch.nn.Parameter(
-        torch.full((6,), 123.0, device="cuda"), requires_grad=False
-    )
-    # The test suite sets the default device, so pin the checkpoint to CPU.
-    checkpoint = torch.arange(8, dtype=torch.float32, device="cpu")
-    load_attention_sink(param, checkpoint)
-    assert param.device.type == "cuda"
-    expected = torch.arange(4, 8, dtype=torch.float32, device="cpu")
-    assert torch.equal(param[:4].cpu(), expected)
-    assert torch.isinf(param[4:]).all() and (param[4:] < 0).all()
 
 
 @pytest.mark.parametrize(
@@ -107,7 +29,8 @@ def test_make_attention_sink_registers_loader_and_padding(num_heads, dtype):
     assert sink.dtype == (dtype or torch.get_default_dtype())
     assert sink.requires_grad is False
     assert torch.isinf(sink).all() and (sink < 0).all()
-    assert sink.weight_loader is load_attention_sink
+    # sharded over heads by the ops loader, padded heads kept at -inf
+    assert sink.shard_dim == 0 and sink.pad_value == -float("inf")
 
 
 def test_download_weights_from_hf():
@@ -418,11 +341,18 @@ class TestKvCacheScaleMapper:
         """GPT-J's attention module is itself named `attn`, so the default
         rule, which skips names already ending in `.attn.k_scale`, must not
         leave its checkpoint scales pointing at the outer module."""
+        from transformers.core_model_loading import rename_source_key
+
+        from vllm.model_executor.model_loader.conversion_mapping import (
+            QKV,
+            rename_mapper,
+        )
         from vllm.model_executor.models.gpt_j import GPTJForCausalLM
 
-        # AutoWeightsLoader does `mapper |= cache_scale_mapper`
-        combined = GPTJForCausalLM.hf_to_vllm_mapper | self._mapper()
-        assert combined._map_name(name) == expected
+        # the ops loader: the model's renamings, the cache scales', then converters
+        combined = rename_mapper(GPTJForCausalLM) | self._mapper()
+        mapped, _ = rename_source_key(combined._map_name(name), [], [QKV])
+        assert mapped == expected
 
 
 @pytest.mark.parametrize(

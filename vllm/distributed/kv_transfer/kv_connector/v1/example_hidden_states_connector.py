@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from packaging.version import Version
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -44,27 +44,6 @@ def extract_from_kv_cache(
     return kv_cache[slot_mapping // block_size, :, slot_mapping % block_size][
         :num_tokens
     ]
-
-
-def load_hidden_states(path: str) -> dict[str, torch.Tensor]:
-    """Load hidden states written by ExampleHiddenStatesConnector.
-
-    Blocks (without polling) until the async write is complete by
-    acquiring a shared flock on the companion lock file.  The kernel
-    puts the caller to sleep until the writer releases its exclusive lock.
-
-    Args:
-        path: The file path returned in kv_transfer_params["hidden_states_path"].
-
-    Returns:
-        Dict with "hidden_states" and "token_ids" tensors.
-
-    """
-    lock_path = path + ".lock"
-    with open(lock_path) as lf:
-        fcntl.flock(lf, fcntl.LOCK_SH)  # sleeps until writer releases LOCK_EX
-        data = load_file(path, device="cpu")
-    return data
 
 
 def cleanup_hidden_states(path: str, keep_hidden_states: bool = False) -> None:

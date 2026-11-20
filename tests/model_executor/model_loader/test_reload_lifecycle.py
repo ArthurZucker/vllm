@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.model_loader import ops_loader
 from vllm.model_executor.model_loader.reload import (
     finish_reload,
     record_metadata_for_reloading,
@@ -16,7 +17,6 @@ from vllm.model_executor.model_loader.reload import (
     weight_update_active,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 _MODEL_CONFIG = SimpleNamespace(
     word_embeddings_untied_by_checkpoint=False, quantization=None, dtype=torch.float32
@@ -38,7 +38,7 @@ class _TinyModel(torch.nn.Module):
         for name, weight in weights:
             self.observed.append(weight_update_active())
             param = params[name]
-            getattr(param, "weight_loader", default_weight_loader)(param, weight)
+            ops_loader.current_load_into()(name, param, weight)
         return set(params)
 
 

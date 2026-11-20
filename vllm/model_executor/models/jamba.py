@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Jamba model."""
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -47,8 +46,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -380,17 +377,6 @@ class JambaForCausalLM(
     SupportsPP,
     IsHybrid,
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".self_attn.": ".", ".A_log": ".A"},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".feed_forward.gate_proj": (".feed_forward.gate_up_proj", 0),
-            ".feed_forward.up_proj": (".feed_forward.gate_up_proj", 1),
-        },
-    )
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -493,10 +479,6 @@ class JambaForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class JambaForSequenceClassification(JambaForCausalLM):
     is_pooling_model = True
@@ -510,7 +492,7 @@ class JambaForSequenceClassification(JambaForCausalLM):
 
         # TODO: The original reward weights have float32 accuracy data, we
         # would like to load them in fp32 to get that extra precision.
-        # Currently weight_loader passes the weight which is already in bf16
+        # Currently the loader passes the weight which is already in bf16
         self.score = nn.Linear(
             config.hidden_size,
             num_labels,

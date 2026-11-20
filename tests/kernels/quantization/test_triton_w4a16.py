@@ -282,7 +282,6 @@ def test_triton_w4a16_process_weights_after_loading_repacks_layout():
     )
 
     # Build dummy layer with vLLM parameter wrappers.
-    weight_loader = lambda *args, **kwargs: None
 
     class DummyLayer(torch.nn.Module):
         pass
@@ -292,7 +291,6 @@ def test_triton_w4a16_process_weights_after_loading_repacks_layout():
         "weight_packed",
         PackedvLLMParameter(
             data=w_ckpt_nk8,
-            weight_loader=weight_loader,
             input_dim=1,
             output_dim=0,
             packed_factor=8,
@@ -303,7 +301,6 @@ def test_triton_w4a16_process_weights_after_loading_repacks_layout():
         "weight_scale",
         GroupQuantScaleParameter(
             data=scales_ckpt_nkg,
-            weight_loader=weight_loader,
             input_dim=1,
             output_dim=0,
         ),
@@ -312,7 +309,6 @@ def test_triton_w4a16_process_weights_after_loading_repacks_layout():
         "weight_zero_point",
         PackedColumnParameter(
             data=zeros_ckpt_n8kg,
-            weight_loader=weight_loader,
             output_dim=0,
             packed_factor=8,
             packed_dim=0,
@@ -392,8 +388,6 @@ def test_triton_w4a16_process_weights_after_loading_keeps_gptq_qzeros_layout():
         w_zp_param_name="qzeros",
     )
 
-    weight_loader = lambda *args, **kwargs: None
-
     class DummyLayer(torch.nn.Module):
         pass
 
@@ -402,7 +396,6 @@ def test_triton_w4a16_process_weights_after_loading_keeps_gptq_qzeros_layout():
         "qweight",
         PackedvLLMParameter(
             data=w_gptq_k8n,
-            weight_loader=weight_loader,
             input_dim=0,
             output_dim=1,
             packed_factor=8,
@@ -413,7 +406,6 @@ def test_triton_w4a16_process_weights_after_loading_keeps_gptq_qzeros_layout():
         "scales",
         GroupQuantScaleParameter(
             data=scales_gptq_gn,
-            weight_loader=weight_loader,
             input_dim=0,
             output_dim=1,
         ),
@@ -422,7 +414,6 @@ def test_triton_w4a16_process_weights_after_loading_keeps_gptq_qzeros_layout():
         "qzeros",
         PackedvLLMParameter(
             data=zeros_gptq_gn8,
-            weight_loader=weight_loader,
             input_dim=0,
             output_dim=1,
             packed_factor=8,

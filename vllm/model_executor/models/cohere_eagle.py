@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -21,11 +21,9 @@ from vllm.model_executor.models.commandr import (
 )
 
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -147,16 +145,13 @@ class EagleCohereForCausalLM(CohereForCausalLM):
         nn.Module.__init__(self)
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-        if self.config.tie_word_embeddings:
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={"model.embed_tokens.": None}
-            )
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = CohereEagleModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
         )
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(
@@ -178,22 +173,3 @@ class EagleCohereForCausalLM(CohereForCausalLM):
                 f"{type(self).__name__} does not support multimodal inputs yet."
             )
         return self.model(input_ids, positions, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        def _track_and_forward(inputs):
-            name, weight = inputs
-            process_eagle_weight(self, name)
-            return name, weight
-
-        loader = AutoWeightsLoader(self)
-
-        loaded_weight_names = loader.load_weights(
-            map(_track_and_forward, weights), mapper=self.hf_to_vllm_mapper
-        )
-
-        # Embed tokens are tied with the target model and therefore not
-        # present in the EAGLE checkpoint; mark them as loaded explicitly to
-        # avoid a spurious "weight not found" warning from the default
-        # weight loader.
-        loaded_weight_names.add("model.embed_tokens.weight")
-        return loaded_weight_names

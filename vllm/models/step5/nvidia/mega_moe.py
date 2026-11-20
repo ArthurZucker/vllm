@@ -19,7 +19,6 @@ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.deep_gemm import _import_deep_gemm
 
 
@@ -200,7 +199,6 @@ class Step5MegaMoEExperts(nn.Module):
                 ),
                 requires_grad=False,
             )
-            set_weight_attrs(param, {"weight_loader": self.weight_loader})
             self.register_parameter(f"{name}_weight", param)
             if self.fp8:
                 scale = nn.Parameter(
@@ -209,7 +207,6 @@ class Step5MegaMoEExperts(nn.Module):
                     ),
                     requires_grad=False,
                 )
-                set_weight_attrs(scale, {"weight_loader": self.weight_loader})
                 self.register_parameter(f"{name}_weight_scale_inv", scale)
             if self.nvfp4:
                 for suffix, shape, scale_dtype in (
@@ -236,49 +233,12 @@ class Step5MegaMoEExperts(nn.Module):
                     scale = nn.Parameter(
                         torch.empty(shape, dtype=scale_dtype), requires_grad=False
                     )
-                    set_weight_attrs(scale, {"weight_loader": self.weight_loader})
                     self.register_parameter(f"{name}_{suffix}", scale)
+        # the experts stacked on disk ([num_experts, ...]): this rank's, from
+        # `expert_start` (`conversion_mapping`); a reload once `ready` is refused
         self.quant_method = _MegaMoEMethod()
         self.ready = False
         self.pool = None
-
-    def weight_loader(
-        self,
-        param,
-        loaded_weight,
-        weight_name=None,
-        shard_id=None,
-        expert_id=None,
-        return_success=False,
-    ):
-        if self.ready:
-            raise RuntimeError("Reloading transformed MegaMoE weights is unsupported")
-        target = param.data
-        if expert_id is None:
-            if loaded_weight.shape[0] == self.num_experts:
-                loaded_weight = loaded_weight.narrow(
-                    0, self.expert_start, self.num_local_experts
-                )
-        else:
-            local_id = expert_id - self.expert_start
-            if not 0 <= local_id < self.num_local_experts:
-                return False if return_success else None
-            target = target[local_id]
-            if shard_id in ("w1", "w3"):
-                if param.ndim == 2:
-                    target = target[0 if shard_id == "w1" else 1]
-                else:
-                    size = target.shape[0] // 2
-                    target = target.narrow(0, 0 if shard_id == "w1" else size, size)
-            elif shard_id != "w2":
-                raise ValueError(f"Invalid MegaMoE weight shard: {shard_id}")
-        if target.shape != loaded_weight.shape:
-            raise ValueError(
-                f"MegaMoE weight shape mismatch: {target.shape} "
-                f"vs {loaded_weight.shape}"
-            )
-        target.copy_(loaded_weight)
-        return True if return_success else None
 
     def _convert_fp8(self, name):
         cast = import_module(f"{self.dg.__name__}.utils").per_token_cast_to_fp8
@@ -447,9 +407,6 @@ class Step5MegaMoEExperts(nn.Module):
 
     def forward(self, hidden_states, topk_weights, topk_ids, padding=None):
         return self._forward_impl(hidden_states, topk_weights, topk_ids, padding)
-
-
-Step5MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
 
 class Step5MegaMoE(nn.Module):

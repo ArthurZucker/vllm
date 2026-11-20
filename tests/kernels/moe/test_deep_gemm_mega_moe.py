@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepGEMM MegaMoE experts: kernel-layout weight loading, shared-expert fusion,
-input staging, and numerics against a dequantized reference for every routed
-format, activation and shared-expert fusion in the feature matrix."""
+"""DeepGEMM MegaMoE experts: loading, kernel layout, staging and numerics."""
 
 from types import SimpleNamespace
 
@@ -31,12 +29,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kNvfp4DynamicToken,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
     record_metadata_for_reloading,
 )
-from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import _import_deep_gemm, is_deep_gemm_supported
 
@@ -87,6 +85,22 @@ def _make_experts(**kwargs) -> DeepGemmMegaMoEExperts:
     kwargs.setdefault("activation", MegaMoEActivation())
     kwargs.setdefault("weight_format", MEGA_MOE_MXFP4)
     return DeepGemmMegaMoEExperts(vllm_config, **kwargs)
+
+
+def _load(experts, weights) -> set[str]:
+    """Checkpoint tensors through the experts' conversion ops, then the post-load
+    kernel layout."""
+    loaded = load_with_ops(experts, list(weights))
+    experts.quant_method.process_weights_after_loading(experts)
+    return loaded
+
+
+@pytest.fixture
+def single_ep_rank(monkeypatch):
+    monkeypatch.setattr(
+        f"{DeepGemmMegaMoEExperts.__module__}.get_ep_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
 
 
 def test_deep_gemm_mega_moe_capture_precedes_eplb(monkeypatch):
@@ -143,8 +157,8 @@ def test_deep_gemm_mega_moe_capture_precedes_eplb(monkeypatch):
         experts(torch.empty(2, 8), torch.empty(2, 2), topk_ids)
 
 
-@requires_sm90_mega_moe_on_sm90
-def test_deep_gemm_mega_moe_weight_loader_uses_ep_expert_ownership():
+def test_deep_gemm_mega_moe_loads_this_ranks_experts():
+    """Each rank reads its own experts, merged gate rows then up rows."""
     experts = _make_experts(
         num_experts=4,
         num_local_experts=2,
@@ -153,55 +167,22 @@ def test_deep_gemm_mega_moe_weight_loader_uses_ep_expert_ownership():
         hidden_size=128,
         intermediate_size=128,
     )
-
-    nonlocal_weight = torch.ones(128, 64, dtype=torch.uint8)
-    assert (
-        experts.weight_loader(
-            experts.w13_weight,
-            nonlocal_weight,
-            "experts.w13_weight",
-            shard_id="w1",
-            expert_id=1,
-            return_success=True,
+    generator = torch.Generator().manual_seed(0)
+    ckpt = {
+        (e, shard): torch.randint(
+            0, 256, (128, 64), dtype=torch.uint8, generator=generator
         )
-        is False
+        for e in range(4)
+        for shard in ("w1", "w3", "w2")
+    }
+    loaded = load_with_ops(
+        experts, [(f"{e}.{shard}.weight", t) for (e, shard), t in ckpt.items()]
     )
-
-    # Bytes of two equal positive FP4 codes are the same in every kernel layout.
-    w1 = torch.full((128, 64), 0x33, dtype=torch.uint8)
-    w3 = torch.full((128, 64), 0x77, dtype=torch.uint8)
-    w2 = torch.full((128, 64), 0x11, dtype=torch.uint8)
-
-    assert experts.weight_loader(
-        experts.w13_weight,
-        w1,
-        "experts.w13_weight",
-        shard_id="w1",
-        expert_id=2,
-        return_success=True,
-    )
-    assert experts.weight_loader(
-        experts.w13_weight,
-        w3,
-        "experts.w13_weight",
-        shard_id="w3",
-        expert_id=2,
-        return_success=True,
-    )
-    assert experts.weight_loader(
-        experts.w2_weight,
-        w2,
-        "experts.w2_weight",
-        shard_id="w2",
-        expert_id=2,
-        return_success=True,
-    )
-
-    interleaved = experts.w13_weight[0].view(torch.uint8).view(16, 2, 8, 64)
-    assert torch.equal(interleaved[:, 0], w1.view(16, 8, 64))
-    assert torch.equal(interleaved[:, 1], w3.view(16, 8, 64))
-    assert torch.equal(experts.w2_weight[0].view(torch.uint8), w2)
-    assert torch.count_nonzero(experts.w13_weight[1]) == 0
+    assert {"w13_weight", "w2_weight"} <= loaded
+    for slot, e in enumerate((2, 3)):
+        w13 = torch.cat([ckpt[e, "w1"], ckpt[e, "w3"]])
+        assert torch.equal(experts.w13_weight[slot].view(torch.uint8), w13)
+        assert torch.equal(experts.w2_weight[slot].view(torch.uint8), ckpt[e, "w2"])
 
 
 def _reference_mega_moe_layout(w13, s13, w2, s2):
@@ -239,7 +220,22 @@ def _make_mega_moe_experts(
     )
 
 
-def _load_mega_moe_checkpoint_shuffled(experts, num_logical_experts, seed):
+def _per_expert(ckpt, inter):
+    """`[experts, ...]` tensors as the checkpoint stores them, one per expert and
+    projection (`N.w1.weight`); w1 and w3 share a global scale."""
+    for name, tensor in ckpt.items():
+        param, _, suffix = name.partition("_")
+        for e, t in enumerate(tensor):
+            if param == "w2":
+                yield f"{e}.w2.{suffix}", t
+            elif t.dim() == 0:
+                yield from ((f"{e}.{shard}.{suffix}", t) for shard in ("w1", "w3"))
+            else:
+                yield f"{e}.w1.{suffix}", t[:inter]
+                yield f"{e}.w3.{suffix}", t[inter:]
+
+
+def _mega_moe_checkpoint(experts, num_logical_experts, seed):
     hidden, inter = experts.hidden_size, experts.intermediate_size
     routed = experts.weight_format.routed
     group = routed.scale_group_k
@@ -263,32 +259,18 @@ def _load_mega_moe_checkpoint_shuffled(experts, num_logical_experts, seed):
     if routed.has_global_scale:
         for name in ("w13_weight_scale_2", "w2_weight_scale_2", "w2_input_scale"):
             ckpt[name] = torch.rand(num_logical_experts, generator=generator) + 0.5
-    shards = []
-    for expert_id in range(num_logical_experts):
-        for name, tensor in ckpt.items():
-            if name.startswith("w2_"):
-                shards.append((name, tensor[expert_id], "w2", expert_id))
-            elif tensor.dim() == 1:
-                # w1 and w3 share one global scale.
-                shards.append((name, tensor[expert_id], "w1", expert_id))
-                shards.append((name, tensor[expert_id], "w3", expert_id))
-            else:
-                shards.append((name, tensor[expert_id, :inter], "w1", expert_id))
-                shards.append((name, tensor[expert_id, inter:], "w3", expert_id))
-    for i in torch.randperm(len(shards), generator=generator).tolist():
-        name, loaded_weight, shard_id, expert_id = shards[i]
-        if name.endswith("weight_scale"):
-            loaded_weight = loaded_weight.view(routed.scale_dtype)
-        param = getattr(experts, name)
-        assert param.weight_loader(
-            param,
-            loaded_weight,
-            f"experts.{name}",
-            shard_id=shard_id,
-            expert_id=expert_id,
-            return_success=True,
-        )
     return ckpt
+
+
+def _load_mega_moe_checkpoint(experts, ckpt):
+    scale_dtype = experts.weight_format.routed.scale_dtype
+    _load(
+        experts,
+        (
+            (name, t.view(scale_dtype) if name.endswith("weight_scale") else t)
+            for name, t in _per_expert(ckpt, experts.intermediate_size)
+        ),
+    )
 
 
 def _expected_mega_moe_layout(ckpt, num_local_experts, num_logical_experts):
@@ -343,10 +325,13 @@ def _assert_mega_moe_layout(experts, expected):
 
 @requires_sm90_mega_moe_on_sm90
 @pytest.mark.parametrize("weight_format", [MEGA_MOE_MXFP4, MEGA_MOE_NVFP4])
-def test_deep_gemm_mega_moe_loads_shards_into_kernel_layout(weight_format):
-    """Shards in any order, including EPLB replicas, land in DeepGEMM's layout."""
+def test_deep_gemm_mega_moe_loads_checkpoint_into_kernel_layout(
+    weight_format, single_ep_rank
+):
+    """Per-expert tensors, EPLB replicas included, land in DeepGEMM's layout."""
     experts = _make_mega_moe_experts(4, 3, weight_format)
-    ckpt = _load_mega_moe_checkpoint_shuffled(experts, 3, seed=0)
+    ckpt = _mega_moe_checkpoint(experts, 3, seed=0)
+    _load_mega_moe_checkpoint(experts, ckpt)
     _assert_mega_moe_layout(experts, _expected_mega_moe_layout(ckpt, 4, 3))
     # DeepGEMM's MN-major scale strides.
     group_k = 4 * weight_format.routed.scale_group_k
@@ -360,58 +345,34 @@ def test_deep_gemm_mega_moe_loads_shards_into_kernel_layout(weight_format):
 
 
 @requires_sm90_mega_moe_on_sm90
-@pytest.mark.parametrize("weight_format", [MEGA_MOE_MXFP4, MEGA_MOE_NVFP4])
-def test_deep_gemm_mega_moe_reload_overwrites_kernel_layout_in_place(weight_format):
-    """A second load must update the live kernel tensors without reallocating."""
-    experts = _make_mega_moe_experts(2, 2, weight_format)
-    _load_mega_moe_checkpoint_shuffled(experts, 2, seed=0)
-    data_ptrs = [param.data_ptr() for param in experts.parameters()]
-    ckpt = _load_mega_moe_checkpoint_shuffled(experts, 2, seed=1)
-    assert [param.data_ptr() for param in experts.parameters()] == data_ptrs
-    _assert_mega_moe_layout(experts, _expected_mega_moe_layout(ckpt, 2, 2))
-
-
-@requires_sm90_mega_moe_on_sm90
 def test_deep_gemm_mega_moe_layerwise_reload():
-    """Layerwise reload first loads each real shard into a meta parameter."""
+    """Layerwise reload restores the checkpoint layout, then lays it out again."""
     experts = _make_mega_moe_experts(2, 2)
-    _load_mega_moe_checkpoint_shuffled(experts, 2, seed=0)
+    load_with_ops(experts, _per_expert(_mega_moe_checkpoint(experts, 2, 0), 384))
     record_metadata_for_reloading(experts)
+    experts.prepare_weights()
     initialize_layerwise_reload(experts)
-    ckpt = _load_mega_moe_checkpoint_shuffled(experts, 2, seed=1)
+    ckpt = _mega_moe_checkpoint(experts, 2, seed=1)
+    load_with_ops(experts, _per_expert(ckpt, 384))
     finalize_layerwise_reload(experts, model_config=None)
     _assert_mega_moe_layout(experts, _expected_mega_moe_layout(ckpt, 2, 2))
 
 
 @pytest.mark.skipif(not has_sm90_mega_moe, reason="SM90 repacks MXFP4 scales per row")
 def test_deep_gemm_mega_moe_sm90_rejects_scale_rows_beyond_kernel_range():
-    """A scale row wider than the SM90 kernel range fails the load, naming the
-    shard, and writes nothing."""
+    """A scale row wider than the SM90 kernel range fails, naming the slot."""
     experts = _make_mega_moe_experts(1, 1)
-    scale = torch.full((384, 8), 120, dtype=torch.uint8)
-
-    def load():
-        experts.weight_loader(
-            experts.w13_weight_scale,
-            scale,
-            "experts.w13_weight_scale",
-            shard_id="w3",
-            expert_id=0,
-        )
-
+    ckpt = _mega_moe_checkpoint(experts, 1, seed=0)
     # 11 below the row maximum is the widest row the kernel takes.
-    scale[5, 3] = 109
-    load()
-    loaded = experts.w13_weight_scale.clone()
-    scale[5, 3] = 108
-    with pytest.raises(ValueError, match=r"expert 0 w3 \(experts.w13_weight_scale\)"):
-        load()
-    assert torch.equal(experts.w13_weight_scale, loaded)
+    ckpt["w13_weight_scale"][0, 5] = 120
+    ckpt["w13_weight_scale"][0, 5, 3] = 108
+    with pytest.raises(ValueError, match="expert slot 0"):
+        _load_mega_moe_checkpoint(experts, ckpt)
 
 
-def test_deep_gemm_mega_moe_nvfp4_l2_scale_covers_every_expert():
+def test_deep_gemm_mega_moe_nvfp4_l2_scale_covers_every_expert(monkeypatch):
     """Every rank quantizes L2 inputs with the max input scale over all experts,
-    including those it does not own, so EPLB can move experts between ranks."""
+    including other ranks', so EPLB can move experts between ranks."""
     experts = _make_experts(
         num_experts=4,
         num_local_experts=2,
@@ -422,71 +383,47 @@ def test_deep_gemm_mega_moe_nvfp4_l2_scale_covers_every_expert():
         weight_format=MEGA_MOE_NVFP4,
     )
     assert experts.l2_activation_scale == 1.0
-    for expert_id, scale in enumerate((0.5, 4.0, 1.0, 2.0)):
-        loaded = experts.weight_loader(
-            experts.w2_input_scale,
-            torch.tensor(scale),
-            "experts.w2_input_scale",
-            shard_id="w2",
-            expert_id=expert_id,
-            return_success=True,
-        )
-        assert loaded == (expert_id >= 2)
-    assert experts.l2_activation_scale == 4.0
-    assert experts.w2_input_scale.tolist() == [1.0, 2.0]
-    # A reload replaces the expert's scale rather than keeping the old max.
-    experts.weight_loader(
-        experts.w2_input_scale,
-        torch.tensor(0.25),
-        "experts.w2_input_scale",
-        shard_id="w2",
-        expert_id=1,
+    module = DeepGemmMegaMoEExperts.__module__
+    monkeypatch.setattr(
+        f"{module}.get_ep_group",
+        lambda: SimpleNamespace(world_size=2, device_group=None),
     )
-    assert experts.l2_activation_scale == 2.0
+    # The other rank owns the largest scale.
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda t, op, group: t.clamp_(min=4.0)
+    )
+    _load(
+        experts,
+        [
+            (f"{e}.w2.input_scale", torch.tensor(scale))
+            for e, scale in enumerate((0.5, 4.0, 1.0, 2.0))
+        ],
+    )
+    assert experts.w2_input_scale.tolist() == [1.0, 2.0]
+    assert experts.l2_activation_scale == 4.0
     # Global scales are expert weights that EPLB moves.
     assert len(experts.get_expert_weights()) == 7
 
 
-def test_deep_gemm_mega_moe_nvfp4_rejects_mismatched_l1_scales():
+def test_deep_gemm_mega_moe_nvfp4_rejects_mismatched_l1_scales(single_ep_rank):
     """The kernel takes one L1 alpha per expert, so w1 and w3 must agree."""
     experts = _make_mega_moe_experts(1, 1, MEGA_MOE_NVFP4)
-
-    def load(shard_id, scale):
-        experts.weight_loader(
-            experts.w13_weight_scale_2,
-            torch.tensor(scale),
-            "experts.w13_weight_scale_2",
-            shard_id=shard_id,
-            expert_id=0,
+    _load(
+        experts,
+        [
+            ("0.w1.weight_scale_2", torch.tensor(0.5)),
+            ("0.w3.weight_scale_2", torch.tensor(0.5)),
+        ],
+    )
+    assert experts.w13_weight_scale_2.tolist() == [0.5]
+    with pytest.raises(ValueError):
+        load_with_ops(
+            experts,
+            [
+                ("0.w1.weight_scale_2", torch.tensor(1.0)),
+                ("0.w3.weight_scale_2", torch.tensor(4.0)),
+            ],
         )
-
-    load("w1", 0.5)
-    load("w3", 0.5)
-    # A reload may change the scale while the old pair is still live.
-    load("w3", 2.0)
-    load("w1", 2.0)
-    load("w1", 1.0)
-    with pytest.raises(ValueError, match="one L1 scale per expert"):
-        load("w3", 4.0)
-
-
-def test_deep_gemm_mega_moe_nvfp4_meta_load_skips_host_scales():
-    """Reload dry runs load meta stand-ins, which must not reach host state."""
-    experts = _make_mega_moe_experts(1, 1, MEGA_MOE_NVFP4)
-    for name, shard_id in (
-        ("w2_input_scale", "w2"),
-        ("w13_weight_scale_2", "w1"),
-        ("w13_weight_scale_2", "w3"),
-    ):
-        assert experts.weight_loader(
-            getattr(experts, name).to("meta"),
-            torch.empty((), device="meta"),
-            f"experts.{name}",
-            shard_id=shard_id,
-            expert_id=0,
-            return_success=True,
-        )
-    assert experts.l2_activation_scale == 1.0
 
 
 @pytest.mark.parametrize("intermediate_size", [512, 2304])
@@ -503,9 +440,9 @@ def test_deep_gemm_mega_moe_preserves_checkpoint_dimensions(intermediate_size):
 
     assert experts.intermediate_size == intermediate_size
     assert experts.w13_weight.shape == (2, 2 * intermediate_size, 64)
-    assert experts.w13_weight_scale.shape == (2, 2 * intermediate_size, 1)
+    assert experts.w13_weight_scale.shape == (2, 2 * intermediate_size, 4)
     assert experts.w2_weight.shape == (2, 128, intermediate_size // 2)
-    assert experts.w2_weight_scale.shape == (2, 128, intermediate_size // 128)
+    assert experts.w2_weight_scale.shape == (2, 128, intermediate_size // 32)
     transformed = (*experts.l1_weights, *experts.l2_weights)
     for actual, param in zip(transformed, experts.parameters()):
         assert actual.data_ptr() == param.data_ptr()
@@ -534,8 +471,7 @@ def _shared_mlp(
     )
 
 
-def test_deep_gemm_mega_moe_loads_shared_experts_into_kernel_layout(monkeypatch):
-    """Shared expert shards land directly in the MegaMoE kernel layout."""
+def _shared_experts(monkeypatch, hidden, inter, scale_block=(1, 32)):
     monkeypatch.setattr(
         DeepGemmMegaMoEExperts, "_kernel_fuses_shared_experts", lambda self, spec: True
     )
@@ -544,43 +480,73 @@ def test_deep_gemm_mega_moe_loads_shared_experts_into_kernel_layout(monkeypatch)
         num_local_experts=2,
         experts_start_idx=0,
         top_k=1,
-        hidden_size=256,
-        intermediate_size=384,
-        shared_experts=_shared_mlp(256, 384),
+        hidden_size=hidden,
+        intermediate_size=inter,
+        shared_experts=_shared_mlp(hidden, inter, scale_block=scale_block),
     )
     assert experts.has_fused_shared_experts
+    return experts
+
+
+@pytest.mark.parametrize("fused_on_disk", [False, True])
+def test_deep_gemm_mega_moe_loads_shared_experts_into_kernel_layout(
+    monkeypatch, fused_on_disk
+):
+    """Shared expert tensors land in the MegaMoE kernel layout; block scales
+    coarser than 1x32 (128x128) are repeated to it."""
     hidden, inter = 256, 384
+    experts = _shared_experts(monkeypatch, hidden, inter, scale_block=(128, 128))
     generator = torch.Generator().manual_seed(42)
 
     def rand(*shape):
         return torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
 
     w1, w3, w2 = rand(inter, hidden), rand(inter, hidden), rand(hidden, inter)
-    s1, s3, s2 = (
-        rand(inter, hidden // 32),
-        rand(inter, hidden // 32),
-        rand(hidden, inter // 32),
-    )
+    s1, s3 = rand(inter // 128, hidden // 128), rand(inter // 128, hidden // 128)
+    s2 = rand(hidden // 128, inter // 128)
     fp8, e8m0 = torch.float8_e4m3fn, torch.float8_e8m0fnu
-    # The down shard arrives as `.w2.` (MTP, DSpark) or `.down_proj.` (mapped).
-    for name, data in [
-        ("shared_experts.w1.weight", w1.view(fp8)),
-        ("shared_experts.w3.weight", w3.view(fp8)),
-        ("shared_experts.down_proj.weight", w2.view(fp8)),
-        ("shared_experts.w1.weight_scale", s1.view(e8m0)),
-        ("shared_experts.w3.weight_scale", s3.view(e8m0)),
-        ("shared_experts.w2.weight_scale", s2.view(e8m0)),
-    ]:
-        loaded = experts.load_shared_expert_weight(f"ffn.{name}", data)
-        # Weight tracking checks this name against the registered parameters.
-        assert loaded in {f"ffn.experts.{n}" for n, _ in experts.named_parameters()}
+    gate_up = (
+        [
+            ("shared_experts.gate_up_proj.weight", torch.cat([w1, w3]).view(fp8)),
+            (
+                "shared_experts.gate_up_proj.weight_scale_inv",
+                torch.cat([s1, s3]).view(e8m0),
+            ),
+        ]
+        if fused_on_disk
+        else [
+            ("shared_experts.w1.weight", w1.view(fp8)),
+            ("shared_experts.up_proj.weight", w3.view(fp8)),
+            ("shared_experts.w1.weight_scale_inv", s1.view(e8m0)),
+            ("shared_experts.up_proj.weight_scale_inv", s3.view(e8m0)),
+        ]
+    )
+    loaded = _load(
+        experts,
+        [
+            *gate_up,
+            ("shared_experts.down_proj.weight", w2.view(fp8)),
+            ("shared_experts.w2.weight_scale_inv", s2.view(e8m0)),
+        ],
+    )
+    assert {
+        n for n, _ in experts.named_parameters() if n.startswith("shared_")
+    } <= loaded
 
-    def l1_halves():
-        return experts.shared_l1_weight.view(torch.uint8).view(-1, 2, 8, hidden)
+    def repeat(s):
+        return s.repeat_interleave(128, 0).repeat_interleave(4, 1)
 
     # Every tensor matches DeepGEMM's batched transform of the checkpoint.
     expected = _reference_mega_moe_layout(
-        *(t.unsqueeze(0) for t in (torch.cat([w1, w3]), torch.cat([s1, s3]), w2, s2))
+        *(
+            t.unsqueeze(0)
+            for t in (
+                torch.cat([w1, w3]),
+                torch.cat([repeat(s1), repeat(s3)]),
+                w2,
+                repeat(s2),
+            )
+        )
     )
     actual = (
         experts.shared_l1_weight,
@@ -590,15 +556,6 @@ def test_deep_gemm_mega_moe_loads_shared_experts_into_kernel_layout(monkeypatch)
     )
     for tensor, reference in zip(actual, expected):
         assert torch.equal(tensor.view(reference.dtype), reference[0])
-    # A reload of one shard overwrites in place and leaves the other half alone.
-    ptr = experts.shared_l1_weight.data_ptr()
-    w1b = rand(inter, hidden)
-    experts.load_shared_expert_weight("shared_experts.w1.weight", w1b.view(fp8))
-    assert experts.shared_l1_weight.data_ptr() == ptr
-    assert torch.equal(l1_halves()[:, 0], w1b.view(-1, 8, hidden))
-    assert torch.equal(l1_halves()[:, 1], w3.view(-1, 8, hidden))
-    with pytest.raises(ValueError):
-        experts.load_shared_expert_weight("shared_experts.gate_up_proj.weight", w1)
 
 
 @pytest.mark.skipif(
@@ -606,68 +563,37 @@ def test_deep_gemm_mega_moe_loads_shared_experts_into_kernel_layout(monkeypatch)
     or not hasattr(_import_deep_gemm(), "requantize_fp8_weights_for_sm90_mega_moe"),
     reason="The installed DeepGEMM has no SM90 MegaMoE requantization",
 )
-def test_deep_gemm_mega_moe_sm90_requantizes_reloaded_shared_shards(monkeypatch):
-    """SM90 requantizes the shared shards a load wrote and refuses a weight or a
-    scale that arrived alone."""
-    monkeypatch.setattr(
-        DeepGemmMegaMoEExperts, "_kernel_fuses_shared_experts", lambda self, spec: True
-    )
+def test_deep_gemm_mega_moe_sm90_requantizes_shared_expert(monkeypatch):
+    """SM90 requantizes the fused shared expert to one exponent per (row, 128 K)."""
     hidden, inter = 256, 384
-    experts = _make_experts(
-        num_experts=2,
-        num_local_experts=2,
-        experts_start_idx=0,
-        top_k=1,
-        hidden_size=hidden,
-        intermediate_size=inter,
-        shared_experts=_shared_mlp(hidden, inter),
-    )
+    experts = _shared_experts(monkeypatch, hidden, inter)
     experts.weight_format = MEGA_MOE_MXFP4_SM90
+    monkeypatch.setattr(experts, "_relayout_sm90_fp4", lambda *args: None)
     generator = torch.Generator().manual_seed(0)
 
     def rand(low, high, *shape):
         return torch.randint(low, high, shape, dtype=torch.uint8, generator=generator)
 
-    def checkpoint(n, k):
+    def checkpoint(shard, n, k):
         # Finite E4M3 codes of both signs; scales that differ within 128 K.
         weight = rand(0, 0x7F, n, k) | (rand(0, 2, n, k) << 7)
         scale = rand(120, 124, n, k // 32)
-        return weight.view(torch.float8_e4m3fn), scale.view(torch.float8_e8m0fnu)
-
-    shards = {
-        "w1": checkpoint(inter, hidden),
-        "w3": checkpoint(inter, hidden),
-        "w2": checkpoint(hidden, inter),
-    }
-
-    def load(*names):
-        for name in names:
-            shard, _, kind = name.partition(".")
-            tensor = shards[shard][kind == "weight_scale"]
-            experts.load_shared_expert_weight(f"shared_experts.{name}", tensor)
-        finalize_model_weights(experts)
         return [
-            param.data.contiguous().view(torch.uint8).clone()
-            for name, param in experts.named_parameters()
-            if name.startswith("shared_")
+            (f"shared_experts.{shard}.weight", weight.view(torch.float8_e4m3fn)),
+            (f"shared_experts.{shard}.weight_scale", scale.view(torch.float8_e8m0fnu)),
         ]
 
-    everything = [f"{s}.{kind}" for s in shards for kind in ("weight", "weight_scale")]
-    clean = load(*everything)
-    # One exponent per (row, 128 K): the four bytes of every scale word agree.
+    _load(
+        experts,
+        [
+            *checkpoint("w1", inter, hidden),
+            *checkpoint("w3", inter, hidden),
+            *checkpoint("w2", hidden, inter),
+        ],
+    )
     for scale in (experts.shared_l1_weight_scale, experts.shared_l2_weight_scale):
         exponents = scale.contiguous().view(torch.uint8).view(-1, 4)
         assert torch.equal(exponents, exponents[:, :1].expand(-1, 4))
-
-    # Reloading one shard, or everything in another order, lands on the same bytes.
-    assert all(map(torch.equal, load("w1.weight", "w1.weight_scale"), clean))
-    assert all(map(torch.equal, load("w2.weight_scale", "w2.weight"), clean))
-    assert all(map(torch.equal, load(*reversed(everything)), clean))
-    # A weight or a scale alone would stay raw under requantized partners.
-    for name in ("w3.weight", "w1.weight_scale", "w2.weight"):
-        with pytest.raises(ValueError, match=name.partition(".")[0]):
-            load(name)
-        assert all(map(torch.equal, load(*everything), clean))
 
 
 def _fake_deep_gemm(with_shared: bool):
@@ -1491,15 +1417,16 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
     w2 = torch.empty(NUM_EXPERTS, HIDDEN, INTER, device=device)
     # NVFP4 L2 input scales; the kernel uses their max.
     l2_scales = [2e-3 * (e + 1) for e in range(NUM_EXPERTS)]
+    checkpoint = []
     for e in range(NUM_EXPERTS):
         # w1 and w3 are quantized together: NVFP4 needs one global scale.
         w13_ckpt = _quantize(randn(2 * INTER, HIDDEN, fan_in=HIDDEN), fmt.routed)
         w2_ckpt = _quantize(randn(HIDDEN, INTER, fan_in=INTER), fmt.routed)
         w13[e], w2[e] = w13_ckpt[3], w2_ckpt[3]
-        for shard_id, param, rows, (weight, scale, global_scale, _) in (
-            ("w1", "w13", slice(0, INTER), w13_ckpt),
-            ("w3", "w13", slice(INTER, None), w13_ckpt),
-            ("w2", "w2", slice(None), w2_ckpt),
+        for shard_id, rows, (weight, scale, global_scale, _) in (
+            ("w1", slice(0, INTER), w13_ckpt),
+            ("w3", slice(INTER, None), w13_ckpt),
+            ("w2", slice(None), w2_ckpt),
         ):
             tensors = {
                 "weight": weight[rows],
@@ -1508,18 +1435,11 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
             }
             if shard_id == "w2" and global_scale is not None:
                 tensors["input_scale"] = torch.tensor(l2_scales[e])
-            for suffix, tensor in tensors.items():
-                if tensor is None:
-                    continue
-                name = f"{param}_{suffix}"
-                assert experts.weight_loader(
-                    getattr(experts, name),
-                    tensor,
-                    f"experts.{name}",
-                    shard_id=shard_id,
-                    expert_id=e,
-                    return_success=True,
-                )
+            checkpoint += [
+                (f"{e}.{shard_id}.{suffix}", tensor)
+                for suffix, tensor in tensors.items()
+                if tensor is not None
+            ]
 
     shared_w13 = torch.cat([shared_ckpt[0][3], shared_ckpt[1][3]])
     # NVFP4 dispatches a scaled shared expert in MXFP8.
@@ -1532,12 +1452,10 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
     )
     if fuse_shared:
         for (weight, scale, _, _), shard in zip(shared_ckpt, ("w1", "w3", "w2")):
-            experts.load_shared_expert_weight(f"shared_experts.{shard}.weight", weight)
+            checkpoint.append((f"shared_experts.{shard}.weight", weight))
             if scale is not None:
-                experts.load_shared_expert_weight(
-                    f"shared_experts.{shard}.weight_scale", scale
-                )
-        finalize_model_weights(experts)
+                checkpoint.append((f"shared_experts.{shard}.weight_scale", scale))
+    _load(experts, checkpoint)
 
     hidden_states = torch.randn(NUM_TOKENS, HIDDEN, device=device).bfloat16()
     scores = torch.randn(NUM_TOKENS, NUM_EXPERTS, device=device)

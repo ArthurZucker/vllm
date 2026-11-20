@@ -24,7 +24,7 @@
 """Inference-only Ernie VL model compatible with HuggingFace weights."""
 
 import math
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Annotated, Any, Literal
 
@@ -55,7 +55,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.common import (
     ApplyRotaryEmb,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -78,7 +77,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .ernie45_vl_moe import Ernie4_5_VLMoeForCausalLM
+from .ernie45_vl_moe import Ernie4_5_VLMoeForCausalLM, split_text_vision_experts
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsEncoderCudaGraph,
@@ -88,8 +87,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
     scatter_output_slices,
 )
@@ -586,17 +583,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
 
         return final_output
 
-    def load_weights(self, weights) -> set[str]:
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
 
 # === Vision Inputs === #
 
@@ -861,19 +847,6 @@ class VariableResolutionResamplerModel(nn.Module):
             x = fwd_temporal(x)
         x = fwd_mlp(x)
         return x
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class Ernie4_5_VLProcessingInfo(BaseProcessingInfo):
@@ -1417,24 +1390,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(
     }
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-            # model.resampler_model.-> language_model.model.resampler_model.
-            # language_model.model.resampler_model. -> resampler_model.
-            "language_model.model.resampler_model.": "resampler_model.",
-        },
-        # resampler_weight_mappings
-        orig_to_new_substr={
-            "spatial_linear.0.": "spatial_linear1.",
-            "spatial_linear.2.": "spatial_linear2.",
-            "spatial_linear.3.": "spatial_norm.",
-            "temporal_linear.0.": "temporal_linear1.",
-            "temporal_linear.2.": "temporal_linear2.",
-            "temporal_linear.3.": "temporal_norm.",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1453,6 +1408,9 @@ class Ernie4_5_VLMoeForConditionalGeneration(
 
         self.config = config
         self.multimodal_config = multimodal_config
+        self.checkpoint_transforms = [
+            partial(split_text_vision_experts, config.moe_num_experts[0])
+        ]
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.vision_model = Ernie4_5_VisionTransformer(
@@ -1943,7 +1901,3 @@ class Ernie4_5_VLMoeForConditionalGeneration(
         )
 
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

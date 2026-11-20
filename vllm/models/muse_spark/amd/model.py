@@ -4,7 +4,7 @@
 
 import functools
 import math
-from collections.abc import Iterable
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -38,9 +38,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     sequence_parallel_chunk,
 )
@@ -63,6 +61,7 @@ from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
     fused_norm_residual_norm_fwd,
     supports_norm_residual_norm,
 )
+from vllm.models.muse_spark.common.qk_layout import interleave_qk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.third_party.flash_linear_attention.ops.kda import (
@@ -256,16 +255,16 @@ class MuseSparkMoE(nn.Module):
 
         self.route_scale = config.routed_scaling_factor
 
+        # folded into the router weight as it loads (`conversion_mapping`'s Affine)
         self.router_output_multiplier = config.output_multiplier
-        self._router_multiplier_folded = False
-        self.router.weight.weight_loader = self._load_router_weight
+        self._router_multiplier_folded = True  # read by the mono decoder's checks
 
         self.moe_router = MuseSparkRouter(
             top_k=config.num_experts_per_tok,
             num_experts=config.num_local_experts,
             expert_bias=self.expert_bias,
             route_scale=self.route_scale,
-            router_output_multiplier=self.router_output_multiplier,
+            router_output_multiplier=None,
             router_score_normalization="sigmoid",
             router_score_division_eps=1e-15,
         )
@@ -337,22 +336,9 @@ class MuseSparkMoE(nn.Module):
             reduce_results=not self.defer_reduce,
         )
 
-    def _load_router_weight(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor
-    ) -> None:
-        self.router.weight_loader(param, loaded_weight)
-        self._router_multiplier_folded = False
-
     def fold_router_output_multiplier(self) -> None:
-        """Fold the router output multiplier and split the bf16x3 planes."""
-        if (
-            not self._router_multiplier_folded
-            and self.router_output_multiplier is not None
-        ):
-            with torch.no_grad():
-                self.router.weight.mul_(self.router_output_multiplier)
-            self._router_multiplier_folded = True
-            self.moe_router.router_output_multiplier = None
+        """Split the router weight (its output multiplier folded in as it loaded)
+        into the bf16x3 planes."""
         weight = self.router.weight.data
         if (
             _supports_router_bf16x3_device()
@@ -977,27 +963,9 @@ class MuseSparkDecoderLayer(nn.Module):
         )
 
 
-def _drop_gate_up_stacking(base: WeightsMapper) -> WeightsMapper:
-    """Keep Quark's per-expert gate/up names unstacked for `RoutedExperts`."""
-    return WeightsMapper(
-        orig_to_new_renaming=base.orig_to_new_renaming,
-        orig_to_new_regex=base.orig_to_new_regex,
-        orig_to_new_substr=base.orig_to_new_substr,
-        orig_to_new_stacked={
-            source: target
-            for source, target in base.orig_to_new_stacked.items()
-            if source not in (".gate_proj", ".up_proj")
-        },
-        orig_to_new_prefix=base.orig_to_new_prefix,
-        orig_to_new_suffix=base.orig_to_new_suffix,
-    )
-
-
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.
 @ignore_torch_compile
 class MuseSparkModel(LlamaModel):
-    hf_to_vllm_mapper = _drop_gate_up_stacking(LlamaModel.hf_to_vllm_mapper)
-
     def __init__(
         self,
         *,
@@ -1153,8 +1121,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper()
-
     def __init__(
         self,
         *,
@@ -1208,6 +1174,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             self.logits_processor.scale = 1.0
 
         self.set_moe_parameters()
+        self.checkpoint_transforms = [partial(interleave_qk, self.model.config)]
 
     def _init_model(
         self,
@@ -1302,37 +1269,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 logits / self.output_soft_cap_temp
             )
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def interleaved_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            config = self.model.config
-            qk_rows = (
-                config.num_attention_heads * config.head_dim,
-                config.num_key_value_heads * config.head_dim,
-            )
-            for name, weight in weights:
-                if (
-                    name.startswith(
-                        ("model.language_model.layers.", "model.layers.", "layers.")
-                    )
-                    and (".self_attn.q_proj." in name or ".self_attn.k_proj." in name)
-                    and name.rsplit(".", 1)[-1].startswith("weight")
-                    and weight.dim() >= 1
-                    and weight.shape[0] in qk_rows
-                ):
-                    # HF stores Q/K rows as [even | odd] per head (NoPE too);
-                    # restore interleaved pairs before TP slicing. Per-row
-                    # scales move with their rows; 0-d scales stay.
-                    shape = weight.shape
-                    weight = (
-                        weight.reshape(-1, 2, config.head_dim // 2, *shape[1:])
-                        .transpose(1, 2)
-                        .reshape(shape)
-                    )
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(interleaved_weights(), mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         n_gates = materialize_residual_path_constants(self)

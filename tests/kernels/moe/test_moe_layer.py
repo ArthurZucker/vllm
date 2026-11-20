@@ -26,7 +26,12 @@ from tests.kernels.moe.modular_kernel_tools.parallel_utils import (
     _set_vllm_config,
     parallel_launch_with_config,
 )
-from tests.kernels.moe.utils import TestMLP, make_test_weights, moe_quantize_weights
+from tests.kernels.moe.utils import (
+    TestMLP,
+    expert_conversions,
+    make_test_weights,
+    moe_quantize_weights,
+)
 from tests.kernels.utils import torch_moe
 from vllm.config import (
     CompilationConfig,
@@ -66,6 +71,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptNvFp4Config,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
@@ -2346,20 +2352,29 @@ def _biased_moe_tp_worker(rank: int, tp_size: int, port: int, result_path: str):
             has_bias=True,
         )
         experts = layer.routed_experts
+        model = torch.nn.Module()
+        model.experts = layer
+        weights = []
         for e in range(num_experts):
             gate, up = w13[e].chunk(2)
             gate_bias, up_bias = b13[e].chunk(2)
-            for param, weight, name, shard_id in [
-                (experts.w13_weight, gate, "w13_weight", "w1"),
-                (experts.w13_weight, up, "w13_weight", "w3"),
-                (experts.w2_weight, w2[e], "w2_weight", "w2"),
-                (experts.w13_bias, gate_bias, "w13_bias", "w1"),
-                (experts.w13_bias, up_bias, "w13_bias", "w3"),
-                (experts.w2_bias, b2[e], "w2_bias", "w2"),
-            ]:
-                assert experts.weight_loader(
-                    param, weight, name, shard_id, e, return_success=True
-                )
+            weights += [
+                (f"experts.{e}.gate_proj.weight", gate),
+                (f"experts.{e}.up_proj.weight", up),
+                (f"experts.{e}.down_proj.weight", w2[e]),
+                (f"experts.{e}.gate_proj.bias", gate_bias),
+                (f"experts.{e}.up_proj.bias", up_bias),
+                (f"experts.{e}.down_proj.bias", b2[e]),
+            ]
+        conversions = expert_conversions(
+            "experts.*.{}.{}", "experts.routed_experts.{}_{}", ("weight", "bias")
+        )
+        loaded = load_with_ops(model, iter(weights), conversions)
+        assert {
+            f"experts.routed_experts.{w}_{s}"
+            for w in ("w13", "w2")
+            for s in ("weight", "bias")
+        } <= loaded
         layer._quant_method.process_weights_after_loading(experts)
 
         with set_forward_context(None, vllm_config, num_tokens=num_tokens):
@@ -2374,7 +2389,7 @@ def _biased_moe_tp_worker(rank: int, tp_size: int, port: int, result_path: str):
 
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_moe_layer_tp_expert_bias(tp_size: int, tmp_path):
-    """A biased MoE loaded through the expert weight loader matches the
+    """A biased MoE loaded through `load_with_ops` matches the
     unsharded reference under TP, so the down-projection bias is added once."""
     if not current_platform.is_cpu() and current_platform.device_count() < tp_size:
         pytest.skip(f"Requires {tp_size} GPUs")

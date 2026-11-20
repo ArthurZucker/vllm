@@ -1510,6 +1510,22 @@ class ModelConfig:
                     f"({self.quantization})."
                 )
 
+        if (
+            self.quantization not in supported_quantization
+            and self.model_impl == "transformers"
+            and quant_cfg is not None
+        ):
+            from vllm.model_executor.models.transformers.conversion import (
+                dequantizable,
+            )
+
+            if dequantizable(quant_cfg):
+                logger.info(
+                    "No vLLM kernels for %s: Transformers dequantizes it on load",
+                    self.quantization,
+                )
+                self.quantization = None
+
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(

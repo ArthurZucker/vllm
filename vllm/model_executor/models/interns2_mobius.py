@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Intern-S2-Mobius model."""
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -43,7 +42,6 @@ from .interns2_preview import (
 )
 from .qwen3_5 import (
     Qwen3_5ForCausalLMBase,
-    Qwen3_5Model,
     Qwen3_5RMSNorm,
 )
 from .qwen3_5_mtp import Qwen3_5MoeMTP
@@ -54,7 +52,6 @@ from .qwen3_vl import (
     Qwen3VLMultiModalProcessor,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
@@ -288,8 +285,6 @@ class InternS2MobiusDecoderLayer(nn.Module):
     }
 )
 class InternS2MobiusModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
 
@@ -404,10 +399,6 @@ class InternS2MobiusModel(nn.Module, EagleModelMixin):
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class InternS2MobiusForCausalLM(Qwen3_5ForCausalLMBase):

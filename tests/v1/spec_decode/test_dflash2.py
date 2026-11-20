@@ -550,6 +550,7 @@ def test_beam_dflash2_loads_every_checkpoint_tensor(monkeypatch):
     """The exported checkpoint's names load into every parameter but the
     embedding and LM head, which alias the target's."""
     from vllm.config import set_current_vllm_config
+    from vllm.model_executor.model_loader.ops_loader import load_weights
     from vllm.models.beam import DFlash2BeamForCausalLM
 
     hidden, heads, kv_heads, head_dim, ffn, vocab, rank = 64, 4, 2, 16, 128, 100, 8
@@ -615,10 +616,12 @@ def test_beam_dflash2_loads_every_checkpoint_tensor(monkeypatch):
     torch.manual_seed(0)
     checkpoint = {name: torch.randn(shape) for name, shape in shapes.items()}
 
-    loaded = model.load_weights(iter(checkpoint.items()))
+    loaded = load_weights(model, iter(checkpoint.items()))
     model.process_weights_after_loading()  # builds the context K/V weights
 
-    assert loaded == {name for name, _ in model.named_parameters()}
+    # all but the embedding and LM head, aliased to the target's after loading
+    aliased = {"model.embed_tokens.weight", "lm_head.weight"}
+    assert loaded == {name for name, _ in model.named_parameters()} - aliased
     context_kv = [
         checkpoint[f"layers.{layer}.self_attn.{proj}_proj.weight"]
         for layer in range(2)
@@ -677,9 +680,9 @@ def test_conv_projections_use_draft_quant_config(monkeypatch):
 
     from vllm.distributed import parallel_state
     from vllm.model_executor.layers.quantization import modelopt
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3DecoderLayer
     from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3DecoderLayer
-    from vllm.model_executor.models.utils import AutoWeightsLoader
 
     monkeypatch.setattr(
         parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
@@ -717,7 +720,7 @@ def test_conv_projections_use_draft_quant_config(monkeypatch):
         assert projection.weight.dtype == torch.uint8
         assert projection.weight.shape == (32, 8)
         weight = torch.ones_like(projection.weight)
-        AutoWeightsLoader(module).load_weights([("kernel_projection.weight", weight)])
+        load_with_ops(module, [("kernel_projection.weight", weight)])
         torch.testing.assert_close(projection.weight, weight)
         assert module.base_kernel.dtype == torch.bfloat16
 

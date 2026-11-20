@@ -26,7 +26,7 @@
 # limitations under the License.
 """Inference-only Qwen2.5-VL model compatible with HuggingFace weights."""
 
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -116,8 +116,6 @@ from .qwen2_vl import (
     Qwen2VLProcessingInfo,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     cast_overflow_tensors,
     init_vllm_registered_model,
     maybe_prefix,
@@ -587,16 +585,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
 
 
 class Qwen2_5_VisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".attn.q.": (".attn.qkv.", "q"),
-            ".attn.k.": (".attn.qkv.", "k"),
-            ".attn.v.": (".attn.qkv.", "v"),
-            ".mlp.gate_proj.": (".mlp.gate_up_proj.", 0),
-            ".mlp.up_proj.": (".mlp.gate_up_proj.", 1),
-        }
-    )
-
     def __init__(
         self,
         vision_config: Qwen2_5_VLVisionConfig,
@@ -1109,10 +1097,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class Qwen2_5_VLDummyInputsBuilder(Qwen2VLDummyInputsBuilder):
     def _get_dummy_videos(
@@ -1277,16 +1261,6 @@ class Qwen2_5_VLForConditionalGeneration(
     }
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "model.visual.": "visual.",
-            # mapping for original checkpoint
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        }
-    )
 
     supports_encoder_tp_data = True
     supports_mm_device_do_normalize = True
@@ -1920,10 +1894,6 @@ class Qwen2_5_VLForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

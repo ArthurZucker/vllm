@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
-from typing import Any, cast
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +19,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fusion.quant_activation import (
@@ -55,10 +53,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     HasInnerState,
@@ -67,10 +61,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    get_spec_layer_idx_from_weight_name,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
 )
@@ -443,6 +434,7 @@ class KimiMoE(nn.Module):
             num_expert_group=config.num_expert_group,
             topk_group=config.topk_group,
             prefix=f"{prefix}.experts",
+            ckpt_names=("w1", "w2", "w3"),
             scoring_func=config.moe_router_activation_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
@@ -1108,169 +1100,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(
-        self,
-        weights: Iterable[
-            tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]
-        ],
-    ) -> set[str]:
-        kda_config = self.config.linear_attn_config
-        use_full_rank_gate = bool(
-            kda_config and kda_config.get("use_full_rank_gate", False)
-        )
-        beta_shard_id = 5 if use_full_rank_gate else 3
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".in_proj_qkvgfab", ".q_proj", 0),
-            (".in_proj_qkvgfab", ".k_proj", 1),
-            (".in_proj_qkvgfab", ".v_proj", 2),
-            (".in_proj_qkvgfab", ".b_proj", beta_shard_id),
-            (".in_proj_qkvgfab", ".f_a_proj", 4),
-            (".conv1d", ".q_conv1d", 0),
-            (".conv1d", ".k_conv1d", 1),
-            (".conv1d", ".v_conv1d", 2),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        if use_full_rank_gate:
-            stacked_params_mapping.append((".in_proj_qkvgfab", ".g_proj", 3))
-        if getattr(self.config, "q_lora_rank", None) is not None:
-            stacked_params_mapping += [
-                (".fused_qkv_a_proj", ".q_a_proj", 0),
-                (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-            ]
-            if self.config.mla_use_output_gate:
-                stacked_params_mapping.append((".fused_qkv_a_proj", ".g_proj", 2))
-        if self.config.is_moe:
-            # Params for weights, fp8 weight scales, fp8 activation scales
-            # (param_name, weight_name, expert_id, shard_id)
-            expert_params_mapping = fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="w1",
-                ckpt_down_proj_name="w2",
-                ckpt_up_proj_name="w3",
-                num_experts=self.config.num_experts,
-            )
-        else:
-            expert_params_mapping = []
-        params_dict = dict(self.named_parameters())
-        # Under the MXFP4 quant interface the routed experts register unpacked
-        # params (``w13_weight``), while the compressed-tensors checkpoint names
-        # them ``.weight_packed``. Rebind so the expert mapping resolves; scales
-        # already share the ``.weight_scale`` suffix.
-        experts_unpacked = not any(n.endswith("w13_weight_packed") for n in params_dict)
-        loaded_params: set[str] = set()
-        for args in weights:
-            name, loaded_weight = args[0], args[1]
-            kwargs: dict[str, Any] = args[2] if len(args) > 2 else {}
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if experts_unpacked and name.endswith(".weight_packed"):
-                name = name.replace(".weight_packed", ".weight")
-
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                # DSA keeps its output gate separate from the fused Q/KV.
-                if weight_name == ".g_proj" and name in params_dict:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                # Packed projections are only present on compatible layers.
-                if name_mapped not in params_dict:
-                    continue
-                name = name_mapped
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for (
-                    expert_param_name,
-                    expert_weight_name,
-                    expert_id,
-                    expert_shard_id,
-                ) in expert_params_mapping:
-                    if expert_weight_name not in name:
-                        continue
-                    name = name.replace(expert_weight_name, expert_param_name)
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        expert_id=expert_id,
-                        shard_id=expert_shard_id,
-                    )
-                    break
-                else:
-                    if self.config.dsa_config is not None:
-                        for param_name, weight_name in _DSA_RENAME_PARAMS_MAPPING:
-                            if weight_name in name:
-                                name = name.replace(weight_name, param_name)
-                                break
-                    # The bf16 indexer projections (wk/wv) cannot take an fp8
-                    # checkpoint weight: default_weight_loader would cast it
-                    # and silently drop the companion weight_scale_inv. (Only
-                    # wq_index is fp8-capable, via quant_config.)
-                    if name.endswith(
-                        (".dsa_indexer.wk_index.weight", ".dsa_indexer.wv_index.weight")
-                    ) and loaded_weight.dtype in (
-                        torch.float8_e4m3fn,
-                        torch.float8_e4m3fnuz,
-                        torch.float8_e5m2,
-                        torch.float8_e5m2fnuz,
-                    ):
-                        raise ValueError(
-                            f"{name}: fp8 indexer wk/wv checkpoint weights are "
-                            "not supported (bf16 projections; the scale would "
-                            "be dropped). Convert the checkpoint to bf16."
-                        )
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and name not in params_dict
-                        and not self.config.is_linear_attn
-                    ):  # noqa: E501
-                        continue
-                    # Remapping the name of FP8 kv-scale.
-                    remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                    if remapped_name is None:
-                        continue
-                    name = remapped_name
-                    if is_pp_missing_parameter(name, self):
-                        continue
-
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight, **kwargs)
-            loaded_params.add(name)
-        return loaded_params
-
 
 class KimiLinearForCausalLM(
     nn.Module,
@@ -1377,7 +1206,3 @@ class KimiLinearForCausalLM(
         self.after_specialized_decode_step()
         hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

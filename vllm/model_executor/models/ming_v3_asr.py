@@ -45,7 +45,7 @@
 # SOFTWARE.
 """Inference-only Ming V3 ASR with the native Bailing hybrid decoder."""
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from functools import cached_property
 from numbers import Integral
 from typing import cast
@@ -88,7 +88,7 @@ from .interfaces import (
 )
 from .ming_audio import MingAudioEncoder, MingAudioProjector, get_audio_token_count
 from .module_mapping import MultiModelKeys
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 ASR_INSTRUCTION = (
     "Please recognize the language of this speech and transcribe it, "
@@ -321,16 +321,6 @@ class MingV3ASRForConditionalGeneration(
 ):
     supported_languages = _LANGUAGES
     supports_transcription_only = True
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.audio.": "audio_encoder.",
-            "linear_proj_audio.": "audio_projector.proj.",
-            "model.visual.": None,
-            "linear_proj.": None,
-            "model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -395,11 +385,6 @@ class MingV3ASRForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(
-            weights, mapper=self.hf_to_vllm_mapper
-        )
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

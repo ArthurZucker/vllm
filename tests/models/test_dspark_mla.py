@@ -10,12 +10,31 @@ import torch.nn as nn
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.model_loader.conversion_mapping import (
+    _CONVERSION_MAPPING,
+    _k3_dspark,
+)
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as dsv4_dspark
 from vllm.models.deepseek_v41.nvidia import dspark as dsv41_dspark
 from vllm.models.kimi_k3.nvidia import dspark_mla
-from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
+from vllm.models.kimi_k3.nvidia.dspark_mla import (
+    K3DSparkForCausalLM,
+    K3DSparkModel,
+    context_kv_sources,
+)
+
+from .utils import map_checkpoint_name
+
+
+def _k3_map(name: str) -> tuple[str, int | None]:
+    draft = SimpleNamespace(
+        config=SimpleNamespace(enable_confidence_head=False),
+        model=SimpleNamespace(config=SimpleNamespace(num_hidden_layers=1)),
+    )
+    return map_checkpoint_name(_k3_dspark(draft), name)
 
 
 def test_dspark_mla_uses_compile_free_model_entrypoint():
@@ -50,17 +69,14 @@ def test_dspark_mla_uses_compile_free_model_entrypoint():
     ],
 )
 def test_dspark_mla_checkpoint_weight_mapping(checkpoint_name, runtime_name, shard_id):
-    assert K3DSparkForCausalLM.hf_to_vllm_mapper._map_name_with_shard(
-        checkpoint_name
-    ) == (runtime_name, shard_id)
+    assert _k3_map(checkpoint_name) == (runtime_name, shard_id)
 
 
 def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
     assert not K3DSparkForCausalLM.has_own_embed_tokens
     assert not K3DSparkForCausalLM.has_own_lm_head
-    mapper = K3DSparkForCausalLM.hf_to_vllm_mapper
     for name in ("confidence_head.weight", "embed_tokens.weight", "lm_head.weight"):
-        assert mapper._map_name(name) is None
+        assert "_dropped_" in _k3_map(name)[0]
 
 
 @pytest.mark.cpu_test
@@ -166,36 +182,53 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     ]
 
 
-def test_context_kv_weights_are_loaded_as_merged_linear_shards():
+def test_context_kv_weights_are_loaded_as_merged_linear_shards(dist_init):
+    """Each layer's `kv_a_proj_with_mqa` is its `fused_qkv_a_proj` shard 1 and
+    also, in layer order, its shard of the draft's `context_kv_proj`."""
+    model = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(enable_confidence_head=False)
+    model.model = nn.Module()
+    model.model.config = SimpleNamespace(num_hidden_layers=2)
+    model.model.layers = nn.ModuleList()
+    model.checkpoint_transforms = [lambda w: context_kv_sources(w, layers=2)]
+    for _ in range(2):
+        layer = nn.Module()
+        layer.self_attn = nn.Module()
+        layer.self_attn.fused_qkv_a_proj = MergedColumnParallelLinear(
+            5, [2, 3], bias=False, disable_tp=True, params_dtype=torch.float32
+        )
+        model.model.layers.append(layer)
+    model.model.context_kv_proj = MergedColumnParallelLinear(
+        5, [3, 3], bias=False, disable_tp=True, params_dtype=torch.float32
+    )
+    q = [torch.arange(10).view(2, 5).float() - 10 * (i + 1) for i in range(2)]
+    kv = [torch.arange(15).view(3, 5).float() + 15 * i for i in range(2)]
     weights = [
-        (
-            "layers.0.self_attn.kv_a_proj_with_mqa.weight_packed",
-            torch.arange(4),
-        ),
-        (
-            "layers.1.self_attn.kv_a_proj_with_mqa.weight_scale",
-            torch.tensor(0.5),
-        ),
+        (f"layers.{i}.self_attn.{name}.weight", w)
+        for i in range(2)
+        for name, w in (("q_a_proj", q[i]), ("kv_a_proj_with_mqa", kv[i]))
     ]
 
-    duplicated = dspark_mla._duplicate_context_kv_weights(weights, 2)
-    mapped = list(K3DSparkForCausalLM.hf_to_vllm_mapper.apply(duplicated))
+    load_weights(model, iter(weights))
 
-    assert [name for name, _ in mapped] == [
-        "model.layers.0.self_attn.fused_qkv_a_proj.weight_packed",
-        "model.context_kv_proj.weight_packed",
-        "model.layers.1.self_attn.fused_qkv_a_proj.weight_scale",
-        "model.context_kv_proj.weight_scale",
-    ]
-    assert [weight.shard_id for _, weight in mapped] == [1, 0, 1, 1]
-    assert mapped[0][1].data_ptr() == mapped[1][1].data_ptr()
-    assert mapped[2][1].data_ptr() == mapped[3][1].data_ptr()
+    for i, layer in enumerate(model.model.layers):
+        torch.testing.assert_close(
+            layer.self_attn.fused_qkv_a_proj.weight, torch.cat([q[i], kv[i]])
+        )
+    torch.testing.assert_close(model.model.context_kv_proj.weight, torch.cat(kv))
+
+
+def _dsv4_dspark_map(draft, name: str) -> tuple[str | None, int | None]:
+    """A dropped name maps to (None, None)"""
+    entry = _CONVERSION_MAPPING["DSparkDeepseekV4ForCausalLM"]
+    transforms = entry(draft) if callable(entry) else entry
+    mapped, shard = map_checkpoint_name(transforms, name)
+    return (None, None) if "_dropped_" in mapped else (mapped, shard)
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "scale_dtype", [torch.uint8, torch.float8_e8m0fnu, torch.float32]
-)
+@pytest.mark.parametrize("scale_name", ["weight_scale", "weight_scale_inv"])
 @pytest.mark.parametrize(
     ("checkpoint_name", "runtime_module", "shard_id"),
     [
@@ -214,205 +247,41 @@ def test_context_kv_weights_are_loaded_as_merged_linear_shards():
         ),
     ],
 )
-def test_v41_dspark_loads_linear_scales(
-    monkeypatch, scale_dtype, checkpoint_name, runtime_module, shard_id
+def test_v41_dspark_maps_linear_scales(
+    scale_name, checkpoint_name, runtime_module, shard_id
 ):
-    """Checkpoint `.scale` maps to the quant method's scale parameter and
-    loads untouched. MXFP8 block-scale expansion lives in the KMxfp8Static
-    loader (see tests/quantization/test_modelopt.py), not in load_weights."""
-    from vllm.models.deepseek_v41.nvidia import dspark
-
-    mxfp8 = scale_dtype != torch.float32
-    scale_name = "weight_scale" if mxfp8 else "weight_scale_inv"
-    runtime_name = f"{runtime_module}.{scale_name}"
-    raw = torch.tensor([[120, 127], [128, 130]], dtype=torch.uint8)
-    checkpoint_scale = raw.view(scale_dtype) if mxfp8 else raw.float()
-    param = nn.Parameter(torch.empty_like(checkpoint_scale), requires_grad=False)
-    shards = []
-
-    def load_scale(param, weight, *args):
-        shards.append(args)
-        assert weight.dtype == checkpoint_scale.dtype
-        param.copy_(weight)
-
-    param.weight_loader = load_scale
-    params = {runtime_name: param}
-    context_param = None
-    if ".attn.wkv." in checkpoint_name:
-        context_param = nn.Parameter(
-            torch.empty_like(checkpoint_scale), requires_grad=False
-        )
-        context_param.weight_loader = load_scale
-        params[f"model.context_wkv_proj.{scale_name}"] = context_param
+    """`.scale` maps to the linear quant method's scale param (`linear_scale_name`)."""
     draft = SimpleNamespace(
-        config=SimpleNamespace(num_attention_heads=4, n_routed_experts=1),
-        quant_config=SimpleNamespace(
-            weight_block_size=[32, 32] if mxfp8 else [128, 128]
-        ),
+        config=SimpleNamespace(expert_dtype="fp4"),
         linear_scale_name=scale_name,
-        pad_shared_expert=False,
-        model=SimpleNamespace(
-            layers=[
-                SimpleNamespace(
-                    ffn=SimpleNamespace(
-                        use_native_mega_moe=False,
-                        n_redundant_experts=0,
-                        experts=SimpleNamespace(has_fused_shared_experts=False),
-                    )
-                )
-            ],
-            confidence_head=None,
-        ),
-        named_parameters=lambda: params.items(),
-        process_weights_after_loading=lambda: None,
+        model=SimpleNamespace(confidence_head=None),
     )
-    draft._remap_dspark_name = lambda name: (
-        dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
+    assert _dsv4_dspark_map(draft, checkpoint_name) == (
+        f"{runtime_module}.{scale_name}",
+        shard_id,
     )
-    monkeypatch.setattr(
-        dspark, "fused_moe_make_expert_params_mapping", lambda *a, **kw: []
-    )
-
-    loaded = dspark.DSparkDeepseekV4ForCausalLM.load_weights(
-        draft, [(checkpoint_name, checkpoint_scale)]
-    )
-
-    assert loaded == set(params)
-    expected_shards = [() if shard_id is None else (shard_id,)]
-    if context_param is not None:
-        expected_shards.append((0,))
-        torch.testing.assert_close(context_param, checkpoint_scale)
-    assert shards == expected_shards
-    torch.testing.assert_close(param, checkpoint_scale)
-
-
-def test_dsv4_dspark_fused_moe_expert_mapping_includes_redundant_experts(
-    monkeypatch,
-):
-    from vllm.models.deepseek_v4.nvidia import dspark
-
-    captured: dict[str, int] = {}
-
-    def capture_expert_mapping(*args, **kwargs):
-        captured.update(kwargs)
-        return []
-
-    draft = SimpleNamespace(
-        config=SimpleNamespace(
-            num_attention_heads=4,
-            n_routed_experts=8,
-            expert_dtype="fp4",
-        ),
-        quant_config=None,
-        pad_shared_expert=False,
-        model=SimpleNamespace(
-            layers=[
-                SimpleNamespace(
-                    ffn=SimpleNamespace(
-                        use_native_mega_moe=False,
-                        use_mega_moe=False,
-                        n_redundant_experts=4,
-                    )
-                )
-            ],
-            confidence_head=None,
-        ),
-        named_parameters=lambda: [],
-        process_weights_after_loading=lambda: None,
-    )
-    draft._remap_dspark_name = lambda name: (
-        dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
-    )
-    monkeypatch.setattr(
-        dspark,
-        "fused_moe_make_expert_params_mapping",
-        capture_expert_mapping,
-    )
-
-    dspark.DSparkDeepseekV4ForCausalLM.load_weights(draft, [])
-
-    assert captured["num_experts"] == 8
-    assert captured["num_redundant_experts"] == 4
-
-
-def test_dsv4_context_wkv_weights_are_duplicated_by_draft_layer():
-    weights = [
-        ("mtp.0.attn.wkv.weight", torch.arange(4)),
-        ("mtp.1.attn.wq_a.weight", torch.arange(3)),
-        ("mtp.2.attn.wkv.scale", torch.tensor(0.5)),
-        ("mtp.3.attn.wkv.weight", torch.arange(2)),
-    ]
-
-    duplicated = list(dsv4_dspark._duplicate_context_wkv_weights(weights, 3))
-
-    assert [name for name, _ in duplicated] == [
-        "mtp.0.attn.wkv.weight",
-        "context_wkv_proj.weight",
-        "mtp.1.attn.wq_a.weight",
-        "mtp.2.attn.wkv.scale",
-        "context_wkv_proj.scale",
-        "mtp.3.attn.wkv.weight",
-    ]
-    assert duplicated[1][1].shard_id == 0
-    assert duplicated[4][1].shard_id == 2
-    assert duplicated[0][1].data_ptr() == duplicated[1][1].data_ptr()
-    assert duplicated[3][1].data_ptr() == duplicated[4][1].data_ptr()
 
 
 @pytest.mark.cpu_test
-def test_v41_context_wkv_loads_each_layer_into_both_projections(monkeypatch):
-    """Duplicating context weights must preserve query WKV and layer order."""
-    from vllm.model_executor import parameter
-
-    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 3)
-    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 4)
-    projections = [
-        MergedColumnParallelLinear(
-            5, sizes, bias=False, disable_tp=True, params_dtype=torch.float32
-        )
-        for sizes in ([2, 4], [2, 4], [2, 4], [4, 4, 4])
-    ]
-    for projection in projections:
-        projection.weight.data.fill_(-1)
-    params = {
-        f"model.layers.{i}.attn.fused_wqa_wkv.weight": projection.weight
-        for i, projection in enumerate(projections[:3])
-    }
-    params["model.context_wkv_proj.weight"] = projections[3].weight
+@pytest.mark.parametrize(
+    ("checkpoint_name", "runtime_name"),
+    [
+        ("embed.weight", None),  # the target's
+        ("layers.0.attn.wq_a.weight", None),
+        ("mtp.1.confidence_head.weight", None),  # none built
+        ("mtp.2.norm.weight", "model.norm.weight"),
+        ("mtp.2.markov_head.embed.weight", "model.markov_head.markov_w1.weight"),
+        ("mtp.2.markov_head.head.weight", "model.markov_head.markov_w2.weight"),
+        ("mtp.1.attn_norm.weight", "model.layers.1.attn_norm.weight"),
+    ],
+)
+def test_v41_dspark_loads_only_its_mtp_weights(checkpoint_name, runtime_name):
     draft = SimpleNamespace(
-        config=SimpleNamespace(n_routed_experts=1),
-        linear_scale_name="weight_scale",
-        pad_shared_expert=False,
-        model=SimpleNamespace(
-            layers=[
-                SimpleNamespace(
-                    ffn=SimpleNamespace(
-                        use_native_mega_moe=False,
-                        n_redundant_experts=0,
-                    )
-                )
-                for _ in range(3)
-            ],
-            confidence_head=None,
-        ),
-        named_parameters=lambda: params.items(),
+        config=SimpleNamespace(expert_dtype="fp4"),
+        linear_scale_name="weight_scale_inv",
+        model=SimpleNamespace(confidence_head=None),
     )
-    draft._remap_dspark_name = lambda name: (
-        dsv41_dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
-    )
-    monkeypatch.setattr(
-        dsv41_dspark, "fused_moe_make_expert_params_mapping", lambda *a, **kw: []
-    )
-    weights = [torch.arange(20).view(4, 5).float() + i * 20 for i in range(3)]
-    loaded = dsv41_dspark.DSparkDeepseekV4ForCausalLM.load_weights(
-        draft, ((f"mtp.{i}.attn.wkv.weight", weights[i]) for i in (2, 0, 1))
-    )
-
-    assert loaded == set(params)
-    torch.testing.assert_close(projections[3].weight, torch.cat(weights))
-    for i, projection in enumerate(projections[:3]):
-        torch.testing.assert_close(projection.weight[2:], weights[i])
-        assert torch.all(projection.weight[:2] == -1)
+    assert _dsv4_dspark_map(draft, checkpoint_name)[0] == runtime_name
 
 
 @pytest.mark.parametrize("dspark_module", [dsv4_dspark, dsv41_dspark])

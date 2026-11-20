@@ -23,7 +23,6 @@
 # This file is based on the LLama model definition file in transformers
 """PyTorch Cohere model."""
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -48,15 +47,12 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import row_parallel_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP, SupportsQuant
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -80,7 +76,7 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(param_shape))
         self.variance_epsilon = eps
-        set_weight_attrs(self.weight, {"weight_loader": row_parallel_weight_loader})
+        set_weight_attrs(self.weight, {"shard_dim": 0})
 
     def forward(self, hidden_states, residuals=None):
         hidden_states = layer_norm_func(
@@ -106,7 +102,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(param_shape))
         self.variance_epsilon = eps
-        set_weight_attrs(self.weight, {"weight_loader": row_parallel_weight_loader})
+        set_weight_attrs(self.weight, {"shard_dim": 0})
 
     def forward(self, hidden_states, residuals=None):
         hidden_states = rms_norm_func(hidden_states, self.weight, self.variance_epsilon)
@@ -401,21 +397,6 @@ class CohereModel(nn.Module):
 
 
 class CohereForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-        # ModelOpt NVFP4 checkpoints carry raw quantizer-module state
-        # (e.g. "*.weight_quantizer._double_scale"); drop them before loading.
-        # See #41925.
-        orig_to_new_substr={"_quantizer.": None},
-        orig_to_new_prefix={"lm_head": None},
-    )
     packed_modules_mapping: dict[str, list[str]] = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -470,7 +451,3 @@ class CohereForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
             )
 
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -89,67 +89,6 @@ def dspark_vllm_config():
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
-def test_dspark_loads_all_local_eplb_redundant_experts(model_type):
-    from torch import nn
-
-    if model_type == "deepseek_v4":
-        from vllm.models.deepseek_v4.nvidia import dspark as dspark_module
-    else:
-        from vllm.models.deepseek_v41.nvidia import dspark as dspark_module
-
-    param_name = "model.layers.0.ffn.experts.routed_experts.w13_weight"
-    param = nn.Parameter(torch.full((5, 2), -1.0))
-
-    def load_local_expert(
-        param,
-        loaded_weight,
-        weight_name,
-        *,
-        shard_id,
-        expert_id,
-        return_success=False,
-    ):
-        assert weight_name == param_name
-        assert shard_id == "w1"
-        assert return_success
-        if expert_id >= param.shape[0]:
-            return False
-        param.data[expert_id].copy_(loaded_weight)
-        return True
-
-    param.weight_loader = load_local_expert
-    draft = object.__new__(dspark_module.DSparkDeepseekV4ForCausalLM)
-    nn.Module.__init__(draft)
-    draft.model = SimpleNamespace(
-        layers=[
-            SimpleNamespace(
-                ffn=SimpleNamespace(
-                    use_native_mega_moe=False,
-                    n_redundant_experts=6,
-                )
-            )
-        ],
-        confidence_head=None,
-    )
-    draft.config = SimpleNamespace(
-        dspark_n_routed_experts=4,
-        n_routed_experts=4 if model_type == "deepseek_v4" else 8,
-        num_attention_heads=4,
-        expert_dtype="fp4",
-    )
-    draft.pad_shared_expert = False
-    draft.quant_config = None
-    draft.named_parameters = lambda: [(param_name, param)]
-
-    # With EP=2, rank 0 owns physical slots 0..4; slots 0 and 4 both map to expert 0.
-    checkpoint_weight = torch.tensor([3.0, 7.0])
-    draft.load_weights([("mtp.0.ffn.experts.0.w1.weight", checkpoint_weight)])
-
-    torch.testing.assert_close(param[0], checkpoint_weight)
-    torch.testing.assert_close(param[4], checkpoint_weight)
-
-
-@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
 def test_eplb_registers_dspark_draft_when_supported(
     dspark_vllm_config, monkeypatch: pytest.MonkeyPatch, model_type
 ):

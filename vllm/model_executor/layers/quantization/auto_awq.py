@@ -128,16 +128,12 @@ def _convert_awq_to_standard_format(
         dim=1, dtype=torch.int32
     )
 
-    def _noop_loader(*args, **kwargs):
-        pass
-
     new_param = PackedvLLMParameter(
         data=new_qw.contiguous(),
         input_dim=0,
         output_dim=1,
         packed_dim=0,
         packed_factor=pack_factor,
-        weight_loader=_noop_loader,
     )
     replace_parameter(layer, w_q_name, new_param)
 
@@ -168,7 +164,6 @@ def _convert_awq_to_standard_format(
         input_dim=1,
         packed_dim=0,
         packed_factor=pack_factor,
-        weight_loader=_noop_loader,
     )
     replace_parameter(layer, w_zp_name, new_zp_param)
 
@@ -432,7 +427,6 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
 
         if self.quant_config.group_size != -1:
             group_size = self.quant_config.group_size
@@ -469,7 +463,6 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
         )
 
         num_groups = input_size_per_partition // group_size
@@ -484,7 +477,6 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
         )
 
         scales = GroupQuantScaleParameter(
@@ -495,7 +487,6 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
             ),
             input_dim=0,
             output_dim=1,
-            weight_loader=weight_loader,
         )
 
         layer.register_parameter("qweight", qweight)
@@ -831,7 +822,6 @@ class BaseAWQLinearMethod(LinearMethodBase):
                 "tensor parallel size."
             )
 
-        weight_loader = extra_weight_attrs.get("weight_loader")
         qweight = PackedvLLMParameter(
             data=torch.empty(
                 input_size_per_partition,
@@ -842,7 +832,6 @@ class BaseAWQLinearMethod(LinearMethodBase):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
         )
 
         num_groups = input_size_per_partition // group_size
@@ -857,7 +846,6 @@ class BaseAWQLinearMethod(LinearMethodBase):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
         )
 
         scales = GroupQuantScaleParameter(
@@ -868,7 +856,6 @@ class BaseAWQLinearMethod(LinearMethodBase):
             ),
             input_dim=0,
             output_dim=1,
-            weight_loader=weight_loader,
         )
 
         layer.register_parameter("qweight", qweight)

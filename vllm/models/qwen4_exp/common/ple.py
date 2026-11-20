@@ -79,17 +79,3 @@ class PLEVocabParallelEmbedding(VocabParallelEmbedding):
             copy_weight_(target, source)
         return overlap.row_count
 
-    def weight_loader(
-        self,
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        checkpoint_start: int | None = None,
-    ) -> None:
-        if checkpoint_start is None:
-            super().weight_loader(param, loaded_weight)
-            return
-        self._copy_embedding_shard_(
-            param,
-            loaded_weight,
-            checkpoint_start=checkpoint_start,
-        )

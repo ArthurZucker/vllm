@@ -88,6 +88,8 @@ class MTPMixin(CausalMixin):
         return NoopOffloader()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """The draft's tensors only (its MTP layers, and the embedding when it
+        tracks its own); `has_own_embed_tokens` when the checkpoint ships one"""
         embed_prefix = None
         if self._tracks_own_embed:
             embed = self.model.get_input_embeddings()

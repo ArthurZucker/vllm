@@ -3,8 +3,13 @@
 
 import pytest
 from PIL import Image
+from transformers.core_model_loading import rename_source_key
 
 from vllm.exceptions import VLLMValidationError
+from vllm.model_executor.model_loader.conversion_mapping import (
+    _CONVERSION_MAPPING,
+    _entry_name,
+)
 from vllm.model_executor.models.alpamayo2_super import (
     Alpamayo2SuperForConditionalGeneration,
 )
@@ -66,7 +71,7 @@ def test_video_input_is_rejected(processor) -> None:
 
 
 def test_weights_mapper_unwraps_vlm_and_drops_expert() -> None:
-    mapper = Alpamayo2SuperForConditionalGeneration.hf_to_vllm_mapper
+    renamings = _CONVERSION_MAPPING[_entry_name(Alpamayo2SuperForConditionalGeneration)]
     names = [
         "vlm.model.language_model.layers.0.mlp.up_proj.weight",
         "vlm.model.visual.blocks.0.attn.qkv.weight",
@@ -74,7 +79,8 @@ def test_weights_mapper_unwraps_vlm_and_drops_expert() -> None:
         "expert.expert.layers.0.mlp.up_proj.weight",
         "expert.action_out_proj.weight",
     ]
-    assert mapper.apply_list(names) == [
+    mapped = [rename_source_key(name, renamings, [])[0] for name in names]
+    assert [name for name in mapped if "_dropped_" not in name] == [
         "language_model.model.layers.0.mlp.up_proj.weight",
         "visual.blocks.0.attn.qkv.weight",
         "language_model.lm_head.weight",

@@ -286,54 +286,6 @@ def test_audio_tower_returns_one_embedding_per_audio_token(tiny_tower, num_sampl
     assert embeddings.shape == (num_tokens, 40)
 
 
-def test_decoder_weights_read_both_checkpoint_layouts():
-    from vllm.model_executor.models.nemotron3_5_transcribe import (
-        Nemotron3_5TranscribeForConditionalGeneration as Model,
-    )
-    from vllm.model_executor.models.nemotron3_5_transcribe import _decoder_weights
-
-    nemo = {
-        "llm.model.embed_tokens.weight": torch.ones(8, 4),
-        "llm.model.layers.0.mixer._fp32_params.A_log": torch.ones(2),
-        "llm.model.layers.1.mixer.experts.down_projs": torch.arange(24.0).view(2, 3, 4),
-        "llm.model.norm.weight": torch.ones(4),
-    }
-    # The FP8 and NVFP4 checkpoints: Hugging Face names, one tensor per expert.
-    hf = {
-        "backbone.embeddings.weight": torch.ones(8, 4),
-        "backbone.layers.1.mixer.experts.0.up_proj.weight_scale": torch.ones(()),
-        "lm_head.weight": torch.ones(8, 4),
-    }
-    mapped = Model.hf_to_vllm_mapper.apply((nemo | hf).items())
-    decoder = ((name.removeprefix("language_model."), t) for name, t in mapped)
-    out = dict(_decoder_weights(decoder, vocab_size=10))
-    assert sorted(out) == [
-        "lm_head.weight",
-        "model.embed_tokens.weight",
-        "model.embeddings.weight",
-        "model.layers.0.mixer.A_log",
-        "model.layers.1.mixer.experts.0.down_proj.weight",
-        "model.layers.1.mixer.experts.0.up_proj.weight_scale",
-        "model.layers.1.mixer.experts.1.down_proj.weight",
-        "model.norm_f.weight",
-    ]
-    for name in (
-        "model.embed_tokens.weight",
-        "model.embeddings.weight",
-        "lm_head.weight",
-    ):
-        assert out[name].shape == (10, 4) and out[name][8:].eq(0).all()
-    assert torch.equal(
-        out["model.layers.1.mixer.experts.1.down_proj.weight"],
-        nemo["llm.model.layers.1.mixer.experts.down_projs"][1].t(),
-    )
-    # Names outside both layouts stay unmapped, so load_weights refuses them.
-    unknown = [("llm.vision.weight", torch.ones(1))]
-    assert [name for name, _ in Model.hf_to_vllm_mapper.apply(unknown)] == [
-        "llm.vision.weight"
-    ]
-
-
 def test_only_audio_has_a_placeholder():
     from vllm.model_executor.models.nemotron3_5_transcribe import (
         AUDIO_PLACEHOLDER,
@@ -349,11 +301,12 @@ def test_only_audio_has_a_placeholder():
 
 
 def test_quantization_layer_names_map_onto_the_model():
+    from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
     from vllm.model_executor.models.nemotron3_5_transcribe import (
         Nemotron3_5TranscribeForConditionalGeneration as Model,
     )
 
-    mapper = Model.hf_to_vllm_mapper.get_rename_mapper()
+    mapper = rename_mapper(Model)
     assert mapper.apply_list(
         [
             "backbone.layers.1.mixer.gate",
@@ -375,6 +328,7 @@ def test_quantization_layer_names_map_onto_the_model():
 @pytest.mark.usefixtures("dist_init")
 def test_fp8_recipe_quantizes_the_asr_encoder_linear_layers():
     from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
+    from vllm.model_executor.model_loader.ops_loader import load_weights
     from vllm.model_executor.model_loader.utils import configure_quant_config
     from vllm.model_executor.models.nemotron3_5_transcribe import (
         Nemotron3_5TranscribeForConditionalGeneration as Model,
@@ -431,7 +385,7 @@ def test_fp8_recipe_quantizes_the_asr_encoder_linear_layers():
         if name.endswith("_scale"):
             tensor = torch.tensor(0.25)
         weights.append((name, tensor))
-    tower.load_weights(weights)
+    load_weights(tower, weights)
     w_qkv = tower.get_submodule("encoder.asr_encoder.layers.0.attn.w_qkv")
     assert w_qkv.weight_scale.item() == w_qkv.input_scale.item() == 0.25
 

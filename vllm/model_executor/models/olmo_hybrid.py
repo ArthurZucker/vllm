@@ -21,7 +21,6 @@
 # limitations under the License.
 """Inference-only OLMo Hybrid model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from functools import partial
 from itertools import islice
 
@@ -67,8 +66,6 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import HasInnerState, IsHybrid, SupportsLoRA, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -301,23 +298,6 @@ class OlmoHybridDecoderLayer(nn.Module):
 
 @support_torch_compile
 class OlmoHybridModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-            ".linear_attn.q_proj": (".linear_attn.in_proj_qkvg", 0),
-            ".linear_attn.k_proj": (".linear_attn.in_proj_qkvg", 1),
-            ".linear_attn.v_proj": (".linear_attn.in_proj_qkvg", 2),
-            ".linear_attn.g_proj": (".linear_attn.in_proj_qkvg", 3),
-            ".q_conv1d": (".conv1d", 0),
-            ".k_conv1d": (".conv1d", 1),
-            ".v_conv1d": (".conv1d", 2),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -373,10 +353,6 @@ class OlmoHybridModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class OlmoHybridForCausalLM(
@@ -474,7 +450,3 @@ class OlmoHybridForCausalLM(
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

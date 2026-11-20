@@ -16,9 +16,6 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -27,7 +24,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -36,7 +32,6 @@ from vllm.model_executor.models.utils import maybe_prefix
 
 from .model import (
     DeepseekV4DecoderLayer,
-    make_deepseek_v4_expert_params_mapping,
 )
 
 logger = init_logger(__name__)
@@ -248,6 +243,19 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.checkpoint_transforms = [self._confidence_head_if_shipped]
+
+    def _confidence_head_if_shipped(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream as is; a confidence head the checkpoint does not ship is
+        dropped (adaptive verification then runs without it)"""
+        shipped = False
+        for name, weight in weights:
+            shipped = shipped or "confidence_head." in name
+            yield name, weight
+        if not shipped:
+            self.model.confidence_head = None
 
     # --- Hooks used by the speculator ---
 
@@ -302,116 +310,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
     # --- Weight loading ---
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load `mtp.{0,1,2}.*` draft weights from the target checkpoint."""
-        first_layer = self.model.layers[0]
-        use_mega_moe = first_layer.ffn.use_mega_moe
-        if use_mega_moe:
-            expert_mapping = make_deepseek_v4_expert_params_mapping(
-                self.config.n_routed_experts
-            )
-        else:
-            expert_mapping = fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="w1",
-                ckpt_down_proj_name="w2",
-                ckpt_up_proj_name="w3",
-                num_experts=self.config.n_routed_experts,
-            )
-        expert_scale_suffix = (
-            ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
-            else ".weight_scale_inv"
-        )
-
-        stacked_params_mapping = [
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        loaded_confidence_head = False
-
-        for name, loaded_weight in weights:
-            mapped = self._remap_dspark_name(name)
-            if mapped is None:
-                continue
-            name = mapped
-            if "confidence_head." in name:
-                loaded_confidence_head = True
-
-            # .scale -> per-method scale suffix
-            if name.endswith(".scale"):
-                suffix = (
-                    expert_scale_suffix
-                    if _EXPERT_SCALE_RE.search(name)
-                    else ".weight_scale_inv"
-                )
-                name = name.removesuffix(".scale") + suffix
-
-            # Expert weights
-            if ".experts." in name:
-                if (
-                    "weight_scale" in name
-                    and loaded_weight.dtype == torch.float8_e8m0fnu
-                ):
-                    loaded_weight = loaded_weight.view(torch.uint8)
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
-                    if weight_name not in name:
-                        continue
-                    name_mapped = name.replace(weight_name, param_name)
-                    if name_mapped not in params_dict:
-                        continue
-                    param = params_dict[name_mapped]
-                    success = param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        loaded_params.add(name_mapped)
-                        break
-                continue
-
-            # Stacked params (decoder-layer only)
-            is_layer_param = name.startswith("model.layers.")
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if not is_layer_param or weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    break
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if ".shared_experts.w2" in name:
-                    name = name.replace(
-                        ".shared_experts.w2", ".shared_experts.down_proj"
-                    )
-                if name.endswith(".ffn.gate.bias"):
-                    name = name.replace(
-                        ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
-                    )
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        if self.model.confidence_head is not None and not loaded_confidence_head:
-            self.model.confidence_head = None
-        logger.info_once("DSpark XPU draft model loaded: %d params", len(loaded_params))
-        return loaded_params
 
     def process_weights_after_loading(self) -> None:
         for layer in self.model.layers:

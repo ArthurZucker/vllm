@@ -60,7 +60,6 @@ from vllm.model_executor.model_loader.reload.layerwise import (
     record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.utils import get_model_architecture
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -339,19 +338,13 @@ def _unpadded_block(padded: torch.Tensor, expected: torch.Tensor) -> torch.Tenso
     return padded[:rows, :cols]
 
 
-@pytest.mark.parametrize(
-    "load_path", ["load_weights", "fused_gate_up", "weight_loader"]
-)
+@pytest.mark.parametrize("load_path", ["load_weights", "fused_gate_up"])
 def test_online_shared_expert_loads_bf16_weights_into_mxfp4_slot(
     default_vllm_config,
     single_rank_parallel_state,
     load_path: str,
 ) -> None:
-    """A BF16 shared expert is quantized while routed MXFP4 weights are loaded.
-
-    `weight_loader` covers DeepSeek-style model loaders, which bypass
-    `RoutedExperts.load_weights`.
-    """
+    """A BF16 shared expert is quantized while routed MXFP4 weights are loaded."""
     default_vllm_config.model_config = ModelConfig()
     hidden_size = intermediate_size = 64
     num_routed_experts = 2
@@ -407,17 +400,6 @@ def test_online_shared_expert_loads_bf16_weights_into_mxfp4_slot(
                 ("2.down_proj.weight", shared_down),
             ]
         list(layer.load_weights(weights))
-
-        if load_path == "weight_loader":
-            for stem, shard_id, weight in (
-                ("w13", "w1", shared_gate),
-                ("w13", "w3", shared_up),
-                ("w2", "w2", shared_down),
-            ):
-                param = getattr(layer, f"{stem}_weight")
-                param.weight_loader(
-                    param, weight, f"{layer.layer_name}.{stem}_weight", shard_id, 2
-                )
 
     expected_gate, expected_gate_scale = mxfp4_quantize(shared_gate)
     expected_up, expected_up_scale = mxfp4_quantize(shared_up)
@@ -822,7 +804,7 @@ _ROUTED_TARGET_CASES = [
                 id=f"{config_id}-{case_id}",
                 marks=pytest.mark.skip(
                     # TODO: enable once `QuarkLinearMethod` implements
-                    # `dequantize_weight`.
+                    # `dequantize_op` for NVFP4.
                     reason="Requantizing Quark NVFP4 shared experts is not supported."
                 )
                 if config is _QUARK_NVFP4_ROUTED_NVFP4_SHARED_QUANT_CONFIG
@@ -990,25 +972,6 @@ def test_fse_online_quantization_routed_shared(
         f"Quantizing {len(quantized)} layers of types: " + "; ".join(quantized)
     ]
 
-    if fse_requested:
-        # The staged shared experts were quantized into their slots once.
-        with pytest.raises(NotImplementedError, match="Reloading fused shared"):
-            routed_experts.weight_loader(
-                routed_experts.w2_weight,
-                torch.zeros(1),
-                f"{routed_experts.layer_name}.w2_weight",
-                "w2",
-                routed_experts.moe_config.num_logical_experts,
-            )
-    if fse_requested and source_cls is None:
-        # Requantized routed experts parameters are replaced after processing, and
-        # are restored for reloads by the layerwise reload machinery only.
-        shared_prefix = routed_experts.moe_config.shared_expert_prefix
-        with pytest.raises(NotImplementedError, match="Reloading fused shared"):
-            model.load_weights(
-                [(f"{shared_prefix}.down_proj.weight", routed_experts.w2_weight[0])]
-            )
-
 
 def test_fse_online_quantization_bf16_routed_quantized_shared_raises(
     tmp_path: Path,
@@ -1047,10 +1010,9 @@ def test_fse_online_quantization_routed_shared_loads_checkpoint_weights(
     checkpoint names (`w1/w2/w3`, `shared_experts.*`, `weight_scale_inv`), as the
     model loader does.
     """
-    from vllm.models.minimax_m3.amd.model import (
-        MiniMaxM3SparseForCausalLM,
-        _redirect_fused_shared_experts,
-    )
+    from vllm.model_executor.model_loader.conversion_mapping import _CONVERSION_MAPPING
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
+    from vllm.models.minimax_m3.amd.model import _redirect_fused_shared_experts
 
     default_vllm_config.model_config = ModelConfig()
     hidden_size = intermediate_size = 64
@@ -1148,10 +1110,10 @@ def test_fse_online_quantization_routed_shared_loads_checkpoint_weights(
         decoder_layer.block_sparse_moe = torch.nn.Module()
         decoder_layer.block_sparse_moe.experts = runner
         model.layers = torch.nn.ModuleList([decoder_layer])
-        redirect = partial(_redirect_fused_shared_experts, model=model)
-        mapper = MiniMaxM3SparseForCausalLM.hf_to_vllm_mapper
-        mapper = mapper | WeightsMapper(weights_transforms=[redirect])
-        AutoWeightsLoader(model).load_weights(weights, mapper=mapper)
+        model.checkpoint_transforms = [
+            partial(_redirect_fused_shared_experts, model=model)
+        ]
+        load_with_ops(model, weights, _CONVERSION_MAPPING["MiniMaxM3SparseForCausalLM"])
         layer.quant_method.process_weights_after_loading(layer)
 
     def check_slot(slot: int, gate, up, down) -> None:
@@ -1228,66 +1190,55 @@ def test_online_gate_up_proj_target_disables_fse(
 
 
 @pytest.mark.skip_global_cleanup
-@pytest.mark.parametrize("num_shared", [0, 1, 2])
-@pytest.mark.parametrize("experts_per_chunk", [1, 3, 4])
-def test_online_moe_quantize_weights_places_routed_then_shared_experts(
-    num_shared: int, experts_per_chunk: int
-):
-    """Chunked routed experts come first and the staged shared experts last."""
-    import types
-
+@pytest.mark.parametrize("num_shared", [1, 2])
+def test_online_moe_quantize_shared_experts_into_last_slots(num_shared: int):
+    """Requantized routed experts load on the plan; the staged shared experts are
+    quantized after, with the same quantize op, into the last slots."""
     from vllm.model_executor.layers.quantization.online.moe_base import (
         OnlineMoEMethodBase,
     )
 
-    num_routed, w13_shape, w2_shape = 4, (6, 8), (8, 3)
+    num_routed, hidden, inter = 4, 8, 3
     num_experts = num_routed + num_shared
 
-    def expert_values(shape: tuple[int, ...]) -> torch.Tensor:
-        # Every element of expert `e` is `e`, so the slot is recoverable.
-        values = torch.arange(num_experts, dtype=torch.float32)
-        return values.view(-1, 1, 1).expand(num_experts, *shape).contiguous()
+    class Method(OnlineMoEMethodBase):
+        def quantize_experts(self, layer, name, weight):
+            return weight * 2, weight.mean(-1)
 
-    w13_all, w2_all = expert_values(w13_shape), expert_values(w2_shape)
+        def process_weights_after_loading(self, layer):
+            pass
 
-    def dequantize_weight(layer):
-        for start in range(0, num_routed, experts_per_chunk):
-            experts = slice(start, min(start + experts_per_chunk, num_routed))
-            yield experts, w13_all[experts], w2_all[experts]
-
-    method = SimpleNamespace(
-        requantization_source=SimpleNamespace(
-            dequantize_weight=dequantize_weight,
-        ),
-        _pad_requantized_weights=lambda layer, w13, w2, n: (w13, w2),
+    method = Method.__new__(Method)
+    method.moe = SimpleNamespace(w13_num_shards=2)
+    layer = torch.nn.Module()
+    layer.local_num_experts = num_experts
+    layer.orig_dtype = torch.float32
+    layer.moe_config = SimpleNamespace(
+        hidden_dim=hidden, intermediate_size_per_partition=inter
     )
-    method.iter_weights_for_quantization = types.MethodType(
-        OnlineMoEMethodBase.iter_weights_for_quantization, method
-    )
-    layer = SimpleNamespace(
-        local_num_experts=num_experts,
-        expert_map_manager=SimpleNamespace(num_fused_shared_experts=num_shared),
-        orig_dtype=torch.float32,
-        shared_expert_online_loader=SimpleNamespace(
-            dequantize_staging=lambda layer: (
-                w13_all[num_routed:],
-                w2_all[num_routed:],
-            ),
-            release_staging=lambda layer: None,
-        ),
-    )
+    for name, shape in (
+        ("w13_weight", (num_experts, 2 * inter, hidden)),
+        ("w13_weight_scale", (num_experts, 2 * inter)),
+        ("w2_weight", (num_experts, hidden, inter)),
+        ("w2_weight_scale", (num_experts, hidden)),
+    ):
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.zeros(shape), requires_grad=False)
+        )
+    shared_w13 = torch.randn(num_shared, 2 * inter, hidden, dtype=torch.bfloat16)
+    shared_w2 = torch.randn(num_shared, hidden, inter, dtype=torch.bfloat16)
 
-    def quantize(w13, w2):
-        return w13 * 2, w13.mean(-1), w2 * 2, w2.mean(-1)
+    method.quantize_shared_experts(layer, shared_w13, shared_w2)
 
-    w13_q, w13_scale, w2_q, w2_scale = OnlineMoEMethodBase.quantize_weights(
-        method, layer, quantize
-    )
-
-    assert torch.equal(w13_q, w13_all * 2)
-    assert torch.equal(w13_scale, w13_all.mean(-1))
-    assert torch.equal(w2_q, w2_all * 2)
-    assert torch.equal(w2_scale, w2_all.mean(-1))
+    shared = slice(num_routed, num_experts)
+    for name, weight in (("w13", shared_w13), ("w2", shared_w2)):
+        weight = weight.float()
+        assert torch.equal(getattr(layer, f"{name}_weight")[shared], weight * 2)
+        assert torch.equal(
+            getattr(layer, f"{name}_weight_scale")[shared], weight.mean(-1)
+        )
+        # The routed experts' slots, filled on load, are left alone.
+        assert not getattr(layer, f"{name}_weight")[:num_routed].any()
 
 
 if current_platform.is_rocm():

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ROCm MoE implementation for Muse Spark checkpoints."""
 
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 
@@ -765,26 +765,6 @@ def _online_mxfp4_applies(prefix: str) -> bool:
     return extract_layer_index(prefix) not in (0, num_layers - 1)
 
 
-_QUARK_EXPERT_PROJECTIONS = {
-    "gate_proj": ("w13_weight", "w1"),
-    "up_proj": ("w13_weight", "w3"),
-    "down_proj": ("w2_weight", "w2"),
-}
-
-
-def _quark_expert_weight_slot(name: str) -> tuple[str, str, int] | None:
-    parts = name.split(".")
-    if len(parts) != 3 or not parts[0].isdigit():
-        return None
-    projection = _QUARK_EXPERT_PROJECTIONS.get(parts[1])
-    if projection is None or parts[2] not in ("weight", "weight_scale"):
-        return None
-    param_name, shard_id = projection
-    if parts[2] == "weight_scale":
-        param_name += "_scale"
-    return param_name, shard_id, int(parts[0])
-
-
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
     """MuseSpark routed experts using ROCm BF16, FP8, or MXFP4 methods."""
 
@@ -823,31 +803,6 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
             quant_method.weight_quant_key,
             quant_method.activation_quant_key,
         )
-
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        if isinstance(
-            self.quant_method, MuseSparkOnlineMXFP4FusedMoE
-        ) or not isinstance(
-            self.quant_method,
-            (MuseSparkQuarkW8A8Fp8FusedMoE, MuseSparkQuarkOCPMXFusedMoE),
-        ):
-            # Quark's unquantized layers (0 and 61) store per-expert tensors.
-            consolidated: list[tuple[str, torch.Tensor]] = []
-            per_expert: list[tuple[str, torch.Tensor]] = []
-            for name, tensor in weights:
-                if _quark_expert_weight_slot(name) is None:
-                    consolidated.append((name, tensor))
-                else:
-                    per_expert.append((name, tensor))
-            if consolidated:
-                yield from super().load_weights(consolidated)
-            if per_expert:
-                yield from RoutedExperts.load_weights(self, per_expert)
-            return
-
-        yield from RoutedExperts.load_weights(self, weights)
 
 
 class MuseMoERunner(MoERunner):

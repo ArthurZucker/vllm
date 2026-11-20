@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import typing
-from collections.abc import Callable, Iterable
 from itertools import islice
 
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -19,7 +16,6 @@ from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClam
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -40,18 +36,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     SupportsEagle3,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
 )
@@ -207,6 +199,7 @@ class DeepseekV4MoE(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            ckpt_names=("w1", "w2", "w3"),
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
@@ -629,196 +622,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        def _resolve_param_name(name: str) -> str:
-            inv_name = f"{name}_inv"
-            if name not in params_dict and inv_name in params_dict:
-                return inv_name
-            return name
-
-        # Pre-compute expert mapping ONCE.
-        expert_mapping = self.get_expert_mapping()
-
-        # Each MoE's own per-layer fusion decision is the source of truth,
-        # so the redirect below can't diverge from how it was built.
-        fuse_by_layer = {
-            extract_layer_index(mod_name): mod.is_fused_shared_expert_enabled
-            for mod_name, mod in self.named_modules()
-            if isinstance(mod, DeepseekV4MoE)
-        }
-        n_routed = self.config.n_routed_experts
-        # Maps the single shared-expert tensor group to one appended slot;
-        # multiple shared experts would need per-expert slicing (see
-        # deepseek_v2.py). DeepSeek-V4 has n_shared_experts == 1.
-        if any(fuse_by_layer.values()) and self.config.n_shared_experts != 1:
-            raise NotImplementedError(
-                "deepseek-v4 fused shared-expert loading supports only "
-                f"n_shared_experts == 1, got {self.config.n_shared_experts}"
-            )
-
-        for name, loaded_weight in weights:
-            # Shared-expert fusion: redirect shared_experts.w{1,2,3} into
-            # the appended routed-expert slot so it loads through the
-            # routed expert (grouped GEMM) loader.
-            if ".ffn.shared_experts.w" in name and fuse_by_layer.get(
-                extract_layer_index(name), False
-            ):
-                name = name.replace(
-                    ".ffn.shared_experts.w",
-                    f".ffn.experts.{n_routed}.w",
-                )
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if ".experts." in name:
-                    continue
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                if is_pp_missing_parameter(name, self):
-                    break
-                param_name = _resolve_param_name(name)
-                param = params_dict[param_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(param_name)
-                break
-            else:
-                if ".experts." in name:
-                    # E8M0 scales are float8_e8m0fnu in checkpoints but the
-                    # MoE param is uint8; copy_() would numerically convert
-                    # (e.g. 2^-7 -> 0) instead of preserving raw bytes.
-                    if (
-                        "weight_scale" in name
-                        and loaded_weight.dtype == torch.float8_e8m0fnu
-                    ):
-                        loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, expert_shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        param = params_dict[name_mapped]
-                        # return_success lets us skip experts that have
-                        # another replica available.
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=expert_shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
-                    continue
-                else:
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param_name = _resolve_param_name(name)
-                    param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(param_name)
-                    continue
-
-        return loaded_params
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # (param_name, weight_name, expert_id, shard_id). When fusing shared
-        # experts, include the appended slots so redirected shared-expert
-        # weights route through the expert loader.
-        n_shared = getattr(self.config, "n_shared_experts", 0) or 0
-        num_experts = self.config.n_routed_experts + (
-            n_shared if self.is_fused_shared_expert_enabled else 0
-        )
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=num_experts,
-        )
-
-
-def _make_deepseek_v4_weights_mapper(
-    expert_dtype: str, fuse_shared_experts: bool = False
-) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts register scales as ``w{1,2,3}_weight_scale`` (no
-        # _inv); FP8 linear/shared-expert scales register as
-        # ``weight_scale_inv``. Route DeepSeek-native ``.scale`` and
-        # AMD-Quark ``.weight_scale`` keys accordingly, leaving expert/
-        # shared-expert ``w{1,2,3}.weight_scale`` untouched for the MXFP4
-        # loader.
-        scale_regex = {
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-            re.compile(r"(?<!\.w[123])\.weight_scale$"): ".weight_scale_inv",
-        }
-    else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            re.compile(r"\.scale$"): ".weight_scale_inv",
-        }
-    # Fused shared experts are redirected to routed expert slots elsewhere;
-    # leave their names untouched here.
-    substr_map: dict[str, str | None] = (
-        {}
-        if fuse_shared_experts
-        else {".shared_experts.w2": ".shared_experts.down_proj"}
-    )
-    # No MTP support on CPU yet: drop mtp.* weights (no model.mtp submodule).
-    substr_map["mtp."] = None
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "hc_head": "model.hc_head",
-            "mtp.": "model.mtp.",
-        },
-        orig_to_new_regex=scale_regex,
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-            ".input_scale": ".input_scale_2",
-        },
-        orig_to_new_substr=substr_map,
-    )
-
 
 class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     model_cls = DeepseekV4Model
 
-    # Default mapper assumes the original FP4-expert checkpoint layout.
-    # Overridden per-instance in __init__ when expert_dtype != "fp4".
-    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
     packed_modules_mapping = {
         "gate_up_proj": ["w1", "w3"],
         "fused_wqa_wkv": ["wq_a", "wkv"],
@@ -829,15 +636,9 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = getattr(config, "expert_dtype", "fp4")
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        if expert_dtype != "fp4" or self.model.is_fused_shared_expert_enabled:
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
-                expert_dtype,
-                fuse_shared_experts=self.model.is_fused_shared_expert_enabled,
-            )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -879,13 +680,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def process_weights_after_loading(self) -> None:
         # No CPU AMX weight-packing hook yet.
         pass
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

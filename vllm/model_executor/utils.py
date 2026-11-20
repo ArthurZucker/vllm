@@ -54,20 +54,6 @@ def set_weight_attrs(
         return
     for key, value in weight_attrs.items():
         assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
-
-        # NOTE(woosuk): During weight loading, we often do something like:
-        # narrowed_tensor = param.data.narrow(0, offset, len)
-        # narrowed_tensor.copy_(real_weight)
-        # expecting narrowed_tensor and param.data to share the same storage.
-        # However, on TPUs, narrowed_tensor will lazily propagate to the base
-        # tensor, which is param.data, leading to the redundant memory usage.
-        # This sometimes causes OOM errors during model loading. To avoid this,
-        # we sync the param tensor after its weight loader is called.
-        # TODO(woosuk): Remove this hack once we have a better solution.
-        from vllm.platforms import current_platform
-
-        if current_platform.use_sync_weight_loader() and key == "weight_loader":
-            value = current_platform.make_synced_weight_loader(value)
         setattr(weight, key, value)
 
 
@@ -179,8 +165,8 @@ def replace_parameter(
     existing one is an online requantization source (released after conversion).
 
     Custom attributes set on `new_tensor` (e.g. kernel dispatch flags such as
-    `is_shuffled`) are carried over to the parameter, except `weight_loader`,
-    which is always taken from the existing parameter, and the direct-reload
+    `is_shuffled`) are carried over to the parameter, except `weight_loader`
+    (loading writes through `ops_loader`, not per-param loaders), and the direct-reload
     attributes `_ckpt` and `fill_on_reload`, which belong to the parameter they
     were set on.
 
@@ -208,12 +194,8 @@ def replace_parameter(
 
     new_tensor_attrs = dict(new_tensor.__dict__)
 
-    # `weight_loader` is the only attribute not ported over from new_tensor,
-    # old_param.weight_loader only is supported. `_weight_loader` is
-    # `BasevLLMParameter`'s backing field for its `weight_loader` property, so
-    # a loader riding along under that name has to be dropped as well.
+    # a `weight_loader` riding along on new_tensor is not ported over
     new_tensor_attrs.pop("weight_loader", None)
-    new_tensor_attrs.pop("_weight_loader", None)
     # A checkpoint record belongs to the parameter it was recorded on (direct
     # reload); one on new_tensor (another checkpoint parameter) must not overwrite it.
     # Likewise the reload zero-fill flag: it is declared per parameter.
@@ -255,10 +237,6 @@ def replace_parameter(
 
     for attr_name, attr in new_tensor_attrs.items():
         setattr(new_param, attr_name, attr)
-
-    if old_param is not None and hasattr(old_param, "weight_loader"):
-        weight_loader = old_param.weight_loader
-        set_weight_attrs(new_param, {"weight_loader": weight_loader})
 
     setattr(layer, param_name, new_param)
 
@@ -383,16 +361,14 @@ def get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
 def get_moe_expert_mapping(
     model: torch.nn.Module,
 ) -> list[tuple[str, str, int, str]]:
-    """Get the expert mapping from a model.
+    """The expert mapping of the model's first `RoutedExperts` layer, by the checkpoint
+    names it declares (`ckpt_names`)"""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-    It will be retrieved from the first module that has a `get_expert_mapping` method.
-    If the model manually implements `get_expert_mapping`, it will be used.
-    Otherwise, it will use the first RoutedExperts layer."""
-    for _, module in model.named_modules():
-        get_mapping = getattr(module, "get_expert_mapping", None)
-        if get_mapping is not None:
-            return get_mapping()
-    raise ValueError("No module in the model has a `get_expert_mapping` method.")
+    for module in model.modules():
+        if isinstance(module, RoutedExperts):
+            return module.get_expert_mapping()
+    raise ValueError("The model has no `RoutedExperts` layer.")
 
 
 def maybe_disable_graph_partition(current_backend: str) -> dict[str, bool]:

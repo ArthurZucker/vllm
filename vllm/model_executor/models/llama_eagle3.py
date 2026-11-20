@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,11 +30,9 @@ from vllm.model_executor.models.llama import (
 from vllm.multimodal.inputs import NestedTensors
 
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -287,21 +285,6 @@ class LlamaModel(nn.Module):
 
         return hidden_states, aux_output
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={"midlayer.": "layers.0."},
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -335,6 +318,7 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
@@ -407,42 +391,3 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
             )
 
         return self.model.fc(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        model_weights = {}
-        includes_draft_id_mapping = False
-        includes_embed_tokens = False
-        for name, loaded_weight in weights:
-            if "t2d" in name:
-                continue
-            if "d2t" in name:
-                name = name.replace("d2t", "draft_id_to_target_id")
-                includes_draft_id_mapping = True
-            elif "mask_hidden" in name:
-                # P-EAGLE (parallel drafting) weight; not supported.
-                logger.warning(
-                    "mask_hidden found in weights but parallel drafting is "
-                    "not supported for EAGLE-3. Skipping loading mask_hidden."
-                )
-                continue
-            elif "lm_head" not in name:
-                name = "model." + name
-            if "embed_tokens" in name:
-                includes_embed_tokens = True
-            model_weights[name] = loaded_weight
-            process_eagle_weight(self, name)
-
-        orig_to_new_substr = {"mask_hidden": None}
-        if not includes_draft_id_mapping:
-            orig_to_new_substr["draft_id_to_target_id"] = None
-        if not includes_embed_tokens:
-            orig_to_new_substr["embed_tokens"] = None
-        if not self.model.use_aux_hidden_state:
-            orig_to_new_substr["fc."] = None
-        if not self.model.norm_before_fc:
-            orig_to_new_substr["input_norm."] = None
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(
-            model_weights.items(),
-            mapper=WeightsMapper(orig_to_new_substr=orig_to_new_substr),
-        )

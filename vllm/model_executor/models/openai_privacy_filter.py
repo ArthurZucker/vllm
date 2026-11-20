@@ -20,9 +20,14 @@ from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_classify
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.sequence import IntermediateTensors
 
-from .gpt_oss import GptOssForCausalLM, GptOssModel, OAIAttention, TransformerBlock
+from .gpt_oss import (
+    GptOssModel,
+    OAIAttention,
+    TransformerBlock,
+    transpose_bf16_experts,
+)
 from .interfaces_base import attn_type, default_pooling_type
-from .utils import AutoWeightsLoader, maybe_prefix
+from .utils import maybe_prefix
 
 
 class OpenAIPrivacyFilterAttention(OAIAttention):
@@ -66,6 +71,7 @@ def _interleave_gate_up_concat_to_pairs(
     # gate/up interleaved. MXFP4/quark suffixes are already interleaved.
     for name, weight in weights:
         if name.endswith(".gate_up_proj") or name.endswith(".gate_up_proj_bias"):
+            weight = weight if isinstance(weight, torch.Tensor) else weight[...]
             *lead, two_i = weight.shape
             i = two_i // 2
             weight = (
@@ -80,7 +86,11 @@ def _interleave_gate_up_concat_to_pairs(
 @default_pooling_type(tok_pooling_type="ALL")
 class OpenAIPrivacyFilterForTokenClassification(nn.Module):
     is_pooling_model = True
-    hf_to_vllm_mapper = GptOssForCausalLM.hf_to_vllm_mapper
+    # HF's experts: gate and up interleaved, then transposed into vLLM's layout
+    checkpoint_transforms = [
+        _interleave_gate_up_concat_to_pairs,
+        transpose_bf16_experts,
+    ]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -118,10 +128,3 @@ class OpenAIPrivacyFilterForTokenClassification(nn.Module):
         )
         hidden_states = hidden_states.to(self.head_dtype)
         return self.score(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _interleave_gate_up_concat_to_pairs(weights),
-            mapper=self.hf_to_vllm_mapper,
-        )

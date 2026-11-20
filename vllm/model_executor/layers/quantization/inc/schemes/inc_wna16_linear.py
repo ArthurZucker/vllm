@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -191,7 +191,6 @@ class INCXPULinearBase(INCLinearScheme):
         input_size_per_partition: int,
         output_partition_sizes: list[int],
         params_dtype: torch.dtype,
-        weight_loader: Any,
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
         scales_and_zp_size = input_size_per_partition // self.group_size
@@ -208,7 +207,6 @@ class INCXPULinearBase(INCLinearScheme):
                 output_dim=1,
                 packed_dim=1,
                 packed_factor=self.pack_factor,
-                weight_loader=weight_loader,
             )
         else:
             # GPTQ: qweight [in // pack_factor, out] packed along input dim
@@ -222,7 +220,6 @@ class INCXPULinearBase(INCLinearScheme):
                 output_dim=1,
                 packed_dim=0,
                 packed_factor=self.pack_factor,
-                weight_loader=weight_loader,
             )
         scales = GroupQuantScaleParameter(
             data=torch.empty(
@@ -232,7 +229,6 @@ class INCXPULinearBase(INCLinearScheme):
             ),
             input_dim=0,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         # Both AWQ and GPTQ checkpoints store qzeros with this shape; for
         # symmetric quantization the values are ignored downstream.
@@ -246,7 +242,6 @@ class INCXPULinearBase(INCLinearScheme):
             output_dim=1,
             packed_dim=1,
             packed_factor=self.pack_factor,
-            weight_loader=weight_loader,
         )
 
         layer.register_parameter("qweight", qweight)
@@ -300,7 +295,6 @@ class INCXPULinearBase(INCLinearScheme):
             input_size_per_partition=input_size_per_partition,
             output_partition_sizes=output_partition_sizes,
             params_dtype=params_dtype,
-            weight_loader=extra_weight_attrs.get("weight_loader"),
         )
 
 

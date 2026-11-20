@@ -21,8 +21,9 @@ from vllm.model_executor.layers.fused_moe.expert_substitution import (
     ConstantExpertSubstitution,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.expert_substitution import as_expert_substitution_model
-from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -77,7 +78,7 @@ def _approx_value(layer: int, expert: int) -> str:
     return f"model.layers.{layer}.mlp.experts.{expert}.approx_value"
 
 
-def _cpu_model(local_layers=(0, 1), tracked=True, model_config=MODEL_CONFIG):
+def _cpu_model(local_layers=(0, 1), model_config=MODEL_CONFIG):
     """Two decoder layers; the others are placeholders as on another PP stage."""
 
     class Model(torch.nn.Module):
@@ -97,10 +98,6 @@ def _cpu_model(local_layers=(0, 1), tracked=True, model_config=MODEL_CONFIG):
                 )
                 self.model.layers.append(layer)
 
-        def load_weights(self, weights):
-            loaded = AutoWeightsLoader(self).load_weights(weights)
-            return loaded if tracked else None
-
     return as_expert_substitution_model(Model, model_config)()
 
 
@@ -108,15 +105,21 @@ def _cpu_model(local_layers=(0, 1), tracked=True, model_config=MODEL_CONFIG):
 def test_loads_local_approx_values_and_passes_through_others(local_layers):
     """Other PP stages and MTP drafts own none or some of the configured layers."""
     model = _cpu_model(local_layers)
-    loaded = model.load_weights(
-        [
-            ("weight", torch.tensor([1.0, 2.0])),
-            *(
-                (_approx_value(layer, expert), torch.full((2,), 10.0 * layer + expert))
-                for layer in range(2)
-                for expert in (1, 2)
-            ),
-        ]
+    loaded = load_weights(
+        model,
+        iter(
+            [
+                ("weight", torch.tensor([1.0, 2.0])),
+                *(
+                    (
+                        _approx_value(layer, expert),
+                        torch.full((2,), 10.0 * layer + expert),
+                    )
+                    for layer in range(2)
+                    for expert in (1, 2)
+                ),
+            ]
+        ),
     )
 
     assert loaded == {"weight"} | {
@@ -133,13 +136,16 @@ def test_loads_local_approx_values_and_passes_through_others(local_layers):
 def test_loads_explicitly_named_values(local_layers):
     """Named values are consumed even when their layer is built elsewhere."""
     model = _cpu_model(local_layers, model_config=EXPLICIT_MODEL_CONFIG)
-    loaded = model.load_weights(
-        [
-            ("weight", torch.tensor([1.0, 2.0])),
-            ("constants.shared", torch.full((2,), 1.0)),
-            ("constants.layer_0", torch.full((2,), 2.0)),
-            ("constants.layer_1", torch.full((2,), 3.0)),
-        ]
+    loaded = load_weights(
+        model,
+        iter(
+            [
+                ("weight", torch.tensor([1.0, 2.0])),
+                ("constants.shared", torch.full((2,), 1.0)),
+                ("constants.layer_0", torch.full((2,), 2.0)),
+                ("constants.layer_1", torch.full((2,), 3.0)),
+            ]
+        ),
     )
 
     assert loaded == {"weight"} | {
@@ -150,45 +156,6 @@ def test_loads_explicitly_named_values(local_layers):
             model.model.layers[layer].mlp.experts.values,
             torch.tensor([[1.0, 1.0], [2.0 + layer, 2.0 + layer]]),
         )
-
-
-def test_direct_reload_updates_values_incrementally():
-    model = _cpu_model(local_layers=(0,), tracked=False)
-    values = model.model.layers[0].mlp.experts.values
-    model.load_weights([(_approx_value(0, 2), torch.ones(2))])
-    assert model.load_weights([(_approx_value(0, 1), torch.zeros(2))]) is None
-    model.load_weights([(_approx_value(0, 2), torch.full((2,), 3.0))])
-    torch.testing.assert_close(values, torch.tensor([[0.0, 0.0], [3.0, 3.0]]))
-
-    with pytest.raises(ValueError, match="not listed"):
-        model.load_weights([(_approx_value(0, 0), torch.ones(2))])
-
-
-def test_layerwise_reload_is_rejected_and_keeps_weights():
-    from vllm.model_executor.model_loader.reload import (
-        initialize_layerwise_reload,
-        record_metadata_for_reloading,
-    )
-
-    model = _cpu_model(local_layers=(0,))
-    record_metadata_for_reloading(model)
-    loaded = [
-        ("weight", torch.tensor([3.0, 4.0])),
-        (_approx_value(0, 1), torch.zeros(2)),
-        (_approx_value(0, 2), torch.ones(2)),
-    ]
-    model.load_weights(loaded)
-    substitution = model.model.layers[0].mlp.experts
-    values = substitution.values
-
-    initialize_layerwise_reload(model)
-    with pytest.raises(NotImplementedError, match="layerwise weight reload"):
-        model.load_weights([(name, weight + 1) for name, weight in loaded])
-
-    assert substitution.values is values
-    torch.testing.assert_close(values, torch.tensor([[0.0, 0.0], [1.0, 1.0]]))
-    torch.testing.assert_close(model.weight, torch.tensor([3.0, 4.0]))
-    assert substitution.expert_substitution_routes.tolist() == [0, -1, -2]
 
 
 def _write_tiny_deepseek_mone_checkpoint(
@@ -292,7 +259,7 @@ def test_loads_mone_checkpoint_into_compact_experts(
     )
 
     updated = weights[value_name] + 1
-    assert model.load_weights([(value_name, updated)]) == {
+    assert load_weights(model, iter([(value_name, updated)])) == {
         f"{experts}.routed_experts.expert_substitution.values"
     }
     torch.testing.assert_close(substitution.values.cpu(), updated.unsqueeze(0))

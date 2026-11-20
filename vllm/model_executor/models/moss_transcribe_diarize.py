@@ -11,7 +11,7 @@ The checkpoint layout is:
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
 import regex as re
@@ -32,8 +32,6 @@ from vllm.model_executor.models.interfaces import (
     _require_is_multimodal,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
@@ -42,7 +40,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.models.whisper import (
     WhisperEncoder,
-    _create_fake_bias_for_k_proj,
 )
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -213,6 +210,8 @@ def _add_vllm_audio_metadata(
     processed: BatchFeature,
     num_audios: int,
 ) -> BatchFeature:
+    if "audio_feature_lengths" not in processed:  # Transformers' processor: masks
+        processed["audio_feature_lengths"] = processed["input_features_mask"].sum(-1)
     audio_feature_lengths = processed["audio_feature_lengths"]
     if not isinstance(audio_feature_lengths, torch.Tensor):
         audio_feature_lengths = torch.tensor(audio_feature_lengths, dtype=torch.long)
@@ -267,14 +266,6 @@ def _add_vllm_audio_metadata(
 
 class MossTranscribeDiarizeWhisperEncoder(WhisperEncoder):
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."},
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-        },
-    )
 
     def __init__(
         self,
@@ -290,11 +281,6 @@ class MossTranscribeDiarizeWhisperEncoder(WhisperEncoder):
         )
         self.audio_merge_size = int(vllm_config.model_config.hf_config.audio_merge_size)
         self.max_encoder_batch: int | None = None
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = _create_fake_bias_for_k_proj(weights, ".k_proj.weight")
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def forward(
         self,
@@ -533,9 +519,15 @@ class MossTranscribeDiarizeMultiModalProcessor(
             ]
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
-        audio_start_id = _get_required_token_id(tokenizer, processor.audio_start_token)
+        audio_start_id = _get_required_token_id(
+            tokenizer,
+            getattr(processor, "audio_start_token", None) or processor.audio_bos_token,
+        )
         audio_token_id = int(processor.audio_token_id)
-        audio_end_id = _get_required_token_id(tokenizer, processor.audio_end_token)
+        audio_end_id = _get_required_token_id(
+            tokenizer,
+            getattr(processor, "audio_end_token", None) or processor.audio_eos_token,
+        )
 
         def get_num_tokens(item_idx: int) -> int:
             if item_idx >= len(audio_token_lengths):
@@ -583,19 +575,6 @@ class MossTranscribeDiarizeForConditionalGeneration(
     supports_segment_timestamp = False
     supports_diarized_transcription = True
     supported_languages = ISO639_1_SUPPORTED_LANGS
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "language_model.layers.": "language_model.model.layers.",
-            "language_model.embed_tokens.": "language_model.model.embed_tokens.",
-            "language_model.norm.": "language_model.model.norm.",
-            "model.language_model.model.": "language_model.model.",
-            "model.language_model.lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-            "model.whisper_encoder.": "whisper_encoder.",
-            "model.vq_adaptor.": "vq_adaptor.",
-            "model.": None,
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -859,10 +838,3 @@ class MossTranscribeDiarizeForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            weights,
-            mapper=self.hf_to_vllm_mapper,
-        )

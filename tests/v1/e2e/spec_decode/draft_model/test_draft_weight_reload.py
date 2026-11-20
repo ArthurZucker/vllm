@@ -27,13 +27,14 @@ def _update_draft_weights(worker) -> None:
     engine loading the received weights, `finish_weight_update`), with the
     drafter's own checkpoint as the update."""
     from vllm.model_executor.model_loader import DefaultModelLoader
+    from vllm.model_executor.model_loader.ops_loader import load_weights
     from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 
     model = worker.get_draft_model()
     config = worker.speculative_config.draft_model_config
     loader = DefaultModelLoader(worker.vllm_config.load_config)
     start_reload(model)
-    model.load_weights(loader.get_all_weights(config, model))
+    load_weights(model, loader.get_all_weights(config, model))
     finish_reload(model, config, worker.device)
 
 

@@ -6,6 +6,7 @@ rotation of linear-layer inputs."""
 import pytest
 import torch
 
+from tests.quantization.utils import load_online_quantized
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config.model import ModelConfig
 from vllm.model_executor.kernels.linear.mxfp4.aiter import AiterMxfp4LinearKernel
@@ -20,17 +21,19 @@ from vllm.model_executor.layers.quantization.input_hadamard import (
     block_hadamard_rotate,
     hadamard_matrix,
 )
+from vllm.model_executor.layers.quantization.online.base import _RotatedOnLoad
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
+from vllm.model_executor.model_loader import ops_loader
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
     record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -86,23 +89,15 @@ def _make_layer(
     rotate_weight: bool, input_size: int = 128, output_size: int = 16, size: int = 32
 ) -> tuple[torch.nn.Module, InputHadamardLinearMethod]:
     layer = torch.nn.Module()
-    layer.weight_loader = "v1"
     method = InputHadamardLinearMethod(_DenseOnlineMethod(), size, rotate_weight)
     method.create_weights(
-        layer,
-        input_size,
-        [output_size],
-        input_size,
-        output_size,
-        torch.float32,
-        weight_loader="v2",
+        layer, input_size, [output_size], input_size, output_size, torch.float32
     )
     return layer, method
 
 
 def test_rotates_weight_once_and_input_on_apply():
     layer, method = _make_layer(rotate_weight=True)
-    assert layer.weight.weight_loader == "v1", "wrapped v1 methods keep the v1 loader"
     assert not hasattr(layer, "input_rotation")
     set_random_seed(0)
     w = torch.randn(16, 128)
@@ -125,7 +120,7 @@ def test_checkpoint_rotation_is_checked_and_dropped():
     h = hadamard_matrix(32, w.device)
     layer.weight.data.copy_(block_hadamard_rotate(w, h))
     signs = (h * 32**0.5).round().to(torch.int8)
-    layer.input_rotation.weight_loader(layer.input_rotation, signs)
+    default_weight_loader(layer.input_rotation, signs)
 
     method.process_weights_after_loading(layer)
 
@@ -137,8 +132,10 @@ def test_rejects_non_sylvester_and_missing_rotation():
     layer, method = _make_layer(rotate_weight=False)
     flipped = (hadamard_matrix(32, torch.device("cpu")) * 32**0.5).round()
     flipped[0] = -flipped[0]
+    default_weight_loader(layer.input_rotation, flipped.to(torch.int8))
     with pytest.raises(NotImplementedError, match="Sylvester"):
-        layer.input_rotation.weight_loader(layer.input_rotation, flipped.to(torch.int8))
+        method.process_weights_after_loading(layer)
+    layer, method = _make_layer(rotate_weight=False)
     with pytest.raises(ValueError, match="input_rotation"):
         method.process_weights_after_loading(layer)
 
@@ -160,12 +157,13 @@ def test_layerwise_reload(rotate_weight: bool, default_vllm_config):
     h = hadamard_matrix(32, torch.device("cpu"))
     signs = (h * 32**0.5).round().to(torch.int8)
 
-    def load(w: torch.Tensor) -> None:
-        layer.weight.weight_loader(
-            layer.weight, w if rotate_weight else block_hadamard_rotate(w, h)
+    def load(w: torch.Tensor) -> None:  # as `load_with_ops` writes, reloading or not
+        write = ops_loader.current_load_into()
+        write(
+            "weight", layer.weight, w if rotate_weight else block_hadamard_rotate(w, h)
         )
         if not rotate_weight:
-            layer.input_rotation.weight_loader(layer.input_rotation, signs)
+            write("input_rotation", layer.input_rotation, signs)
 
     set_random_seed(0)
     load(torch.randn(16, 128))
@@ -197,7 +195,6 @@ class _FusingMethod(_DenseOnlineMethod, InputHadamardFusable):
 
 def test_fused_rotation_is_skipped_by_the_wrapper():
     layer = torch.nn.Module()
-    layer.weight_loader = "v1"
     method = InputHadamardLinearMethod(_FusingMethod(), 32, rotate_weight=True)
     method.create_weights(layer, 128, [16], 128, 16, torch.float32)
     set_random_seed(0)
@@ -236,9 +233,11 @@ def _online_mxfp4(
         inner.kernel.out_dtype = torch.bfloat16
     method: LinearMethodBase = inner
     if hadamard_size is not None:
-        method = InputHadamardLinearMethod(inner, hadamard_size, rotate_weight=True)
+        # as `OnlineQuantizationConfig.get_quant_method` wraps it
+        method = _RotatedOnLoad(inner, hadamard_size, rotate_weight=True)
     layer = torch.nn.Module()
     layer.weight_loader = default_weight_loader
+    layer.params_dtype = torch.bfloat16
     method.create_weights(
         layer=layer,
         input_size_per_partition=input_size,
@@ -248,8 +247,8 @@ def _online_mxfp4(
         params_dtype=torch.bfloat16,
         weight_loader=default_weight_loader,
     )
-    replace_parameter(layer, "weight", weight.clone())
-    method.process_weights_after_loading(layer)
+    # the plan's quantize op (rotating first), then post-load processing
+    load_online_quantized(layer, {"weight": weight.clone()}, method)
     return layer, method.apply(layer, x)
 
 

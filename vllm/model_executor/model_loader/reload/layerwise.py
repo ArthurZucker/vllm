@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import inspect
-from collections.abc import Callable
+from collections.abc import Iterable
 from contextlib import nullcontext
-from functools import wraps
 from weakref import WeakKeyDictionary, WeakSet
 
 import torch
@@ -12,10 +10,7 @@ from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    finalize_model_weights,
-)
+from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 
 from .meta import (
     SKIP_LOAD_TENSORS,
@@ -103,9 +98,11 @@ def initialize_layerwise_reload(
     Must be called after `record_metadata_for_reloading`. This function:
     1. Saves current kernel tensors for later copying
     2. Restores layer parameters/buffers from metadata (on meta device)
-    3. Wraps weight loaders to defer processing until all weights are loaded
+    3. Routes `load_with_ops`'s writes through `reload_load_into`, which buffers
+       them until all weights of a layer are loaded
 
-    When all weights for a layer are loaded, the wrapped loaders will:
+    A weight update is then `load_weights` again, with the same conversions and
+    plan (quantize ops re-run). When all weights for a layer are loaded:
     1. Materialize the layer onto the target device
     2. Load all cached weights
     3. Run quantization processing if applicable
@@ -132,117 +129,94 @@ def initialize_layerwise_reload(
         # Restore layer parameters/buffers onto meta device
         restore_layer_on_meta(layer, info)
 
-        # Wrap weight loaders to buffer loading
-        initialize_online_processing(layer)
+        # Buffer the writes into the layer until it is complete
+        info.load_numel = 0
+        info.load_numel_total = get_layer_size(layer)
+        _track(layer)
         info.defer_processing = defer_processing
 
 
-def initialize_online_processing(layer: torch.nn.Module):
-    """Wrap a layer's weight loaders with online processing loaders.
-    Called by either `initialize_layerwise_reload` or an online quantization scheme,
-    prevents double wrapping in the case of online quantization + reloading
-
-    Args:
-        layer: layer whose parameter weight loaders will be wrapped
-
-    """
-    info = get_layerwise_info(layer)
-
-    # Track loading progress to determine when to process/copy
-    info.load_numel = 0
-    info.load_numel_total = get_layer_size(layer)
-    _wrap_parameters_weight_loader(layer)
+# The tensors whose writes a layerwise reload buffers: id -> (tensor, layer, name)
+_TRACKED: dict[int, tuple[torch.Tensor, torch.nn.Module, str]] = {}
 
 
-def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
-    """Wrap each parameter's weight loader."""
-    # Note that nested wrapping will occur for shared tensors
+def _track(layer: torch.nn.Module) -> None:
     for name, tensor in get_layer_tensors(layer).items():
-        if name in SKIP_LOAD_TENSORS:
-            continue
-        if _get_weight_loader(tensor).__name__ != "online_process_loader":
-            tensor.weight_loader = make_online_process_loader(layer, name)
+        if name not in SKIP_LOAD_TENSORS:
+            _TRACKED[id(tensor)] = (tensor, layer, name)
 
 
-def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Callable:
-    """Create a wrapped weight loader that defers processing."""
+def _untrack(layers: Iterable[torch.nn.Module]) -> None:
+    """Stop buffering writes into `layers`"""
+    layers = set(layers)
+    for key in [k for k, (_, layer, _) in _TRACKED.items() if layer in layers]:
+        del _TRACKED[key]
+
+
+def reloading() -> bool:
+    """Whether a layerwise reload is buffering writes"""
+    return bool(_TRACKED)
+
+
+def reload_load_into(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
+    """Buffer writes into a tracked layer; process it once all its numel is loaded"""
+    from vllm.model_executor.model_loader.ops_loader import copy_into
+
+    tracked = _TRACKED.get(id(param))
+    if tracked is None or tracked[0] is not param:
+        copy_into(name, param, value)
+        return
+    _, layer, attr = tracked
     info = get_layerwise_info(layer)
-    param = getattr(layer, param_name)
-    original_loader = _get_original_loader(param)
-    loader_signature = inspect.signature(original_loader)
+    if not info.can_load():
+        # Some qconfigs load the same weight several times (CT_WNA16 loads
+        # `weight_shape` for each qkv partition): extra writes after the layer
+        # was processed are dropped. `weight_shape` is tiny, so the layer cannot
+        # complete without its real weights. See Limitations(3).
+        logger.debug("%s: Excessive loading", layer.__class__.__name__)
+        return
 
-    @wraps(original_loader, assigned=("__doc__", "__annotations__"))
-    def online_process_loader(*args, **kwargs):
-        if not info.can_load():
-            # Unfortunately, some qconfigs are set up to load the same weight
-            # multiple times. For example, CT_WNA16 loads `weight_shape` for
-            # each of the qkv partitions. This results in layers loading extra
-            # weights (beyond load_numel_total) after it's already processed.
-            #
-            # Best solution is to ensure that `load_numel_total` reflects the
-            # actual number of weights loaded, either by modifying qconfigs to
-            # create as many weights as loaded (see padding issue as well)
-            # or maybe capturing how many weights are loaded on first pass
-            #
-            # For now, `load_numel_total` is still safe to use as long as
-            # there's no way to reach `load_numel_total` without loading all
-            # necessary weights. `weight_shape` is very small, so this is safe.
-            # see Limitations(4)
-            logger.debug("%s: Excessive loading", layer.__class__.__name__)
-            return
+    # layers may register tensors later (e.g. `bias`): track them, and refresh
+    # `load_numel_total` so processing waits until they are loaded too
+    info.load_numel_total = get_layer_size(layer)
+    _track(layer)
 
-        # Re-run on each load: layers may register parameters later (e.g., `bias`).
-        # Wrap late parameters and refresh `load_numel_total` so processing waits
-        # until all parameters are loaded.
-        info.load_numel_total = get_layer_size(layer)
-        _wrap_parameters_weight_loader(layer)
+    info.loaded_weights.append((attr, name, value))
+    info.load_numel += get_numel_loaded(param, lambda: copy_into(name, param, value))
 
-        # Bind and normalize arguments
-        bound_args = loader_signature.bind(*args, **kwargs)
-        bound_args.apply_defaults()
+    logger.debug(
+        "%s: %d / %d",
+        layer.__class__.__name__,
+        info.load_numel,
+        info.load_numel_total,
+    )
 
-        # Buffer loaded weights, track loading progress
-        info.loaded_weights.append((param_name, bound_args))
-        num_loaded, ret = get_numel_loaded(original_loader, bound_args)
-        info.load_numel += num_loaded
+    # Do not online process attention layers, must wait until finalize
+    # Preserve placement remapping until checkpoint iteration finishes:
+    # expert reload must survive trailing redundant mappings.
+    if info.defer_processing or is_deferred_attention_layer(layer):
+        return
 
-        logger.debug(
-            "%s: %d / %d",
-            layer.__class__.__name__,
-            info.load_numel,
-            info.load_numel_total,
-        )
+    # Log warnings allocating excessive buffers on device
+    if has_device_tensors([value]) and layer not in LOADING_LAYERS:
+        LOADING_LAYERS.add(layer)
+        if len(LOADING_LAYERS) == 2:
+            names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
+            mem_used = sum(
+                get_info_size(LAYERWISE_INFO[layer]) for layer in LOADING_LAYERS
+            )
+            logger.warning_once(
+                "Allocating %.1f MB of device memory to buffers to load %s layers. "
+                "This extra memory usage can be avoided by ordering weights "
+                "by their parent layer when reloading.",
+                mem_used / 1e6,
+                str(list(names)),
+            )
 
-        # Do not online process attention layers, must wait until finalize
-        # Preserve placement remapping until checkpoint iteration finishes:
-        # expert reload wrappers must survive trailing redundant mappings.
-        if info.defer_processing or is_deferred_attention_layer(layer):
-            return ret
-
-        # Log warnings allocating excessive buffers on device
-        if has_device_tensors(bound_args) and layer not in LOADING_LAYERS:
-            LOADING_LAYERS.add(layer)
-            if len(LOADING_LAYERS) == 2:
-                names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
-                mem_used = sum(
-                    get_info_size(LAYERWISE_INFO[layer]) for layer in LOADING_LAYERS
-                )
-                logger.warning_once(
-                    "Allocating %.1f MB of device memory to buffers to load %s layers. "
-                    "This extra memory usage can be avoided by ordering weights "
-                    "by their parent layer when reloading.",
-                    mem_used / 1e6,
-                    str(list(names)),
-                )
-
-        # Process and copy when all weights are loaded
-        if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
-            _layerwise_process(layer, info)
-            LOADING_LAYERS.discard(layer)
-
-        return ret
-
-    return online_process_loader
+    # Process and copy when all weights are loaded
+    if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
+        _layerwise_process(layer, info)
+        LOADING_LAYERS.discard(layer)
 
 
 def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelConfig):
@@ -250,8 +224,8 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     This includes attention layers and layers which have weight elements which are not
     loaded (due to padding).
 
-    This function should be applied after `initialize_layerwise_reload` is applied
-    unwrap the layerwise weight loaders.
+    This function should be applied after `initialize_layerwise_reload`; it stops
+    buffering writes into the model's layers.
 
     Args:
         model: model to finalize processing for
@@ -304,6 +278,7 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         info.reset()
 
     LOADING_LAYERS.clear()
+    _untrack(model.modules())
 
 
 def finalize_layerwise_reload(model: torch.nn.Module, model_config: ModelConfig):
@@ -339,10 +314,7 @@ def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -
         # are correctly detected by process_weights_after_loading
         quant_method.create_weights(layer)
 
-    for name, args in info.loaded_weights:
-        param = getattr(layer, name)
-        args.arguments["param"] = param
-        _get_weight_loader(param)(*args.args, **args.kwargs)
+    _replay(layer, info)
 
     if quant_method is not None:
         from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
@@ -375,17 +347,8 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     """
     # Materialize layer tensors onto device
     materialize_layer(layer, info)
-
-    # Unwrap layerwise loading wrappers
-    for param in get_layer_tensors(layer).values():
-        param.weight_loader = _get_original_loader(param)
-
-    # Load all buffered weights into materialized layer (using original loaders)
-    for name, args in info.loaded_weights:
-        param = getattr(layer, name)
-        args.arguments["param"] = param
-        param.weight_loader(*args.args, **args.kwargs)
-
+    # Load all buffered weights into the materialized layer
+    _replay(layer, info)
     _process_loaded_layer(layer, info)
     logger.debug("%s: Processed", layer.__class__.__name__)
 
@@ -397,7 +360,7 @@ def _process_loaded_layer(layer: torch.nn.Module, info: LayerReloadingInfo) -> N
 
     Shared by `_layerwise_process` and the sharded-RDT engine's quant stream,
     which loads a layer's weights by scattering into it instead of through the
-    buffered loaders but finishes it exactly the same way.
+    buffered writes but finishes it exactly the same way.
     """
     # Reset online quantization flag so process_weights_after_loading
     # will run again during reload
@@ -436,17 +399,12 @@ def _process_loaded_layer(layer: torch.nn.Module, info: LayerReloadingInfo) -> N
     info.reset()
 
 
-def _get_original_loader(tensor: torch.Tensor) -> Callable:
-    """Return the weight loader with any layerwise wrappers removed."""
-    loader = _get_weight_loader(tensor)
-    while loader.__name__ == "online_process_loader":
-        loader = loader.__wrapped__  # type: ignore[union-attr]
+def _replay(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
+    """Write the buffered values into the layer's current (materialized) tensors"""
+    from vllm.model_executor.model_loader.ops_loader import copy_into
 
-    return loader
-
-
-def _get_weight_loader(tensor: torch.Tensor):
-    return getattr(tensor, "weight_loader", default_weight_loader)
+    for attr, name, value in info.loaded_weights:
+        copy_into(name, getattr(layer, attr), value)
 
 
 def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
@@ -455,7 +413,7 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     assert info.kernel_tensors is not None
     parameters, buffers = info.kernel_tensors
     non_persistent = info.kernel_non_persistent_buffers
-    loaded_tensor_names = {name for name, _ in info.loaded_weights}
+    loaded_tensor_names = {attr for attr, _, _ in info.loaded_weights}
     for name, param in parameters.items():
         param.data.copy_(getattr(layer, name))
     for name, buffer in buffers.items():

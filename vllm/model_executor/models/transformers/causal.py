@@ -16,7 +16,6 @@
 # limitations under the License.
 """Transformers modeling backend mixin for causal language models."""
 
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import checkpoint_shapes
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 
@@ -50,6 +50,7 @@ class CausalMixin(VllmModelForTextGeneration, Base):
             self.lm_head = ParallelLMHead(
                 self.text_config.vocab_size,
                 self.text_config.hidden_size,
+                bias=bool(checkpoint_shapes(r"(^|\.)lm_head\.bias$")),  # Phi
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
@@ -66,25 +67,6 @@ class CausalMixin(VllmModelForTextGeneration, Base):
             )
         else:
             self.lm_head = PPMissingLayer()
-
-    def load_weights(self, weights: Iterable[tuple[str, "torch.Tensor"]]) -> set[str]:
-        """A thin wrapper around `Base.load_weights` to handle the lm_head bias."""
-        lm_head_bias = set()
-        load_device = self.vllm_config.load_config.device or self.device_config.device
-
-        def auto_load_lm_head_bias(weights):
-            for name, weight in weights:
-                if name.endswith("lm_head.bias") and self.pp_group.is_last_rank:
-                    # load_weights is called outside vLLM's device context,
-                    # so we must enter it again when registering the bias.
-                    with torch.device(load_device):
-                        self.lm_head._register_bias()
-                    self.lm_head.bias.weight_loader(self.lm_head.bias, weight)
-                    lm_head_bias.add(name)
-                else:
-                    yield name, weight
-
-        return super().load_weights(auto_load_lm_head_bias(weights)) | lm_head_bias
 
     def compute_logits_local(self, hidden_states: "torch.Tensor") -> "torch.Tensor":
         """Logits for this TP rank's vocab shard, for batch-sharded sampling."""

@@ -3,7 +3,6 @@
 # LiLiCorr head adapted from sgl-project/sglang PR #37462 (Apache-2.0).
 """DFlash backbone with the LiLiCorr candidate-lattice correlator."""
 
-from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -24,7 +23,7 @@ from vllm.v1.worker.gpu.spec_decode.lilicorr.config import LiLiCorrSpeculatorCon
 from .nemotron_h import NemotronHMLP
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
-from .utils import AutoWeightsLoader, maybe_prefix
+from .utils import maybe_prefix
 
 
 class LiLiCorrLatticeAttention(nn.Module):
@@ -250,6 +249,11 @@ class LiLiCorrHead(nn.Module):
         self._attn_bias: torch.Tensor | None = None
         self._rank_frac_col: torch.Tensor
         self._is_top1_col: torch.Tensor
+
+    def process_weights_after_loading(self) -> None:
+        self.materialize_inference_buffers(
+            self.slot_embedding.device, self.slot_embedding.dtype
+        )
 
     @torch.no_grad()
     def materialize_inference_buffers(
@@ -492,22 +496,3 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
             self.model.lilicorr.candidate_topk,
             return_log_probs=True,
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        head_weights: list[tuple[str, torch.Tensor]] = []
-
-        def normalized_weights():
-            for name, value in weights:
-                name = name.removeprefix("model.")
-                # The backbone stacks up_proj into gate_up_proj. Load the
-                # nongated correlator separately to avoid that transformation.
-                if name.startswith("lilicorr."):
-                    head_weights.append((name.removeprefix("lilicorr."), value))
-                else:
-                    yield name, value
-
-        super().load_weights(normalized_weights())
-        AutoWeightsLoader(self.model.lilicorr).load_weights(head_weights)
-        head = self.model.lilicorr
-        parameter = head.slot_embedding
-        head.materialize_inference_buffers(parameter.device, parameter.dtype)

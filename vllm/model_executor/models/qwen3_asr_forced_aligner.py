@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-ASR ForcedAligner model (token classification)."""
 
-from collections.abc import Iterable
-
 import torch
 import torch.nn as nn
 
@@ -16,7 +14,6 @@ from vllm.model_executor.models.qwen3_asr import (
     Qwen3ASRMultiModalProcessor,
     Qwen3ASRProcessingInfo,
 )
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
@@ -51,15 +48,6 @@ class Qwen3ASRForcedAlignerForTokenClassification(
     is_pooling_model = True
 
     # Map thinker.lm_head -> classifier (not language_model.lm_head)
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "thinker.lm_head.": "classifier.",
-            "thinker.model.": "language_model.model.",
-            "thinker.": "",
-            "talker.": None,
-            "code2wav.": None,
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -110,7 +98,3 @@ class Qwen3ASRForcedAlignerForTokenClassification(
 
         # Apply classification head -> [num_tokens, classify_num]
         return self.classifier(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

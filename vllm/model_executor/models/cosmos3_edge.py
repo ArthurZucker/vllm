@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Literal
 
 import torch
@@ -61,8 +61,6 @@ from .qwen3_vl import (
     Qwen3VLProcessingInfo,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
 )
 from .vision import (
@@ -439,11 +437,6 @@ class Cosmos3EdgeAttentionDecoderLayer(nn.Module):
 class Cosmos3EdgeTextModel(NemotronHModel):
     """Nemotron-H backbone with Cosmos-owned checkpoint name mapping."""
 
-    # The enclosing Cosmos model maps and packs checkpoint weights. Disabling
-    # Nemotron-H's checkpoint-specific hook prevents those names from being
-    # remapped a second time when AutoWeightsLoader descends into this module.
-    load_weights = None  # type: ignore[assignment]
-
 
 def _to_nemotron_h_config(text_config: Cosmos3EdgeTextConfig) -> NemotronHConfig:
     """Express the dense text model as Nemotron-H attention and MLP layers."""
@@ -531,40 +524,6 @@ class Cosmos3EdgeForCausalLM(nn.Module):
         return self.logits_processor(self.lm_head, hidden_states)
 
 
-def _cosmos3_edge_diffusers_prefix_map() -> dict[str, str]:
-    """Map Diffusers blocks to interleaved Nemotron-H layers.
-
-    The checkpoint stores attention and MLP in one `layers.N` block, while
-    the Nemotron-H model represents them as separate decoder layers. Therefore,
-    checkpoint block `N` maps its attention to layer `2N` and its MLP to
-    layer `2N + 1`.
-    """
-    mappings = {
-        "embed_tokens.": "language_model.model.embed_tokens.",
-        "norm.": "language_model.model.norm_f.",
-    }
-    for physical_idx in range(28):
-        attention_idx = 2 * physical_idx
-        mlp_idx = attention_idx + 1
-        source_prefix = f"layers.{physical_idx}"
-        attention_prefix = f"language_model.model.layers.{attention_idx}"
-        mlp_prefix = f"language_model.model.layers.{mlp_idx}"
-        mappings.update(
-            {
-                f"{source_prefix}.input_layernorm.": f"{attention_prefix}.norm.",
-                **{
-                    f"{source_prefix}.self_attn.{proj}_proj.": (
-                        f"{attention_prefix}.mixer.{proj}_proj."
-                    )
-                    for proj in ("q", "k", "v", "o")
-                },
-                f"{source_prefix}.post_attention_layernorm.": (f"{mlp_prefix}.norm."),
-                f"{source_prefix}.mlp.": f"{mlp_prefix}.mixer.",
-            }
-        )
-    return mappings
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     Cosmos3EdgeMultiModalProcessor,
     info=Cosmos3EdgeProcessingInfo,
@@ -582,48 +541,6 @@ class Cosmos3EdgeForConditionalGeneration(
         - self.visual: SigLIP2 encoder + patch merger + projector
         - self.language_model: Cosmos3EdgeForCausalLM (pure attention + RoPE)
     """
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj.": (".qkv_proj.", "q"),
-            ".k_proj.": (".qkv_proj.", "k"),
-            ".v_proj.": (".qkv_proj.", "v"),
-        },
-        orig_to_new_prefix={
-            **_cosmos3_edge_diffusers_prefix_map(),
-            "proj_in.": None,
-            "proj_out.": None,
-            "time_embedder.": None,
-            "action_proj_in.": None,
-            "action_proj_out.": None,
-            "audio_modality_embed": None,
-            "action_modality_embed": None,
-            "model.visual.": "visual.encoder.",
-            "model.projector.": "visual.projector.",
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.": "language_model.model.",
-        },
-        orig_to_new_substr={
-            "_moe_gen": None,
-            "k_norm_und_for_gen": None,
-            ".add_q_proj.": None,
-            ".add_k_proj.": None,
-            ".add_v_proj.": None,
-            ".to_add_out.": None,
-            ".norm_added_q.": None,
-            ".norm_added_k.": None,
-            ".self_attn.to_q.": ".self_attn.q_proj.",
-            ".self_attn.to_k.": ".self_attn.k_proj.",
-            ".self_attn.to_v.": ".self_attn.v_proj.",
-            ".self_attn.to_out.": ".self_attn.o_proj.",
-            "language_model.embeddings": "language_model.embed_tokens",
-            # ModelOpt-native dialect (diffusers/transformers read these; vLLM reads
-            # weight_scale/input_scale instead), drop so AutoWeightsLoader passes
-            ".input_quantizer.": None,
-            ".weight_quantizer.": None,
-            ".output_quantizer.": None,
-        },
-    )
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -825,10 +742,6 @@ class Cosmos3EdgeForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

@@ -8,7 +8,7 @@ shuffle connector and ColBERT-style 128-dim per-token embeddings.
 Reference: https://huggingface.co/ModernVBERT/colmodernvbert-merged
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 from torch import nn
@@ -43,7 +43,7 @@ from .interfaces import (
 from .interfaces_base import default_pooling_type
 from .modernbert import ModernBertEmbeddings, ModernBertLayer
 from .siglip import SiglipVisionModel
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 # ---------------------------------------------------------------------------
 # Connector: pixel shuffle + simple linear projection
@@ -356,35 +356,3 @@ class ColModernVBertForRetrieval(
 
     # Checkpoint prefix → vLLM param prefix.
     # More-specific prefixes must appear before shorter ones.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.text_model.layers.": "text_layers.",
-            "model.text_model.embeddings.": "text_embeddings.",
-            "model.text_model.final_norm.": "text_final_norm.",
-            "model.connector.modality_projection.": "connector.proj.",
-            "model.custom_text_proj.": "custom_text_proj.",
-            "model.vision_model.vision_model.": "vision_model.vision_model.",
-            "model.": "",
-        },
-    )
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(
-            weights,
-            mapper=self.hf_to_vllm_mapper,
-        )
-
-        # The pooler wraps ``custom_text_proj`` as its head projector.
-        # Mark those params as loaded under the pooler path too.
-        if hasattr(self, "pooler") and hasattr(self.pooler, "head"):
-            head = self.pooler.head
-            projector = getattr(head, "projector", None)
-            if projector is not None and isinstance(projector, nn.Module):
-                for pname, _ in projector.named_parameters():
-                    loaded_params.add(f"pooler.head.projector.{pname}")
-
-        return loaded_params

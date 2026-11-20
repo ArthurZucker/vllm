@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, cast
 
 import torch
@@ -54,8 +54,6 @@ from .interfaces import (
 )
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
@@ -320,20 +318,6 @@ class FireRedASR2ForConditionalGeneration(
         "encoder_attn.kv_proj": ["encoder_attn.k_proj", "encoder_attn.v_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "llm.": "model.decoder.",
-            "encoder.": "model.encoder.audio_encoder.",
-            "encoder_projector.": "model.encoder_projector.",
-            "net.0": "pre_layer_norm",
-            "net.1": "linear_expand",
-            "net.4": "linear_project",
-        },
-        orig_to_new_prefix={
-            "model.encoder.audio_encoder.positional_encoding.pe": None,
-        },
-    )
-
     supports_transcription_only = True
     supports_segment_timestamp = True
     supported_languages = ISO639_1_SUPPORTED_LANGS
@@ -478,8 +462,3 @@ class FireRedASR2ForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.model.decoder.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

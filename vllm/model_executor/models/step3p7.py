@@ -12,32 +12,13 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear
 from .interfaces import supports_pp
 from .step3_vl import Step3VLForConditionalGeneration
 from .step_vl import PerceptionEncoder
-from .utils import WeightsMapper, init_vllm_registered_model, maybe_prefix
+from .utils import init_vllm_registered_model, maybe_prefix
 from .vision import run_dp_sharded_vision_model
 
 logger = init_logger(__name__)
 
 
 class Step3p7ForConditionalGeneration(Step3VLForConditionalGeneration):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.vision_model.": "vision_model.",
-            "model.vit_large_projector.": "vit_large_projector.",
-            "model.vit_large_projector": "vit_large_projector",
-            "model.language_model.": "language_model.model.",
-            "model.language_model": "language_model.model",
-            "model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-            "lm_head": "language_model.lm_head",
-        },
-        orig_to_new_substr={
-            ".attn.in_proj_weight": ".attn.qkv_proj.weight",
-            ".attn.in_proj_bias": ".attn.qkv_proj.bias",
-            ".mlp.c_fc": ".mlp.fc1",
-            ".mlp.c_proj": ".mlp.fc2",
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super(Step3VLForConditionalGeneration, self).__init__()
 

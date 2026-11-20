@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.model_loader.reload import (
     finish_reload,
     lifecycle,
@@ -94,7 +95,7 @@ def _metadata(shapes: dict) -> list[ParamMeta]:
 
 def _cold_start(make, weights):
     model = make()
-    model.load_weights(weights.items())
+    load_weights(model, iter(weights.items()))
     process_weights_after_loading(model, _MODEL_CONFIG, _CPU)
     return model
 
@@ -193,20 +194,15 @@ _LINEAR_SHAPES = {
 
 def _linear_model(padding_size=0):
     def make():
-        model = _Toy()
+        # no `load_weights`: loaded by `ops_loader`, whose default conversions fuse
+        # q/k/v into `qkv_proj` and gate/up into `gate_up_proj`
+        model = torch.nn.Module()
         kw = dict(bias=False, params_dtype=BF16)
         model.qkv_proj = QKVParallelLinear(8, 2, 4, 2, **kw)
         model.gate_up_proj = MergedColumnParallelLinear(
             8, [6, 6], padding_size=padding_size, **kw
         )
         model.down_proj = RowParallelLinear(6, 8, **kw)
-        model.stacked = {
-            "q_proj.weight": ("qkv_proj.weight", "q"),
-            "k_proj.weight": ("qkv_proj.weight", "k"),
-            "v_proj.weight": ("qkv_proj.weight", "v"),
-            "gate_proj.weight": ("gate_up_proj.weight", 0),
-            "up_proj.weight": ("gate_up_proj.weight", 1),
-        }
         return model
 
     return make

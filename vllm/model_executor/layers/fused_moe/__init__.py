@@ -20,10 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoEFactory,
-    fused_moe_make_expert_params_mapping,
-)
+from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat,
     FusedMoEExpertsModular,
@@ -86,7 +83,6 @@ __all__ = [
     "SharedExperts",
     "activation_without_mul",
     "apply_moe_activation",
-    "fused_moe_make_expert_params_mapping",
     "override_config",
     "get_config",
 ]

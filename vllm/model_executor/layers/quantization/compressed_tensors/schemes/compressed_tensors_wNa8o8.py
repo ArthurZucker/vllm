@@ -8,8 +8,6 @@ reproduced as a float fake-quant on the layer input and output, around a
 weight-only matmul, rather than a fused int8 GEMM.
 """
 
-from collections.abc import Callable
-
 import torch
 from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
 
@@ -92,7 +90,6 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -118,12 +115,10 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
             w_s_param_name="weight_scale",
         )
 
-        self._register_weight(
-            layer, input_size, input_size_per_partition, params_dtype, weight_loader
-        )
+        self._register_weight(layer, input_size, input_size_per_partition, params_dtype)
 
     def _register_weight(
-        self, layer, input_size, input_size_per_partition, params_dtype, weight_loader
+        self, layer, input_size, input_size_per_partition, params_dtype
     ):
         out = layer.output_size_per_partition
         if self.is_int_quantized:
@@ -134,7 +129,6 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
                     data=torch.empty(out, input_size_per_partition, dtype=torch.int8),
                     input_dim=1,
                     output_dim=0,
-                    weight_loader=weight_loader,
                 ),
             )
         else:
@@ -145,7 +139,6 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
                     output_dim=0,
                     packed_dim=1,
                     packed_factor=self.pack_factor,
-                    weight_loader=weight_loader,
                     data=torch.empty(
                         out,
                         input_size_per_partition // self.pack_factor,
@@ -155,9 +148,7 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
             )
             layer.register_parameter(
                 "weight_shape",
-                BasevLLMParameter(
-                    data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
-                ),
+                BasevLLMParameter(data=torch.empty(2, dtype=torch.int64)),
             )
 
         # Scale: per-output-channel, or per group along the input dim under TP.
@@ -172,12 +163,10 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
                 input_size_per_partition, group_size, self.layer_name
             )
             weight_scale = GroupQuantScaleParameter(
-                data=scale_data, output_dim=0, input_dim=1, weight_loader=weight_loader
+                data=scale_data, output_dim=0, input_dim=1
             )
         else:
-            weight_scale = ChannelQuantScaleParameter(
-                data=scale_data, output_dim=0, weight_loader=weight_loader
-            )
+            weight_scale = ChannelQuantScaleParameter(data=scale_data, output_dim=0)
         layer.register_parameter("weight_scale", weight_scale)
 
         for name, present in (
@@ -189,7 +178,6 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
                     name,
                     BasevLLMParameter(
                         data=torch.empty(1, dtype=torch.float32),
-                        weight_loader=weight_loader,
                     ),
                 )
 
@@ -217,14 +205,10 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
         replace_parameter(layer, "weight_packed", packed.contiguous())
         weight.packed_dim, weight.packed_factor = 1, self.pack_factor
 
-        def _noop_loader(*_, **__):
-            return None
-
         layer.register_parameter(
             "weight_shape",
             BasevLLMParameter(
                 data=torch.tensor([out_features, in_features], dtype=torch.int64),
-                weight_loader=_noop_loader,
             ),
         )
 

@@ -12,8 +12,6 @@ step (decoder layers, candidate head and selector) in its own CUDA graphs, and
 the context K/V precompute runs eagerly as a few fused kernels.
 """
 
-from collections.abc import Iterable
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -40,8 +38,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.qwen3_dflash2 import DFlashGroupedConv, _score_edges
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.model_executor.utils import refill_derived
@@ -320,16 +316,6 @@ class DFlash2BeamCandidateSelector(nn.Module):
 
 
 class DFlash2BeamModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
-
     def __init__(
         self,
         *,
@@ -515,10 +501,6 @@ class DFlash2BeamModel(nn.Module):
             )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class DFlash2BeamForCausalLM(nn.Module):
     # The speculator this is a draft model of (see SpeculativeDraftModel).
@@ -551,6 +533,9 @@ class DFlash2BeamForCausalLM(nn.Module):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+        # aliased to the target's after loading, not in the checkpoint
+        for param in (self.model.embed_tokens.weight, self.lm_head.weight):
+            param.loaded_at_init = True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -601,11 +586,6 @@ class DFlash2BeamForCausalLM(nn.Module):
         return self.logits_processor.get_top_k_tokens(
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = {f"model.{name}" for name in self.model.load_weights(weights)}
-        # Aliased to the target's after loading.
-        return loaded | {"model.embed_tokens.weight", "lm_head.weight"}
 
     def process_weights_after_loading(self) -> None:
         self.model.build_context_kv_weights()

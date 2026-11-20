@@ -33,7 +33,7 @@ from vllm.model_executor.layers.utils import (
     maybe_use_skinny_gemm,
 )
 from vllm.model_executor.parameter import BasevLLMParameter
-from vllm.model_executor.utils import copy_weight_, set_weight_attrs
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
@@ -370,7 +370,6 @@ class VocabParallelEmbedding(PluggableLayer):
             self.input_size,
             self.output_size,
             params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
         )
         self.update_param_tp_status()
 
@@ -483,47 +482,6 @@ class VocabParallelEmbedding(PluggableLayer):
         assert len(ret) == self.num_embeddings_padded
         return ret
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        output_dim = getattr(param, "output_dim", None)
-        packed_dim = getattr(param, "packed_dim", None)
-
-        # Parameters without an output dimension are copied onto all GPUs.
-        if output_dim is None:
-            if (
-                loaded_weight.ndim == 0
-                and param.data.ndim == 1
-                and param.data.numel() == 1
-            ):
-                loaded_weight = loaded_weight.reshape(1)
-            assert param.data.shape == loaded_weight.shape
-            copy_weight_(param.data, loaded_weight)
-            return
-
-        # Shard indexes for loading the weight
-        start_idx = self.shard_indices.org_vocab_start_index
-        shard_size = self.shard_indices.org_vocab_end_index - start_idx
-
-        # If param packed on the same dim we are sharding on, then
-        # need to adjust offsets of loaded weight by pack_factor.
-        if packed_dim is not None and packed_dim == output_dim:
-            packed_factor = (
-                param.packed_factor
-                if isinstance(param, BasevLLMParameter)
-                else param.pack_factor
-            )
-            assert loaded_weight.shape[output_dim] == (
-                self.org_vocab_size // param.packed_factor
-            )
-            start_idx = start_idx // packed_factor
-            shard_size = shard_size // packed_factor
-        else:
-            assert loaded_weight.shape[output_dim] == self.org_vocab_size
-
-        # Copy the data. Select chunk corresponding to current shard.
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-        copy_weight_(param[: loaded_weight.shape[0]].data, loaded_weight)
-        param[loaded_weight.shape[0] :].data.fill_(0)
-
     def forward(self, input_):
         """Look up IDs, optionally reducing contributions from vocabulary shards."""
         if self.tp_size == 1:
@@ -635,7 +593,7 @@ class ParallelLMHead(VocabParallelEmbedding):
     def _register_bias(self):
         data = torch.empty(self.num_embeddings_per_partition, dtype=self.params_dtype)
         self.bias = Parameter(data, requires_grad=False)
-        weight_attrs = dict(output_dim=0, weight_loader=self.weight_loader)
+        weight_attrs = dict(output_dim=0)
         set_weight_attrs(weight=self.bias, weight_attrs=weight_attrs)
 
     def tie_weights(self, embed_tokens: VocabParallelEmbedding):

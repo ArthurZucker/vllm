@@ -16,6 +16,7 @@ from vllm import envs
 from vllm.config import MultiModalConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.fusion.mm_input_norm import FusedMMInputNorm
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.nano_nemotron_vl import (
     NanoNemotronVLDummyInputsBuilder,
     NanoNemotronVLImagePixelInputsDynamic,
@@ -564,65 +565,49 @@ def test_precomputed_multimodal_embeddings(input_key: str):
     assert all(torch.equal(output, embed) for output, embed in zip(outputs, embeds))
 
 
-class _TextOnlyMultiModalConfig:
-    def get_limit_per_prompt(self, modality: str) -> int:
-        return 0
-
-
 class _ImageOnlyMultiModalConfig:
     def get_limit_per_prompt(self, modality: str) -> int:
         return 1 if modality == "image" else 0
-
-
-class _ModelConfig:
-    multimodal_config = _TextOnlyMultiModalConfig()
 
 
 class _ImageOnlyModelConfig:
     multimodal_config = _ImageOnlyMultiModalConfig()
 
 
-class _LanguageModel:
-    def __init__(self) -> None:
-        self.loaded_weights: list[tuple[str, object]] = []
-
-    def load_weights(self, weights):
-        self.loaded_weights = list(weights)
-
-
-class _MissingMultiModalModule:
-    def named_parameters(self):
-        raise AssertionError("multimodal weights should not be inspected")
-
-    def load_weights(self, weights):
-        raise AssertionError("multimodal weights should not be loaded")
-
-
-class _AdapterModule:
-    def named_parameters(self):
-        return []
+def _module(**params: torch.Tensor) -> nn.Module:
+    """A module holding `params` (dotted names make submodules), zeros"""
+    module = nn.Module()
+    for name, value in params.items():
+        *path, leaf = name.split(".")
+        owner = module
+        for part in path:
+            if not hasattr(owner, part):
+                owner.add_module(part, nn.Module())
+            owner = getattr(owner, part)
+        owner.register_parameter(
+            leaf, nn.Parameter(torch.zeros_like(value), requires_grad=False)
+        )
+    return module
 
 
-class _VisionModel:
-    def __init__(self) -> None:
-        self.loaded_weights: list[tuple[str, object]] = []
-
-    def load_weights(self, weights):
-        self.loaded_weights = list(weights)
+def _nemotron_vl(language_model: nn.Module, vision_model: nn.Module | None):
+    model = _uninitialized_model()
+    nn.Module.__init__(model)
+    model.language_model = language_model
+    model.vision_model = vision_model
+    model.vision_final_layernorm = None
+    model.sound_encoder = None
+    model.mlp1 = nn.Identity()
+    return model
 
 
 def test_nano_nemotron_vl_skips_multimodal_weights_in_text_only_mode():
-    model = _uninitialized_model()
-    language_model = _LanguageModel()
-    object.__setattr__(model, "model_config", _ModelConfig())
-    object.__setattr__(model, "language_model", language_model)
-    object.__setattr__(model, "mlp1", _AdapterModule())
-    object.__setattr__(model, "vision_model", _MissingMultiModalModule())
-    object.__setattr__(model, "vision_final_layernorm", _MissingMultiModalModule())
-    object.__setattr__(model, "sound_encoder", None)
+    """Text only, no tower is built: its checkpoint tensors match no param"""
+    language_weight = torch.tensor([1.0])
+    model = _nemotron_vl(_module(**{"layers.0.weight": language_weight}), None)
 
-    language_weight = torch.tensor(1.0)
-    model.load_weights(
+    loaded = load_weights(
+        model,
         [
             ("language_model.layers.0.weight", language_weight),
             ("mlp1.0.weight", torch.empty(0)),
@@ -630,62 +615,44 @@ def test_nano_nemotron_vl_skips_multimodal_weights_in_text_only_mode():
             ("sound_encoder.encoder.weight", torch.empty(0)),
             ("vision_projector.vision_final_layernorm.weight", torch.empty(0)),
             ("vision_projector.vision_final_layernorm.bias", torch.empty(0)),
-        ]
+        ],
     )
 
-    assert language_model.loaded_weights == [("layers.0.weight", language_weight)]
+    assert loaded == {"language_model.layers.0.weight"}
+    torch.testing.assert_close(model.language_model.layers[0].weight, language_weight)
 
 
 def test_nano_nemotron_vl_loads_vision_weights_without_sound_encoder():
-    model = _uninitialized_model()
-    language_model = _LanguageModel()
-    vision_model = _VisionModel()
-    object.__setattr__(model, "model_config", _ImageOnlyModelConfig())
-    object.__setattr__(model, "language_model", language_model)
-    object.__setattr__(model, "mlp1", _AdapterModule())
-    object.__setattr__(model, "vision_model", vision_model)
-    object.__setattr__(model, "vision_final_layernorm", None)
-    object.__setattr__(model, "sound_encoder", None)
-
-    language_weight = torch.tensor(1.0)
+    language_weight = torch.tensor([1.0])
     vision_weight = torch.tensor([2.0, 3.0])
-    model.load_weights(
+    model = _nemotron_vl(
+        _module(**{"layers.0.weight": language_weight}),
+        _module(**{"radio_model.encoder.weight": vision_weight}),
+    )
+
+    loaded = load_weights(
+        model,
         [
             ("language_model.layers.0.weight", language_weight),
             ("vision_model.radio_model.encoder.weight", vision_weight),
-        ]
+        ],
     )
 
-    assert language_model.loaded_weights == [("layers.0.weight", language_weight)]
-    assert len(vision_model.loaded_weights) == 1
-    name, loaded_weight = vision_model.loaded_weights[0]
-    assert name == "radio_model.encoder.weight"
-    assert isinstance(loaded_weight, torch.Tensor)
-    torch.testing.assert_close(loaded_weight, vision_weight)
-    assert loaded_weight is not vision_weight
-
-
-def test_nano_nemotron_vl_requires_sound_encoder_for_sound_weights():
-    model = _uninitialized_model()
-    language_model = _LanguageModel()
-    vision_model = _VisionModel()
-    object.__setattr__(model, "model_config", _ImageOnlyModelConfig())
-    object.__setattr__(model, "language_model", language_model)
-    object.__setattr__(model, "mlp1", _AdapterModule())
-    object.__setattr__(model, "vision_model", vision_model)
-    object.__setattr__(model, "vision_final_layernorm", None)
-    object.__setattr__(model, "sound_encoder", None)
-
-    with pytest.raises(AssertionError):
-        model.load_weights([("sound_encoder.encoder.weight", torch.empty(0))])
+    assert loaded == {
+        "language_model.layers.0.weight",
+        "vision_model.radio_model.encoder.weight",
+    }
+    torch.testing.assert_close(
+        model.vision_model.radio_model.encoder.weight, vision_weight
+    )
 
 
 def _vision_norm_model(use_layernorm=True):
     model = _uninitialized_model()
     torch.nn.Module.__init__(model)
     model.model_config = _ImageOnlyModelConfig()
-    model.language_model = _LanguageModel()
-    model.vision_model = _VisionModel()
+    model.language_model = None
+    model.vision_model = None
     model.sound_encoder = None
     model.input_norm = None
     model.mlp1 = torch.nn.Identity()
@@ -707,13 +674,14 @@ def test_vision_layernorm_is_loaded_and_applied_before_pixel_shuffle(
     model = _vision_norm_model(use_layernorm)
     weight = torch.tensor([2.0, 3.0, 4.0, 5.0], dtype=torch.bfloat16)
     bias = torch.tensor([0.5, -0.5, 1.0, -1.0], dtype=torch.bfloat16)
-    model.load_weights(
+    load_weights(
+        model,
         [
             ("vision_projector.vision_final_layernorm.weight", weight),
             ("vision_projector.vision_final_layernorm.bias", bias),
         ]
         if use_layernorm
-        else []
+        else [],
     )
     features = torch.arange(16, dtype=torch.bfloat16).reshape(1, 4, 4)
     expected = (

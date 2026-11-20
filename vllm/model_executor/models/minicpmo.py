@@ -25,7 +25,7 @@
 """Inference-only MiniCPM-O model compatible with HuggingFace weights."""
 
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias
 
 import torch
@@ -77,8 +77,6 @@ from .minicpmv import (
     _minicpmv_field_config,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     cast_overflow_tensors,
     maybe_prefix,
 )
@@ -688,7 +686,6 @@ class MiniCPMOBaseModel(_MiniCPMOBaseModelBase):
     """Base mixin class for MiniCPM-O models with audio support."""
 
     # Unlike the vision-only MiniCPM-V models, audio weights are loaded here.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"tts": None})
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -734,12 +731,6 @@ class MiniCPMOBaseModel(_MiniCPMOBaseModelBase):
         )
         self.audio_encoder_layer = -1
         return model
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._ensure_resampler_device()
-        return loaded
 
     def subsequent_chunk_mask(
         self,

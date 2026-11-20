@@ -19,7 +19,6 @@ from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4ForCausalLM,
     DeepseekV4MoE,
-    make_deepseek_v4_expert_params_mapping,
     prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v41.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
@@ -295,19 +294,6 @@ def test_deepseek_v4_mega_gate_hash_routing_correctness(
         image_sentinel_base_id=None,
     )
     torch.testing.assert_close(moe(hidden_states, input_ids, metadata), hidden_states)
-
-
-def test_deepseek_v4_mega_moe_expert_mapping():
-    mapping = make_deepseek_v4_expert_params_mapping(2)
-
-    assert mapping == [
-        ("experts.w13_", "experts.0.w1.", 0, "w1"),
-        ("experts.w2_", "experts.0.w2.", 0, "w2"),
-        ("experts.w13_", "experts.0.w3.", 0, "w3"),
-        ("experts.w13_", "experts.1.w1.", 1, "w1"),
-        ("experts.w2_", "experts.1.w2.", 1, "w2"),
-        ("experts.w13_", "experts.1.w3.", 1, "w3"),
-    ]
 
 
 def test_deepseek_v4_pwal_hook_finalizes_mhc_broadcast():

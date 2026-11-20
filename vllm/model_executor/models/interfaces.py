@@ -57,7 +57,6 @@ if TYPE_CHECKING:
         MambaStateCopyFuncsByType,
     )
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-    from vllm.model_executor.models.utils import WeightsMapper
     from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
     from vllm.multimodal.registry import _ProcessorFactories
     from vllm.sequence import IntermediateTensors
@@ -1259,7 +1258,6 @@ class SupportsLateInteraction(Protocol):
 class SupportsQuant:
     """The interface required for all models that support quantization."""
 
-    hf_to_vllm_mapper: "WeightsMapper | None" = None
     packed_modules_mapping: dict[str, list[str]]
     quant_config: QuantizationConfig | None = None
 
@@ -1292,8 +1290,11 @@ class SupportsQuant:
         """Apply model mappings to config for proper config-model matching"""
         if self.quant_config is None:
             return
-        if (hf_to_vllm_mapper := self.hf_to_vllm_mapper) is not None:
-            self.quant_config.apply_vllm_mapper(hf_to_vllm_mapper.get_rename_mapper())
+        from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
+
+        # called from `__new__`: the class's renamings, its modules are not built yet
+        if (mapper := rename_mapper(type(self))) is not None:
+            self.quant_config.apply_vllm_mapper(mapper)
         if packed_modules_mapping := getattr(self, "packed_modules_mapping", None):
             self.quant_config.packed_modules_mapping.update(packed_modules_mapping)
 

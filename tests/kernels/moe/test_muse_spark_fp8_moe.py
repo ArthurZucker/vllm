@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.online.base import (
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PtpcOnlineMoEMethod,
 )
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -178,7 +179,7 @@ def test_layerwise_reload_requantizes_in_place(dist_init, workspace_init):
     ptrs = {n: p.data_ptr() for n, p in routed.named_parameters()}
 
     initialize_layerwise_reload(routed)
-    list(routed.load_weights(list(_checkpoint(1).items())))
+    load_weights(routed, _checkpoint(1).items())
     finalize_layerwise_reload(routed, None)
 
     assert {n: p.data_ptr() for n, p in routed.named_parameters()} == ptrs
@@ -203,12 +204,3 @@ def test_other_online_moe_formats_are_rejected(dist_init):
             intermediate_size=N,
             top_k=TOPK,
         )
-
-
-@requires_fp8_triton
-@torch.inference_mode()
-def test_direct_load_weights_after_init_is_refused(dist_init, workspace_init):
-    """A direct load_weights would cast BF16 into the FP8 experts unscaled."""
-    _, _, runner, _ = _build(_checkpoint(0), _online_config(moe="fp8_per_channel"))
-    with pytest.raises(RuntimeError, match="layerwise reload"):
-        list(runner.routed_experts.load_weights(list(_checkpoint(1).items())))

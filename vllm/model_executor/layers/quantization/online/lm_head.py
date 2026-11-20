@@ -45,9 +45,10 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
     mixed-precision linear kernel (`choose_mp_linear_kernel`).
 
     A subclass sets the weight format and implements `quantize`. An untied
-    head loads its fp16/bf16 weight like any online linear layer and replaces
-    it with the quantized copy. A tied head shares the input embeddings'
-    weight, which stays unchanged: the quantized copy is added next to it.
+    head loads its fp16/bf16 weight as it is (a padded vocab pads it first) and
+    replaces it with the quantized copy after loading. A tied head shares the
+    input embeddings' weight, which stays unchanged: the quantized copy is added
+    next to it.
     """
 
     supports_lm_head = True
@@ -150,7 +151,7 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
         tied = getattr(layer, "online_lm_head_tied_weight", False)
-        weight = self.get_weight_for_quantization(layer)
+        weight = layer.weight
         n, k = weight.shape
         packed, scales, zero_points = self.quantize(weight)
         set_weight_attrs(packed, {"packed_dim": 1})
@@ -194,7 +195,6 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
             w_zp_param_name=w_zp_name,
         )
         self.kernel.process_weights_after_loading(layer)
-        self.release_requantization_source_weights(layer)
         logger.info_once(
             "Quantized the lm_head to %s (%d x %d per rank) with %s.",
             self.scheme,
@@ -246,11 +246,6 @@ def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead
     # Never loaded: a new param sharing the source storage, never a copy of it.
     head.weight = torch.nn.Parameter(lm_head.weight.data, requires_grad=False)
     head.quant_method.process_weights_after_loading(head)
-    # The copy is never loaded. The online loader wrapper captures the layer,
-    # so keeping it would leave each copy to the cycle collector.
-    for param in head.parameters(recurse=False):
-        if hasattr(param, "weight_loader"):
-            del param.weight_loader
     return head
 
 

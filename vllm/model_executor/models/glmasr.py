@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
 import torch
@@ -67,12 +67,10 @@ from .interfaces import (
     SupportsTranscription,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
-from .whisper import ISO639_1_SUPPORTED_LANGS, _create_fake_bias_for_k_proj
+from .whisper import ISO639_1_SUPPORTED_LANGS
 
 
 class GlmAsrEncoderRotaryEmbedding(nn.Module):
@@ -396,14 +394,6 @@ class GlmAsrEncoder(nn.Module):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config,
@@ -503,11 +493,6 @@ class GlmAsrEncoder(nn.Module):
 
         # Return in a format compatible with transformers' BaseModelOutput
         return _GlmAsrEncoderOutput(last_hidden_state=hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = _create_fake_bias_for_k_proj(weights, ".k_proj.weight")
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class GlmAsrFeatureInputs(TensorSchema):
@@ -903,10 +888,6 @@ class GlmAsrForConditionalGeneration(
 ):
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"audio_tower.embed_positions": None}
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1072,10 +1053,6 @@ class GlmAsrForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def _get_audio_token(cls, model_config: ModelConfig) -> str:

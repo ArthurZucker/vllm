@@ -52,9 +52,7 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -82,7 +80,7 @@ def _normalize_expert_bias(
     """
     for name, w in weights:
         if _is_expert_bias_name(name):
-            w = _zero_mean_tensor(w)
+            w = _zero_mean_tensor(w if isinstance(w, torch.Tensor) else w[...])
         yield name, w
 
 
@@ -432,28 +430,6 @@ class Param2MoEDecoderLayer(nn.Module):
 
 
 class Param2MoEModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "word_embeddings.": "embed_tokens.",
-            # Fused query_key_value is renamed to qkv_proj and loaded directly;
-            # QKVParallelLinear splits the fused [Q|K|V] tensor internally.
-            ".attention.query_key_value.": ".self_attn.qkv_proj.",
-            ".attention.dense.": ".self_attn.o_proj.",
-            ".attention.query_layernorm.": ".self_attn.q_layernorm.",
-            ".attention.key_layernorm.": ".self_attn.k_layernorm.",
-            # Catch-all for any remaining .attention. names (must come last).
-            ".attention.": ".self_attn.",
-            ".mlp.gate.expert_bias": ".mlp.gate.e_score_correction_bias",
-        },
-        orig_to_new_stacked={
-            # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        },
-    )
-
     def __init__(
         self,
         *,
@@ -535,15 +511,6 @@ class Param2MoEModel(nn.Module):
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _normalize_expert_bias(weights), mapper=self.hf_to_vllm_mapper
-        )
 
 
 class Param2MoEMixtureOfExperts(MixtureOfExperts):
@@ -636,6 +603,7 @@ class Param2MoEForCausalLM(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self.checkpoint_transforms = [_normalize_expert_bias]
 
         self.tie_word_embeddings: bool = getattr(config, "tie_word_embeddings", False)
         if get_pp_group().is_last_rank:
@@ -697,10 +665,3 @@ class Param2MoEForCausalLM(
         if not get_pp_group().is_last_rank:
             return None
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

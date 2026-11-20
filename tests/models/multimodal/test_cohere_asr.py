@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from vllm.config import SpeechToTextConfig
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.cohere_asr import (
     CohereAsrForConditionalGeneration,
     CohereASRModel,
@@ -112,7 +113,9 @@ def test_load_weights_preserves_runtime_bias_dtype() -> None:
         model = _CohereASRWeightLoadingModel()
 
     loaded_weight = torch.ones_like(model.pos_bias_u, dtype=torch.float32)
-    model.load_weights([("pos_bias_u", loaded_weight), ("pos_bias_v", loaded_weight)])
+    load_weights(
+        model, iter([("pos_bias_u", loaded_weight), ("pos_bias_v", loaded_weight)])
+    )
 
     assert model.pos_bias_u.dtype == torch.float16
     assert model.pos_bias_v.dtype == torch.float16

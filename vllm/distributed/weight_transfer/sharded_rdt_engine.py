@@ -1236,19 +1236,9 @@ class ShardedRDTWeightTransferEngine(
         """Bake the replay plan once, as a self-driven meta dry run, into
         `state` (the engine itself when omitted).
 
-        Puts the params on meta, then drives `model.load_weights` over
-        `init_info.names` through the model's ORIGINAL loaders (the stamps
-        bypass `online_process_loader`, so `_layerwise_process` is never in
-        the path). Nothing materializes or pulls; the fake's `copy_` records
-        the source op chain and the meta destination's geometry. Afterwards one
-        scatter list per fully-loaded leaf module (copied numel == loadable
-        size) is indexed by source name; a partial or unrecordable module fails
-        the plan build. The model is restored.
-
-        This leans on layerwise internals a public API should expose first-class:
-        a currently-loading hook instead of monkeypatched stamps, a dry-run mode
-        instead of bypassing `online_process_loader`, and an
-        `abort_layerwise_reload` instead of `_restore_after_dry_run`.
+        Loads fake weights onto meta through a recording `load_into` (bypassing
+        the reload's buffering); the fake's `copy_` records each op chain. One
+        scatter list per fully-loaded leaf module is indexed by source name.
         """
         from vllm.model_executor.model_loader.reload.layerwise import (
             initialize_layerwise_reload,
@@ -1272,18 +1262,21 @@ class ShardedRDTWeightTransferEngine(
 
         _t0 = time.perf_counter()
         with torch.device(self.device):
-            # Meta-restore params + save kernel tensors (we bypass the loader
-            # wrapping it installs, below).
             initialize_layerwise_reload(model)
-            # Stamp the *original* loaders (bypassing online_process_loader), so
-            # the single load pass runs the loaders on meta and records via the
-            # fake's copy_ — with no inline _layerwise_process, no deferral.
-            self._install_recording_stamps(model, recorder)
-            model.load_weights(
-                self._build_fake_weights(names, recorder, self.device, into._name_meta)
+            from vllm.model_executor.model_loader.ops_loader import (
+                load_weights as load_model_weights,
             )
+            from vllm.model_executor.model_loader.ops_loader import loading_into
+
+            with loading_into(self._recording_load_into(model, recorder)):
+                load_model_weights(
+                    model,
+                    self._build_fake_weights(
+                        names, recorder, self.device, into._name_meta
+                    ),
+                )
             # Keep only fully-loaded modules (copied numel >= loadable size, the
-            # test online_process_loader uses): a partial module leaves unwritten
+            # test the reload's write uses): a partial module leaves unwritten
             # regions that finalize would init, so baking it scatters garbage.
             for module, recorded in recorder.copies_by_layer.items():
                 if not recorded or any(c is None for c in recorded):
@@ -1315,69 +1308,40 @@ class ShardedRDTWeightTransferEngine(
             time.perf_counter() - _t0,
         )
 
-    def _install_recording_stamps(
+    def _recording_load_into(
         self, model: torch.nn.Module, recorder: "BakeSink"
-    ) -> None:
-        """Wrap each loadable param's `weight_loader` to stamp
-        `recorder.current = (leaf_module, param_name)` before delegating to the
-        original loader, so the fake's `copy_` can attribute each recorded copy.
-        `functools.wraps` keeps the loader's real signature (so vLLM's
-        `_layerwise_process` `param` redirect still works if a stamp leaks),
-        and `_rdt_stamp_inner` tags it so `_restore_after_dry_run` can unwrap it.
-        """
-        import functools
-
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            _get_original_loader,
-        )
+    ) -> Callable[[str, torch.Tensor, torch.Tensor], None]:
+        """`copy_into`, with `recorder.current` set so the fake's `copy_` knows
+        its module"""
+        from vllm.model_executor.model_loader.ops_loader import copy_into
         from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
-        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-        def _make_stamp(layer, name, inner, added=False):
-            @functools.wraps(inner)  # keep ``inner``'s signature (incl. ``param``)
-            def stamp(*args, **kwargs):
-                recorder.current = (layer, name)
-                try:
-                    return inner(*args, **kwargs)
-                finally:
-                    recorder.current = None
+        owners = {
+            id(tensor): (tensor, module, name)
+            for module in model.modules()
+            for name, tensor in get_layer_tensors(module).items()
+        }
 
-            # Tag so _restore_after_dry_run can detect and unwrap leaked stamps,
-            # and so a second bake doesn't double-wrap.
-            stamp._rdt_stamp_inner = inner  # type: ignore[attr-defined]
-            stamp._rdt_stamp_added = added  # type: ignore[attr-defined]
-            return stamp
+        def record(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
+            owner = owners.get(id(param))
+            if owner is not None and owner[0] is param:
+                recorder.current = (owner[1], owner[2])
+            try:
+                copy_into(name, param, value)
+            finally:
+                recorder.current = None
 
-        for module in model.modules():
-            for name, tensor in get_layer_tensors(module).items():
-                if getattr(tensor, "weight_loader", None) is None:
-                    # A param with NO loader (e.g. GLM's router bias, a plain
-                    # nn.Parameter) is still loaded by the model's load_weights
-                    # through the getattr(param, "weight_loader",
-                    # default_weight_loader) fallback — unstamped, its bake copy
-                    # would be unattributable, failing the module's coverage
-                    # gate and the plan build. Stamp the same default loader
-                    # the fallback would pick; the restore deletes it again.
-                    tensor.weight_loader = _make_stamp(
-                        module, name, default_weight_loader, added=True
-                    )
-                    continue
-                # Bypass online_process_loader: stamp the *original* loader.
-                original = _get_original_loader(tensor)
-                tensor.weight_loader = _make_stamp(module, name, original)
+        return record
 
     def _restore_after_dry_run(self, model: torch.nn.Module) -> None:
         """Restore each layerwise layer's saved kernel tensors without pulling
-        (a real `finalize_layerwise_reload` would materialize/load) and reset
-        its info. Also unwrap any recording `stamp` left on the params, since a
-        leaked stamp would sit under the next sync's `online_process_loader` and
-        silently break `_layerwise_process`'s `param` redirect.
-        """
+        (a real `finalize_layerwise_reload` would materialize/load), reset its
+        info and stop buffering writes into it."""
         from vllm.model_executor.model_loader.reload.layerwise import (
             LAYERWISE_INFO,
             _place_kernel_tensors,
+            _untrack,
         )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 
         for layer in model.modules():
             info = LAYERWISE_INFO.get(layer)
@@ -1385,21 +1349,7 @@ class ShardedRDTWeightTransferEngine(
                 if info.kernel_tensors is not None:
                     _place_kernel_tensors(layer, info)
                 info.reset()
-        # Unwrap any recording stamps left on the (now-restored) params so they
-        # never leak into a later update_weights. ``_rdt_stamp_inner`` is set by
-        # ``_install_recording_stamps``; unwrap repeatedly in case of nesting.
-        for module in model.modules():
-            for _name, tensor in get_layer_tensors(module).items():
-                loader = getattr(tensor, "weight_loader", None)
-                added = False
-                while loader is not None and hasattr(loader, "_rdt_stamp_inner"):
-                    added = added or getattr(loader, "_rdt_stamp_added", False)
-                    loader = loader._rdt_stamp_inner
-                    tensor.weight_loader = loader
-                if added:
-                    # The stamp was ATTACHED to a param that had no loader
-                    # (see _install_recording_stamps); leave none behind.
-                    del tensor.weight_loader
+        _untrack(model.modules())
         if hasattr(model, "_original_do_torchao_reload"):
             model._do_torchao_reload = model._original_do_torchao_reload
 

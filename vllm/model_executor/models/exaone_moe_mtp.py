@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only ExaoneMoe MTP model."""
 
-from collections.abc import Iterable
-
 import torch
 from torch import nn
 
@@ -20,7 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.exaone_moe import ExaoneMoeDecoderLayer
 from vllm.sequence import IntermediateTensors
 
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -29,17 +27,6 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 
 @support_torch_compile
 class ExaoneMoeMultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            # Scope to dense mlp; experts are handled separately.
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -115,10 +102,6 @@ class ExaoneMoeMultiTokenPredictor(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 @support_torch_compile
 class ExaoneMoeMTP(nn.Module):
@@ -175,17 +158,3 @@ class ExaoneMoeMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        shared_weight_names = ["embed_tokens", "lm_head"]
-
-        def remap_weight_names(weights):
-            for name, weight in weights:
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif not any(key in name for key in shared_weight_names):
-                    continue
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))

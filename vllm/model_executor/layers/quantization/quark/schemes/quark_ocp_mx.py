@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from fractions import Fraction
 
 import torch
+from transformers.core_model_loading import ConversionOps
 
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp6E3M2Static,
     kMxfp8Static,
 )
+from vllm.model_executor.model_loader.weight_ops import _each
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -130,25 +131,17 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 "open an issue."
             )
 
-    def _expanding_scale_loader(self, weight_loader: Callable) -> Callable:
-        """Expand a 2-D block scale to one row per weight row.
-
-        A `block_size=[R, 32]` export carries one e8m0 value per R weight
-        rows; the kernels want one per row. At `R == 1` the layouts already
-        coincide, so the loader is passed through untouched.
-        """
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """A `block_size=[R, 32]` export's scales (one e8m0 value per R weight
+        rows) load expanded to one per row (`ExpandScaleRows`); at `R == 1` the
+        layouts coincide"""
         if self.scale_block_rows == 1:
-            return weight_loader
+            return None
+        from vllm.model_executor.models.transformers.conversion import (
+            VllmLayoutQuantizer,
+        )
 
-        rows = self.scale_block_rows
-
-        def expanding_loader(param, loaded_weight, *args, **kwargs):
-            loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
-                rows, dim=0
-            )
-            return weight_loader(param, loaded_weight, *args, **kwargs)
-
-        return expanding_loader
+        return VllmLayoutQuantizer(ExpandScaleRows, ["weight_scale"])
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -163,7 +156,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         if input_size_per_partition % OCP_MX_BLOCK_SIZE != 0:
@@ -191,7 +183,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
             )
             layer.register_parameter("weight", weight)
 
@@ -203,7 +194,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=self._expanding_scale_loader(weight_loader),
             )
             layer.register_parameter("weight_scale", weight_scale)
             layer.weight_block_size = [1, OCP_MX_BLOCK_SIZE]
@@ -222,7 +212,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 output_dim=0,
                 packed_dim=1,
                 packed_factor=self.packed_factor,
-                weight_loader=weight_loader,
             )
             layer.register_parameter("weight", weight)
 
@@ -235,7 +224,6 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
             )
             layer.register_parameter("weight_scale", weight_scale)
 
@@ -274,3 +262,25 @@ class QuarkOCP_MX(QuarkScheme, InputHadamardFusable):
         if isinstance(self.ocp_mx_linear, MxFp4LinearKernel):
             return self.ocp_mx_linear.fuse_input_hadamard(size)
         return False
+
+
+class ExpandScaleRows(ConversionOps):
+    """A 2-D block scale (one e8m0 value per `scale_block_rows` weight rows)
+    repeated to one row per weight row, as the kernels read it. Whole: a rank's
+    rows are sharded after (its slice of the compressed scale is not the
+    param's). `hf_quantizer` keeps the tensor's own dtype: the e8m0 bytes are
+    viewed, not cast"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        self.hf_quantizer = quantizer
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        name = kwargs["full_layer_name"]
+        layer = kwargs["model"].get_submodule(name.rpartition(".")[0])
+        rows = layer.scheme.scale_block_rows
+        return _each(
+            input_dict, lambda t: t.view(torch.uint8).repeat_interleave(rows, dim=0)
+        )

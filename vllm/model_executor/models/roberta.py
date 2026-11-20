@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import itertools
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -25,7 +23,6 @@ from vllm.model_executor.layers.pooler.tokwise import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.bert import (
     TOKEN_TYPE_SHIFT,
     BertEmbeddingModel,
@@ -34,8 +31,6 @@ from vllm.model_executor.models.bert import (
     _encode_token_type_ids,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
@@ -150,39 +145,6 @@ class RobertaEmbeddingModel(BertEmbeddingModel):
         else:
             return JinaRobertaModel(vllm_config=vllm_config, prefix=prefix)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        weights_list = list(weights)
-        orig_to_new_prefix: dict[str, str | None] = {"lm_head.": None}
-        has_roberta_prefix = any(
-            name.startswith("roberta.") for name, _ in weights_list
-        )
-        if has_roberta_prefix:
-            # For models with the `roberta.` prefix e.g.
-            # `FacebookAI/roberta-base`
-            orig_to_new_prefix["roberta."] = "model."
-        else:
-            # For models without the `roberta.` prefix e.g.
-            # `sentence-transformers/stsb-roberta-base-v2`
-            orig_to_new_prefix[""] = "model."
-        mapper = WeightsMapper(orig_to_new_prefix=orig_to_new_prefix)
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights_list, mapper=mapper)
-
-
-def filter_secondary_weights(
-    all_weights: Iterable[tuple[str, torch.Tensor]],
-    secondary_weights: list[str],
-) -> tuple[Iterable[tuple[str, torch.Tensor]], Iterable[tuple[str, torch.Tensor]]]:
-    all_weights1, all_weights2 = itertools.tee(all_weights)
-
-    def filtered(n):
-        return any(n.startswith(f) for f in secondary_weights)
-
-    return ((n, w) for n, w in all_weights1 if filtered(n)), (
-        (n, w) for n, w in all_weights2 if not filtered(n)
-    )
-
 
 class BgeM3EmbeddingModel(RobertaEmbeddingModel):
     """A model that extends RobertaEmbeddingModel with sparse embeddings.
@@ -249,23 +211,6 @@ class BgeM3EmbeddingModel(RobertaEmbeddingModel):
             }
         )
 
-    def load_weights(self, all_weights: Iterable[tuple[str, torch.Tensor]]):
-        secondary, weights = filter_secondary_weights(
-            all_weights, self.secondary_weight_prefixes
-        )
-
-        super().load_weights(weights)
-
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in secondary:
-            if any(
-                name.startswith(prefix) for prefix in self.secondary_weight_prefixes
-            ):
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-
 
 @default_pooling_type(seq_pooling_type="CLS")
 class RobertaForSequenceClassification(nn.Module, SupportsCrossEncoding, SupportsLoRA):
@@ -282,19 +227,6 @@ class RobertaForSequenceClassification(nn.Module, SupportsCrossEncoding, Support
 
     is_pooling_model = True
     packed_modules_mapping = {"qkv_proj": ["query", "key", "value"]}
-    jina_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "emb_ln": "embeddings.LayerNorm",
-            "layers": "layer",
-            "mixer.Wqkv": "attention.self.qkv_proj",
-            "mixer.out_proj": "attention.output.dense",
-            "norm1": "attention.output.LayerNorm",
-            "mlp.fc1": "intermediate.dense",
-            "mlp.fc2": "output.dense",
-            "norm2": "output.LayerNorm",
-        }
-    )
-
     embedding_class: type[nn.Module] = RobertaEmbedding
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -318,10 +250,6 @@ class RobertaForSequenceClassification(nn.Module, SupportsCrossEncoding, Support
             pooler_config,
             classifier=self.classifier,
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.jina_to_vllm_mapper)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.roberta.embed_input_ids(input_ids)
@@ -382,10 +310,6 @@ class RobertaForTokenClassification(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.roberta.embed_input_ids(input_ids)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
     def forward(
         self,

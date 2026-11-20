@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from itertools import accumulate
 from typing import Annotated, Literal, TypeAlias
 
@@ -47,8 +47,6 @@ from vllm.model_executor.models.qwen2_vl import (
 )
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -593,21 +591,6 @@ class DotsVisionTransformer(nn.Module):
     dummy_inputs=DotsOCRDummyInputsBuilder,
 )
 class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".attn.qkv_proj.": ".attn.qkv.",
-            ".attn.out_proj.": ".attn.proj.",
-        },
-        orig_to_new_stacked={
-            ".fc1.": (".fc13.", 0),
-            ".fc3.": (".fc13.", 1),
-        },
-        orig_to_new_prefix={
-            "lm_head.": "language_model.lm_head.",
-            "model.": "language_model.model.",
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -765,10 +748,6 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""

@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedConfig
+from transformers.core_model_loading import WeightConverter, rename_source_key
 
 from vllm.config.model import AttnTypeStr, ModelConfig, ModelDType, RunnerOption
 from vllm.config.pooler import SequencePoolingType, TokenPoolingType
@@ -708,3 +709,15 @@ def skip_unavailable_models(
             pytest.param(id_, marks=pytest.mark.skip(reason=reason)) if reason else id_
         )
     return params
+
+
+def map_checkpoint_name(transforms, name: str) -> tuple[str, int | None]:
+    """`name` through conversion `transforms`: (target, index among its converter's
+    sources, or None when renamed only)"""
+    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
+    converters = [t for t in transforms if isinstance(t, WeightConverter)]
+    mapped, pattern = rename_source_key(name, renamings, converters)
+    if pattern is None:
+        return mapped, None
+    [converter] = [c for c in converters if pattern in c.source_patterns]
+    return mapped, converter.source_patterns.index(pattern)

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -16,7 +15,6 @@ from vllm.config import (
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -25,7 +23,6 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -45,10 +42,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.ops_loader import ShardOutputs
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
     make_attention_sink,
-    maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
@@ -63,10 +59,8 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -777,6 +771,44 @@ def _shard_fp8_qkv_proj(
     return _requantize_fp8(grouped, index.numel(), block, w_full.dtype)
 
 
+class FusedFp8QKV(ShardOutputs):
+    """A layer's FP8 `qkv_proj` and its block scales, fused on disk and pre-sharded
+    for `num_key_value_heads` ranks (MiMo V2.5): this rank's rows of both
+    (`_shard_fp8_qkv_proj`), read whole. It shards its outputs itself (a
+    `ShardOutputs`)."""
+
+    needs_full = True
+
+    def __init__(self):
+        pass
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        model, name = kwargs["model"], kwargs["full_layer_name"]
+        attn = model.get_submodule(name.rsplit(".", 2)[0])
+        weight, scale = (
+            value[0] if isinstance(value, list) else value
+            for value in (input_dict[p] for p in source_patterns)
+        )
+        sharded = _shard_fp8_qkv_proj(
+            weight,
+            scale,
+            num_heads=attn.total_num_heads,
+            num_kv_heads=attn.total_num_kv_heads,
+            head_dim=attn.head_dim,
+            v_head_dim=attn.v_head_dim,
+            tp_rank=attn.qkv_proj.tp_rank,
+            tp_size=attn.qkv_proj.tp_size,
+            ckpt_tp=kwargs["config"].get_text_config().num_key_value_heads,
+            kv_chunk_rows=attn.kv_chunk_rows,
+        )
+        out = {}
+        for pattern, tensor in zip(target_patterns, sharded):
+            param = model.get_parameter(name.replace(target_patterns[0], pattern))
+            out[pattern] = tensor[: param.shape[0]]  # the layer's padding rows
+        return out
+
+
 @support_torch_compile
 class MiMoV2Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -863,212 +895,6 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=self.num_redundant_experts,
-        )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping: list[tuple[str, str, str | int]] = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-        expert_params_mapping = self.get_expert_mapping()
-        # Pro-format fused qkv_proj arrives as two tensors (weight and
-        # weight_scale_inv). Store them per-layer so that they can be
-        # sharded together. The state must outlive this call: AutoWeightsLoader
-        # delegates per contiguous group of names, so a pair can straddle two
-        # calls and would otherwise be dropped silently.
-        pending_fp8_qkv_proj = getattr(self, "_pending_fp8_qkv_proj", None)
-        if pending_fp8_qkv_proj is None:
-            self._pending_fp8_qkv_proj = pending_fp8_qkv_proj = {}
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-            if "mtp" in name:
-                continue
-
-            expert_matched = False
-            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                name_rewritten = name.replace(weight_name, param_name)
-
-                if is_pp_missing_parameter(name_rewritten, self):
-                    continue
-
-                if (
-                    name_rewritten.endswith(".bias") or name_rewritten.endswith("_bias")
-                ) and name_rewritten not in params_dict:
-                    continue
-
-                if name_rewritten not in params_dict:
-                    continue
-
-                param = params_dict[name_rewritten]
-                weight_loader = param.weight_loader
-
-                weight_loader(
-                    param,
-                    loaded_weight,
-                    name_rewritten,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
-                loaded_params.add(name_rewritten)
-                expert_matched = True
-                break
-
-            if expert_matched:
-                continue
-            # Support fused qkv_proj checkpoint (Pro format)
-            if self._try_load_fp8_qkv_proj(
-                name,
-                loaded_weight,
-                pending_fp8_qkv_proj,
-                params_dict,
-                loaded_params,
-                tp_rank,
-                tp_size,
-            ):
-                continue
-            stacked_matched = False
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name_rewritten = name.replace(weight_name, param_name)
-
-                if (
-                    name_rewritten.endswith(".bias")
-                    and name_rewritten not in params_dict
-                ):
-                    continue
-
-                if is_pp_missing_parameter(name_rewritten, self):
-                    continue
-
-                if name_rewritten not in params_dict:
-                    continue
-
-                param = params_dict[name_rewritten]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(name_rewritten)
-
-                stacked_matched = True
-                break
-
-            if stacked_matched:
-                continue
-
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-
-            orig_name = name
-            mapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            name = mapped_name if mapped_name is not None else orig_name
-
-            if name not in params_dict:
-                continue
-
-            param = params_dict[name]
-
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
-
-    def _try_load_fp8_qkv_proj(
-        self,
-        name: str,
-        tensor: torch.Tensor,
-        fp8_qkv_proj_dict: dict[str, dict[str, torch.Tensor]],
-        params_dict: dict[str, torch.nn.Parameter],
-        loaded_params: set[str],
-        tp_rank: int,
-        tp_size: int,
-    ) -> bool:
-        """The fused fp8 QKV projection weights and scale are stored separately.
-        Special care must be taken while sharding these tensors across TP ranks.
-        See _shard_fp8_qkv_proj for more details.
-
-        Returns:
-            True if `tensor` was an fp8 qkv_proj weight/scale and was consumed
-            (caller should skip it); False otherwise, so the caller falls
-            through to its normal loading path.
-
-        """
-        is_weight = (
-            name.endswith("qkv_proj.weight") and tensor.dtype == torch.float8_e4m3fn
-        )
-        is_scale = name.endswith("qkv_proj.weight_scale_inv")
-        if not is_weight and not is_scale:
-            # Weight is not in FP8 format. Ignore.
-            return False
-
-        if is_pp_missing_parameter(name, self):
-            # This qkv_proj is for a layer not on this PP rank.
-            return True
-
-        prefix, qkv_kind = name.rsplit(".", 1)
-        if f"{prefix}.weight" not in params_dict:
-            # Layer absent from this instance, e.g. truncated num_hidden_layers.
-            return True
-        entry = fp8_qkv_proj_dict.setdefault(prefix, {})
-        entry[qkv_kind] = tensor
-        if "weight" not in entry or "weight_scale_inv" not in entry:
-            # Still waiting for the other param.
-            return True
-        del fp8_qkv_proj_dict[prefix]
-
-        # Get self_attn module, which is a parent of qkv_proj.
-        attn = self.get_submodule(prefix.rsplit(".", 1)[0])
-
-        # Shard the qkv_proj per-rank.
-        w_rank, s_rank = _shard_fp8_qkv_proj(
-            entry["weight"],
-            entry["weight_scale_inv"],
-            num_heads=attn.total_num_heads,
-            num_kv_heads=attn.total_num_kv_heads,
-            head_dim=attn.head_dim,
-            v_head_dim=attn.v_head_dim,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            # The fused qkv_proj is pre-sharded for this many ranks.
-            ckpt_tp=self.config.num_key_value_heads,
-            kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
-        )
-        sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
-        for kind, tensor in sharded.items():
-            param_name = f"{prefix}.{kind}"
-            param = params_dict[param_name]
-            if tensor.shape[0] > param.shape[0]:
-                tensor = tensor[: param.shape[0]]
-            default_weight_loader(param, tensor)
-            loaded_params.add(param_name)
-        return True
-
 
 class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEagle3):
     packed_modules_mapping = {
@@ -1125,13 +951,6 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
 
 class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):

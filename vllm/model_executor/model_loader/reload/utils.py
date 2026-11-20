@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from inspect import BoundArguments
+from collections.abc import Iterable
 
 import torch
 
@@ -39,8 +39,8 @@ def get_tensor_load_numel(tensor: torch.Tensor) -> int:
 def get_layer_size(layer: torch.nn.Module) -> int:
     """Calculate total number of elements across loadable tensors in a layer.
 
-    Excludes SKIP_LOAD_TENSORS (e.g. _expert_map) which are never loaded via
-    weight_loader during layerwise reload.
+    Excludes SKIP_LOAD_TENSORS (e.g. _expert_map) which are never loaded during
+    layerwise reload.
     """
     from .meta import SKIP_LOAD_TENSORS
 
@@ -51,35 +51,18 @@ def get_layer_size(layer: torch.nn.Module) -> int:
     )
 
 
-def has_device_tensors(bound_args: BoundArguments) -> bool:
-    """Return True if the loaded weights exist on an accelerator device.
-
-    Args:
-        bound_args: args to load weights
-
-    Returns:
-        True if weights are on accelerator device
-
-    """
+def has_device_tensors(values: Iterable[object]) -> bool:
+    """Return True if any of the loaded values is on an accelerator device."""
     return any(
         isinstance(value, torch.Tensor) and value.device.type not in ("meta", "cpu")
-        for value in bound_args.arguments.values()
+        for value in values
     )
 
 
 def get_info_size(info: LayerReloadingInfo) -> int:
-    """Calculate the number of bytes used by loaded weights for a given layer.
-
-    Args:
-        info: layerwise info to get size of
-
-    Returns:
-        number of bytes used by loaded weights
-
-    """
+    """Bytes of device memory held by a layer's buffered writes."""
     return sum(
         value.nbytes
-        for _, args in info.loaded_weights
-        for value in args.arguments.values()
-        if isinstance(value, torch.Tensor) and value.device.type not in ("meta", "cpu")
+        for _, _, value in info.loaded_weights
+        if value.device.type not in ("meta", "cpu")
     )

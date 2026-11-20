@@ -117,6 +117,9 @@ class InklingAttention(nn.Module, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.qkvr",
         )
+        # k and v (shards 1, 2): a kv head shared by tp / kv-heads ranks
+        r = kv_total_for_sizing // self.num_total_kv_heads
+        self.qkvr.shard_replicas = {1: r, 2: r}
         self.wo_ud = RowParallelLinear(
             input_size=head_dim * self.num_total_heads,
             output_size=config.hidden_size,
@@ -144,6 +147,9 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         self.v_sconv = InklingShortConv(
             kv_conv_dim, config.sconv_kernel_size, owner=conv_owner, stream_idx=_V
         )
+        # a kv head's channels shared by `r` ranks, like qkvr's k/v
+        self.k_sconv.weight.shard_replicas = r
+        self.v_sconv.weight.shard_replicas = r
 
         # FA4 left/right window; right=0 keeps it causal. local_extent-1 mirrors
         # the source (sliding_window_size - 1).

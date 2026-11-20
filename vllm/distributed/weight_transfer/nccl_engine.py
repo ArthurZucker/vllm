@@ -337,9 +337,13 @@ class NCCLWeightTransferEngine(
                     )
                 ),
             )
+        from vllm.model_executor.model_loader import ops_loader
+
         model = self.model
         load_weights = (
-            model.load_weights if plan is None else partial(load_planned, model, plan)
+            partial(ops_loader.load_weights, model)
+            if plan is None
+            else partial(load_planned, model, plan)
         )
         if self.packed:
             # Build iterator of (name, (shape, dtype)) from update_info

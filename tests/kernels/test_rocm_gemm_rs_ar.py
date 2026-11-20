@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.kernels.test_gemm_rs_ar import _N, _SHAPES
+from tests.quantization.utils import load_online_quantized
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.distributed import cleanup_dist_env_and_memory, get_tp_group
@@ -110,8 +111,11 @@ def _run_mode(
             torch.randn(_N, K, dtype=torch.bfloat16, device=device, generator=generator)
             * 0.1
         )
-        layer.weight = torch.nn.Parameter(weight, requires_grad=False)
-        layer.quant_method.process_weights_after_loading(layer)
+        if quant_config is None:
+            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+            layer.quant_method.process_weights_after_loading(layer)
+        else:  # quantized by the plan's quantize op as it loads
+            load_online_quantized(layer, {"weight": weight})
         if backend == "mxfp8":
             from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
                 RocmDotScaledMxfp8LinearKernel,

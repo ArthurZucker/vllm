@@ -22,24 +22,14 @@ class KVCacheScaleParameter(torch.nn.Parameter):
     """Scalar parameter for KV-cache scales.
 
     Initialized to -1.0 (an invalid sentinel) so call sites just write
-    `KVCacheScaleParameter()`. The `weight_loader` accepts shape `()` or
-    `(1,)` and rejects anything else — per-head scales go through a separate
-    path (compressed-tensors' `_tp_aware_loader`), not this one. Per-instance
-    overrides still work because instance attribute assignment shadows this
-    class-level loader.
+    `KVCacheScaleParameter()`. A scalar or `(1,)` checkpoint tensor loads into
+    it as is (`ops_loader.copy_into` views a same-size value at the param's
+    shape); anything larger is a shape mismatch. Per-head scales are
+    compressed-tensors' (`AttnHeadScales`).
     """
 
     def __new__(cls) -> "KVCacheScaleParameter":
         return super().__new__(cls, torch.tensor(-1.0), requires_grad=False)
-
-    @staticmethod
-    def weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        if loaded_weight.numel() != 1:
-            raise ValueError(
-                f"KV-cache scale expects a scalar weight, got shape "
-                f"{tuple(loaded_weight.shape)}"
-            )
-        param.data.copy_(loaded_weight.reshape(()))
 
 
 class BaseKVCacheMethod(QuantizeMethodBase):

@@ -3,8 +3,6 @@
 """Minimal implementation of BlipVisionModel intended to be only used
 within a vision language model."""
 
-from collections.abc import Iterable
-
 import torch
 import torch.nn as nn
 from transformers import Blip2VisionConfig, BlipVisionConfig
@@ -21,7 +19,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from .interfaces import SupportsQuant
-from .utils import AutoWeightsLoader, WeightsMapper
 
 
 def get_blip_patch_grid_length(*, image_size: int, patch_size: int) -> int:
@@ -260,14 +257,6 @@ class BlipVisionModel(nn.Module, SupportsQuant):
     main_input_name = "pixel_values"
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv", "q"),
-            ".k_proj": (".qkv", "k"),
-            ".v_proj": (".qkv", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: BlipVisionConfig,
@@ -305,9 +294,6 @@ class BlipVisionModel(nn.Module, SupportsQuant):
             )
         else:
             self.post_layernorm = None
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={"post_layernorm.": None}
-            )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embeddings(pixel_values)
@@ -317,17 +303,3 @@ class BlipVisionModel(nn.Module, SupportsQuant):
             return hidden_states
 
         return self.post_layernorm(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        # omit layers when num_hidden_layers_override is set
-        def _filter(ws):
-            for name, weight in ws:
-                if name.startswith("encoder.layers.") and int(
-                    name.split(".")[2]
-                ) >= len(self.encoder.layers):
-                    continue
-                yield name, weight
-
-        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)

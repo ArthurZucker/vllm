@@ -63,7 +63,6 @@ class INCMxfp8MoEMethod(FusedMoEMethodBase):
             )
 
         layer.num_experts = num_experts
-        weight_loader = extra_weight_attrs.get("weight_loader")
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
 
         w13_weight = ModelWeightParameter(
@@ -75,7 +74,6 @@ class INCMxfp8MoEMethod(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
 
@@ -88,7 +86,6 @@ class INCMxfp8MoEMethod(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
 
@@ -101,7 +98,6 @@ class INCMxfp8MoEMethod(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
@@ -114,7 +110,6 @@ class INCMxfp8MoEMethod(FusedMoEMethodBase):
             ),
             input_dim=2,
             output_dim=1,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 

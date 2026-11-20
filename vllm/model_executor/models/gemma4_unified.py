@@ -16,7 +16,7 @@ embedding/forward path, and LoRA support are all inherited unchanged.
 """
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -54,8 +54,6 @@ from vllm.multimodal.processing.processor import PromptUpdateDetails
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -260,17 +258,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
       * `load_weights` — ignore-prefix list excludes the absent towers.
       * `get_mm_mapping` — no tower entries.
     """
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.embed_audio.": "embed_audio.",
-            "model.embed_vision.": "embed_vision.",
-            "model.language_model.": "language_model.model.",
-            "model.vision_embedder.": "vision_embedder.",
-            "lm_head.": "language_model.lm_head.",
-            "model": "language_model.model",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # LightOnOCR-style rebuild: do NOT call super().__init__ — that
@@ -538,22 +525,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     # ------------------------------------------------------------------ #
     # Weight loading
     # ------------------------------------------------------------------ #
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        ignore_prefixes = [
-            # Vestigial Gemma3n-style embedding tables not used by
-            # Gemma4MultimodalEmbedder (which has only projection + norm).
-            "embed_vision.embedding.",
-            "embed_audio.embedding.",
-        ]
-        if self.embed_audio is None:
-            ignore_prefixes.append("embed_audio.")
-
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=ignore_prefixes,
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping

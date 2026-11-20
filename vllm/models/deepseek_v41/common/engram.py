@@ -498,21 +498,6 @@ class NgramHashState(nn.Module):
         return output
 
 
-def _engram_head_shard_weight_loader(
-    param: torch.nn.Parameter, loaded_weight: torch.Tensor
-) -> None:
-    """Load this rank's complete head buckets. ue8m0 scales arrive as
-    float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
-    part_rows = param.shape[0]
-    if loaded_weight.dtype == torch.float8_e8m0fnu:
-        loaded_weight = loaded_weight.view(torch.uint8)
-    shard = loaded_weight.narrow(0, param.engram_vocab_start, part_rows)
-    assert shard.shape == param.shape, (
-        f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
-    )
-    param.data.copy_(shard)
-
-
 # Branching on SORTED at runtime intermittently crashes Triton 3.8's
 # RemoveLayoutConversions.
 # TODO: Remove the 3.8 check once Triton ships
@@ -836,8 +821,9 @@ def _allow_any_numa_node(address: int, num_bytes: int) -> None:
 
 
 class DPSharedEngramStorage:
-    """Host weights shared by a node-local DP group with one writer: host-NUMA
-    cuMem where FABRIC handles work, else a registered /dev/shm mapping."""
+    """Host weights shared by a node-local DP group with one writer (the group's
+    leader): host-NUMA cuMem where FABRIC handles work, else a registered /dev/shm
+    mapping."""
 
     def __init__(
         self,
@@ -948,15 +934,6 @@ class DPSharedEngramStorage:
         if result.value != 0:
             logger.warning("Engram cudaHostUnregister failed: %s", result)
 
-    def load_weight(
-        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
-    ) -> None:
-        if self.group.rank_in_group == 0:
-            _engram_head_shard_weight_loader(param, loaded_weight)
-        # Read order may differ across ranks. Equal load counts ensure all shared
-        # weights are ready after the last weight-loader call returns.
-        torch.distributed.barrier(group=self.group.cpu_group)
-
     def get_views(
         self, weight: torch.Tensor, scales: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1039,7 +1016,6 @@ class ParallelEngramEmbedding(nn.Module):
     4-bit dtype.
     """
 
-    _weight_loader = staticmethod(_engram_head_shard_weight_loader)
     _shared_memory: DPSharedEngramStorage | None = None
     _packed: torch.Tensor | None = None
     _loaded = False
@@ -1140,14 +1116,22 @@ class ParallelEngramEmbedding(nn.Module):
         weight, scales = self._allocate_weights()
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.weight_scale_inv = nn.Parameter(scales, requires_grad=False)
+        # this rank's rows of the checkpoint's tables, as their bytes (ue8m0 scales
+        # into uint8): `conversion_mapping`'s `ViewAsParam`, `ParamRows`
         for param in (self.weight, self.weight_scale_inv):
             set_weight_attrs(
-                param,
-                {
-                    "weight_loader": self._weight_loader,
-                    "engram_vocab_start": row_start,
-                },
+                param, {"row_start": row_start, "keeps_sent_dtype": (param.dtype,)}
             )
+        # a DP-shared host table is written by its group's leader alone: the others
+        # drop its tensors (`conversion_mapping`) and wait for it after loading
+        shared = self._shared_memory
+        self.leader_written: tuple[str, ...] = (
+            ("weight", "weight_scale_inv")
+            if shared is not None and shared.group.rank_in_group != 0
+            else ()
+        )
+        for name in self.leader_written:
+            getattr(self, name).loaded_at_init = True
         if cpu_offload and not self.weight.is_meta:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
@@ -1230,7 +1214,6 @@ class ParallelEngramEmbedding(nn.Module):
                 self.packed_fp4,
             )
             self._shared_memory = storage
-            self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
         # pin_memory rounds up to a power of two. ROCm pins huge pages either way.
         if self.use_thp or current_platform.is_rocm():
@@ -1262,8 +1245,11 @@ class ParallelEngramEmbedding(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Peers read this table's rows directly, so serve only once every GPU
-        of the group has finished loading its own."""
+        """Serve only once the leader of the ranks sharing this table has written it
+        (DP-shared host memory), or every GPU of the peer group has loaded its own
+        (peers read those rows directly)."""
+        if self._shared_memory is not None:
+            torch.distributed.barrier(group=self._shared_memory.group.cpu_group)
         if not self.peer_rows:
             return
         assert self._peer_group is not None

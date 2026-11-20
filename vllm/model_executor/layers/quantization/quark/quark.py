@@ -1046,8 +1046,9 @@ class QuarkLinearMethod(LinearMethodBase, InputHadamardFusable):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
-    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
-        """Reconstruct serialized weights for online requantization."""
+    def dequantize_op(self, layer: torch.nn.Module):
+        """Each MXFP8 checkpoint weight to bf16 as it loads, for requantization:
+        its scales one per `(scale_block_rows, 32)` block"""
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
             dequant_mxfp8_to_bf16,
         )
@@ -1055,13 +1056,18 @@ class QuarkLinearMethod(LinearMethodBase, InputHadamardFusable):
             kMxfp8Static,
         )
 
-        if getattr(layer.scheme, "weight_quant_key", None) != kMxfp8Static:
+        scheme = layer.scheme
+        if getattr(scheme, "weight_quant_key", None) != kMxfp8Static:
             raise NotImplementedError(
                 "Quark weight dequantization is only supported for MXFP8."
             )
-        return dequant_mxfp8_to_bf16(
-            layer.weight.contiguous(), layer.weight_scale.contiguous()
-        )
+        rows = getattr(scheme, "scale_block_rows", 1)
+
+        def dequantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            scale = scale.view(torch.uint8).repeat_interleave(rows, dim=0)
+            return dequant_mxfp8_to_bf16(weight.contiguous(), scale.contiguous())
+
+        return dequantize, ["weight", "weight_scale"], []
 
     def create_weights(
         self,
@@ -1077,7 +1083,6 @@ class QuarkLinearMethod(LinearMethodBase, InputHadamardFusable):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
-        weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,
@@ -1085,7 +1090,6 @@ class QuarkLinearMethod(LinearMethodBase, InputHadamardFusable):
             output_partition_sizes=output_partition_sizes,
             output_size=output_size,
             params_dtype=params_dtype,
-            weight_loader=weight_loader,
         )
 
     def apply(
@@ -1110,6 +1114,12 @@ class QuarkLinearMethod(LinearMethodBase, InputHadamardFusable):
         return isinstance(scheme, InputHadamardFusable) and (
             scheme.fuse_input_hadamard(layer, size)
         )
+
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        """The scheme's, when its checkpoint needs vLLM's layout"""
+        scheme = getattr(layer, "scheme", None)
+        method = getattr(scheme, "checkpoint_quantizer", None)
+        return None if method is None else method(layer)
 
 
 class QuarkKVCacheMethod(BaseKVCacheMethod):

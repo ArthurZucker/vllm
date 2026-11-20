@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -10,7 +9,6 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -34,13 +32,9 @@ from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
 )
-from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -278,44 +272,8 @@ class NomicMoE(nn.Module):
             )
         )
         self.bias = nn.Parameter(torch.zeros(self.hidden_size))
-        set_weight_attrs(
-            self.w1,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-        set_weight_attrs(
-            self.w2,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-    ):
-        # NOTE: Nomic-MoE has fused experts weights with shape
-        # (num_experts * intermediate_size, hidden_size)
-        tp_rank = get_tensor_model_parallel_rank()
-        param_data = param.data
-        shard_size = self.intermediate_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
-        if weight_name.endswith("w1"):
-            loaded_weight = loaded_weight.reshape(
-                self.num_total_experts,
-                self.total_intermediate_size,
-                self.hidden_size,
-            )[:, shard]
-        if weight_name.endswith("w2"):
-            loaded_weight = loaded_weight.reshape(
-                self.num_total_experts,
-                self.total_intermediate_size,
-                self.hidden_size,
-            )[:, shard].transpose(1, 2)
-        param_data.copy_(loaded_weight)
+        # stored `[experts * intermediate, hidden]`, w2 transposed (conversion_mapping)
+        self.w1.shard_dim, self.w2.shard_dim = 1, 2
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
@@ -446,8 +404,6 @@ class BertWithRopeEncoder(nn.Module):
 @support_torch_compile
 @default_pooling_type(seq_pooling_type="CLS")
 class BertWithRope(nn.Module, SupportsQuant):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.": ""})
-
     def __init__(
         self,
         *,
@@ -492,81 +448,15 @@ class BertWithRope(nn.Module, SupportsQuant):
             )
         return self.encoder(positions, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-
-        if self.config.hidden_act in ["silu", "geglu"]:
-            stacked_params_mapping = [
-                # (param_name, shard_name, shard_id)
-                ("gate_up_proj", "gate_proj", 0),
-                ("gate_up_proj", "up_proj", 1),
-            ]
-        else:
-            stacked_params_mapping = []
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if not self.add_pooling_layer and "pooler" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if name.endswith((".w1", ".w2")):
-                    # Nomic-MoE has fused experts weights
-                    weight_loader(param, loaded_weight, name)
-                else:
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
 
 class NomicBertModel(BertWithRope):
     # for https://huggingface.co/nomic-ai/nomic-bert-2048
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "emb_ln": "embeddings.LayerNorm",
-            "attn.Wqkv": "attn.qkv_proj",
-            "norm1": "attn_ln",
-            "mlp.fc1.": "mlp.up_proj.",
-            "mlp.fc11": "mlp.up_proj",
-            "mlp.fc12": "mlp.gate_proj",
-            "mlp.fc2": "mlp.down_proj",
-            "norm2": "mlp_ln",
-            # MoE mapping
-            "experts.mlp.": "",
-            "experts.": "",
-            "router.layer": "router",
-        }
-    )
+    pass
 
 
 class GteNewModel(BertWithRope):
     # for https://huggingface.co/Alibaba-NLP/new-impl
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "new.": "",
-            "layer": "layers",
-            "attention.qkv_proj": "attn.qkv_proj",
-            "attention.o_proj": "attn.out_proj",
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs):
         super().__init__(vllm_config=vllm_config, prefix=prefix, **kwargs)
@@ -576,105 +466,17 @@ class GteNewModel(BertWithRope):
             layer.mlp.gate_up_proj.bias = None
             layer.mlp.gate_up_proj.skip_bias_add = True
 
-    def split_up_gate_proj(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        n = "mlp.up_gate_proj"
-        for name, weight in weights:
-            if n in name:
-                up, gate = weight.chunk(2, dim=0)
-                yield name.replace(n, "mlp.up_proj"), up
-                yield name.replace(n, "mlp.gate_proj"), gate
-            else:
-                yield name, weight
-
-    def ignore_unnecessary_layers(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        for name, weight in weights:
-            if name.startswith("classifier"):
-                continue
-            yield name, weight
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.ignore_unnecessary_layers(weights)
-        weights = self.split_up_gate_proj(weights)
-        return super().load_weights(weights)
-
 
 class SnowflakeGteNewModel(GteNewModel):
     # for Snowflake/snowflake-arctic-embed-m-v2.0
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "layer": "layers",
-            "attention.qkv_proj": "attn.qkv_proj",
-            "attention.o_proj": "attn.out_proj",
-        }
-    )
+    pass
 
 
 class JinaRobertaModel(BertWithRope):
     # for https://huggingface.co/jinaai/jina-embeddings-v3
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "emb_ln": "embeddings.LayerNorm",
-            "mixer.Wqkv": "attn.qkv_proj",
-            "mixer.out_proj": "attn.out_proj",
-            "norm1": "attn_ln",
-            "mlp.fc1.": "mlp.up_proj.",
-            "mlp.fc2": "mlp.down_proj",
-            "norm2": "mlp_ln",
-        }
-    )
-
-    @torch.inference_mode()
-    def jina_merge_lora_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        # use for jina-embeddings-v3
-        # Merge Lora weights into a single weight tensor.
-        # This is a temporary solution until we have a better way to handle
-
-        scaling = self.config.lora_alpha / self.config.lora_rank
-        device = self.vllm_config.device_config.device
-
-        weights_dict = {name: weight for name, weight in weights}
-
-        o = ".original"
-        a = ".0.lora_A"
-        b = ".0.lora_B"
-
-        # text-matching
-        i = -1
-
-        for name in list(weights_dict.keys()):
-            if o in name:
-                dtype = weights_dict[name].dtype
-                shape = weights_dict[name].shape
-                weight_name = name[: -len(o)]
-
-                if "embeddings" in weight_name:
-                    B = weights_dict[weight_name + a][i].to(device).float()
-                    A = weights_dict[weight_name + b][i].to(device).float()
-                else:
-                    B = weights_dict[weight_name + b][i].to(device).float()
-                    A = weights_dict[weight_name + a][i].to(device).float()
-
-                weight = (
-                    weights_dict[weight_name + o].to(device)
-                    + torch.matmul(B, A).view(shape) * scaling
-                )
-                weight = weight.cpu().to(dtype)
-
-                weights_dict[weight_name.replace(".parametrizations", "")] = weight
-
-                del (
-                    weights_dict[weight_name + o],
-                    weights_dict[weight_name + a],
-                    weights_dict[weight_name + b],
-                )
-
-        return [(name, weight) for name, weight in weights_dict.items()]
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.jina_merge_lora_weights(weights)
-        return super().load_weights(weights)
+    pass
 
 
 @default_pooling_type(seq_pooling_type="CLS")
@@ -707,11 +509,6 @@ class GteNewForSequenceClassification(nn.Module, SupportsCrossEncoding):
             pooling=self.new.pooler,
             classifier=self.classifier,
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights)
-        return loaded_params
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.new.embed_input_ids(input_ids)

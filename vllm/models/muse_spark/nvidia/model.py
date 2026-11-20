@@ -4,8 +4,8 @@
 
 import inspect
 import math
-from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import partial
 from itertools import islice
 from typing import TYPE_CHECKING, Any, cast
 
@@ -79,9 +79,7 @@ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     sequence_parallel_chunk,
 )
@@ -114,6 +112,7 @@ from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
     supports_norm_residual_norm,
 )
 from vllm.models.muse_spark.common.ops.fused_routing import fused_muse_spark_routing
+from vllm.models.muse_spark.common.qk_layout import interleave_qk
 from vllm.models.muse_spark.nvidia.mega_moe import (
     MuseSparkMegaMoEExperts,
     get_trtllm_token_threshold,
@@ -466,9 +465,8 @@ class MuseSparkMoE(nn.Module):
 
         self.route_scale = config.routed_scaling_factor
 
-        # folded into the router weight as it loads (`_load_router_weight`)
+        # folded into the router weight as it loads (`conversion_mapping`'s Affine)
         self.router_output_multiplier = config.output_multiplier
-        self.router.weight.weight_loader = self._load_router_weight
 
         self.moe_router = MuseSparkRouter(
             top_k=config.num_experts_per_tok,
@@ -681,14 +679,6 @@ class MuseSparkMoE(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
             self.experts.finalize_weights()
-
-    def _load_router_weight(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor
-    ) -> None:
-        self.router.weight_loader(param, loaded_weight)
-        if self.router_output_multiplier is not None:
-            with torch.no_grad():
-                param.mul_(self.router_output_multiplier)
 
     def _can_shard_projection(self, num_tokens: int, sp_active: bool) -> bool:
         return num_tokens <= _SHARDED_PROJECTION_MAX_TOKENS and (
@@ -1984,8 +1974,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper()
-
     def __init__(
         self,
         *,
@@ -2042,6 +2030,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         # self.model, built by the model state once the weights are loaded.
         self.specialized_decode_config = specialized_decode_config(vllm_config)
         self.specialized_decode: SpecializedDecode | None = None
+        self.checkpoint_transforms = [partial(interleave_qk, self.model.config)]
 
     def build_specialized_decode(self) -> None:
         from vllm.models.muse_spark.nvidia.specialized_decode.runtime.decode import (
@@ -2158,28 +2147,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 logits / self.output_soft_cap_temp
             )
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def interleaved_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            config = self.model.config
-            for name, weight in weights:
-                if name.startswith(
-                    ("model.language_model.layers.", "model.layers.", "layers.")
-                ) and name.endswith(
-                    (".self_attn.q_proj.weight", ".self_attn.k_proj.weight")
-                ):
-                    # HF stores Q/K rows as [even | odd] per head (NoPE too);
-                    # restore interleaved pairs before TP slicing.
-                    shape = weight.shape
-                    weight = (
-                        weight.reshape(-1, 2, config.head_dim // 2, shape[1])
-                        .transpose(1, 2)
-                        .reshape(shape)
-                    )
-                yield name, weight
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(interleaved_weights(), mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         if self.specialized_decode is not None:

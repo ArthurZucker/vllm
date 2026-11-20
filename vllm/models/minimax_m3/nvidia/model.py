@@ -42,7 +42,6 @@ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
-    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_NVFP4,
@@ -94,9 +93,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     init_vllm_registered_model,
     make_empty_intermediate_tensors_factory,
@@ -291,22 +288,6 @@ def _row_parallel_reduce_scatter(
 # MiniMax-M3.1 QAT quantizes the FC2 input with a fixed global scale of 16;
 # checkpoints carry a placeholder ``w2.input_global_scale`` of 1.0.
 MEGA_MOE_FC2_INPUT_SCALE = 1.0 / 16.0
-
-
-def _mega_moe_expert_params_mapping(
-    num_experts: int,
-) -> list[tuple[str, str, int, str]]:
-    """Map `experts.{e}.w{1,2,3}.*` to the MegaMoE `w13_*`/`w2_*` params."""
-    return [
-        (
-            "experts.w2_" if shard_id == "w2" else "experts.w13_",
-            f"experts.{expert_id}.{shard_id}.",
-            expert_id,
-            shard_id,
-        )
-        for expert_id in range(num_experts)
-        for shard_id in ("w1", "w2", "w3")
-    ]
 
 
 def _redirect_fused_shared_experts(
@@ -517,7 +498,6 @@ class MiniMaxM3MoE(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(config.num_local_experts, dtype=torch.float32)
         )
-        self.e_score_correction_bias.weight_loader = MiniMaxM3MoE.ebias_weight_loader
 
         # Router weights are stored in fp32; GateLinear upcasts the bf16
         # activations and computes the gate in fp32 (fp32 router logits).
@@ -626,11 +606,6 @@ class MiniMaxM3MoE(nn.Module):
         )
         if not self.experts.has_fused_shared_experts:
             self.shared_experts = replicated_shared_experts()
-
-    @staticmethod
-    def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight.to(torch.float32))
 
     @property
     def ffn_all_reduce_deferred(self) -> bool:
@@ -1652,18 +1627,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        if self.use_mega_moe:
-            return _mega_moe_expert_params_mapping(self.config.num_local_experts)
-        # Checkpoint experts use w1=gate, w2=down, w3=up.
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
-        )
-
 
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
@@ -1672,23 +1635,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "mtp.": None,
-            # ModelOpt MXFP8 layers name the checkpoint's block scales this way.
-            "weight_scale_inv": "weight_scale",
-        },
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".index_q_proj": (".qkv_proj", "index_q"),
-            ".index_k_proj": (".qkv_proj", "index_k"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1718,8 +1664,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             self.lm_head = PPMissingLayer()
         if self.model.use_mega_moe:
             redirect = partial(_redirect_fused_shared_experts, model=self.model)
-            transforms = WeightsMapper(weights_transforms=[redirect])
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | transforms
+            self.checkpoint_transforms = [redirect]
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
@@ -1771,13 +1716,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 @MULTIMODAL_REGISTRY.register_processor(
     MiniMaxM3VLMultiModalProcessor,
@@ -1807,17 +1745,6 @@ class MiniMaxM3SparseForConditionalGeneration(
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "multi_modal_projector.": "vision_tower.multi_modal_projector.",
-            "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
-        },
-        orig_to_new_substr={
-            ".mlp.fc1.": ".fc1.",
-            ".mlp.fc2.": ".fc2.",
-        },
-    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1992,10 +1919,3 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits_local(hidden_states)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.language_model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

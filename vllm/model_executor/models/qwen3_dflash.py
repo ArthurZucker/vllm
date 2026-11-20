@@ -3,6 +3,7 @@
 
 import io
 from collections.abc import Iterable
+from functools import partial
 
 import regex as re
 import torch
@@ -33,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.utils import (
     refill_derived,
@@ -49,12 +51,11 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 
 from .qwen3 import Qwen3ForCausalLM, Qwen3MLP
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
     map_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -69,17 +70,11 @@ def _is_mxfp8_linear(layer: nn.Module) -> bool:
     ) and not isinstance(layer.quant_method, UnquantizedLinearMethod)
 
 
-_QKV_PARAM = re.compile(
-    r"^layers\.(\d+)\.self_attn\.qkv_proj\.(weight|weight_scale|bias)$"
+# A draft layer's K or V checkpoint tensor (`midlayer`: layer 0)
+_KV_SOURCE = re.compile(
+    r"^(?:model\.)?(?:layers\.(\d+)|midlayer)\.self_attn\.([kv])_proj\."
+    r"(weight|weight_scale|bias)$"
 )
-
-
-def _load_context_kv_rows(
-    param: torch.Tensor, loaded_weight: torch.Tensor, row_offset: int
-) -> None:
-    """Weight loader of the MXFP8 context K/V projection: one layer's K or V
-    rows, at their offset in the stacked projection."""
-    param.data.narrow(0, row_offset, loaded_weight.shape[0]).copy_(loaded_weight)
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -419,27 +414,6 @@ class DFlashQwen3DecoderLayer(nn.Module):
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_regex={
-            # Match a complete module name, including bare names and trailing
-            # wildcards in quantization configs, but not e.g. midlayer_extra.
-            re.compile(r"(?<![A-Za-z0-9_])midlayer(?=\.|\*|$)"): "layers.0",
-            # Muse-Glimmer-30B-assistant names the aux-hidden-state encoder
-            # `encoder.fc` / `encoder.output_norm_enc`; this head calls them
-            # `fc` / `hidden_norm`. Same tensors and shapes, different names.
-            re.compile(r"(?<![A-Za-z0-9_])encoder\.output_norm_enc(?=\.|\*|$)"): (
-                "hidden_norm"
-            ),
-            re.compile(r"(?<![A-Za-z0-9_])encoder\.fc(?=\.|\*|$)"): "fc",
-        },
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        },
-    )
     # Maps module paths in the draft checkpoint's quantization exclusions to
     # this model's module paths.
     quant_config_mapper: WeightsMapper | None = None
@@ -465,7 +439,7 @@ class DFlashQwen3Model(nn.Module):
             self.quant_config.apply_vllm_mapper(self.quant_config_mapper)
         map_draft_quant_config(
             self.quant_config,
-            self.hf_to_vllm_mapper,
+            rename_mapper(DFlashQwen3Model) or WeightsMapper(),
             prefix,
             start_layer_id,
             self.config.num_hidden_layers,
@@ -597,29 +571,35 @@ class DFlashQwen3Model(nn.Module):
             return_bias=False,
             disable_tp=True,  # holds this rank's K/V rows
         )
-        for param in proj.parameters():
-            param.weight_loader = _load_context_kv_rows
-        offsets = [0]
-        for a in layers_attn:
-            offsets.append(offsets[-1] + 2 * a.kv_size)
-        self._context_kv_offsets = offsets
         return proj
 
-    def _load_context_kv(
-        self, layer_idx: int, shard_id: str, param_name: str, weight: torch.Tensor
-    ) -> None:
-        """Load this rank's rows of a layer's K or V checkpoint tensor into the
-        MXFP8 context projection, sharded as the layer's QKV projection does."""
-        assert self._context_kv_proj is not None
+    def _local_kv_rows(self, layer_idx: int, weight: torch.Tensor) -> torch.Tensor:
+        """This rank's rows of a layer's K or V checkpoint tensor (or lazy slice),
+        sharded as the layer's QKV projection does"""
         attn = self.layers[layer_idx].self_attn
         qkv = attn.qkv_proj
-        rank = qkv.tp_rank // qkv.num_kv_head_replicas
-        rows = weight.narrow(0, rank * attn.kv_size, attn.kv_size)
-        offset = self._context_kv_offsets[layer_idx]
-        if shard_id == "v":
-            offset += attn.kv_size
-        param = getattr(self._context_kv_proj, param_name)
-        param.weight_loader(param, rows, offset)
+        start = qkv.tp_rank // qkv.num_kv_head_replicas * attn.kv_size
+        return weight[start : start + attn.kv_size]
+
+    def stack_context_kv(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream, then the MXFP8 context projection's tensors: every layer's K
+        and V rows this rank holds, stacked (layer 0's K, V, layer 1's K, ...)"""
+        rows: dict[str, list[tuple[int, str, torch.Tensor]]] = {}
+        for name, weight in weights:
+            if (match := _KV_SOURCE.match(name)) is not None:
+                layer_idx = int(match[1] or 0)
+                rows.setdefault(match[3], []).append(
+                    (layer_idx, match[2], self._local_kv_rows(layer_idx, weight))
+                )
+            yield name, weight
+        for param, parts in rows.items():
+            parts.sort(key=lambda part: part[:2])
+            yield (
+                f"model._context_kv_proj.{param}",
+                torch.cat([local for *_, local in parts]),
+            )
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -846,31 +826,6 @@ class DFlashQwen3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        proj = self._context_kv_proj
-        if proj is not None:
-            weights = self._tee_context_kv(weights)
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        if proj is not None:
-            loaded |= {
-                f"_context_kv_proj.{name}" for name, _ in proj.named_parameters()
-            }
-        return loaded
-
-    def _tee_context_kv(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in weights:
-            mapped = self.hf_to_vllm_mapper._map_name_with_shard(name)
-            if mapped is not None and mapped[1] in ("k", "v"):
-                match = _QKV_PARAM.match(mapped[0])
-                if match is not None:
-                    self._load_context_kv(
-                        int(match[1]), str(mapped[1]), match[2], weight
-                    )
-            yield name, weight
-
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     # The speculator this is a draft model of (see SpeculativeDraftModel).
@@ -915,6 +870,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        self.checkpoint_transforms = [
+            partial(observe_eagle_weights, self),
+            self._with_mask_embedding,
+        ]
+        if getattr(self.model, "_context_kv_proj", None) is not None:
+            self.checkpoint_transforms.append(self.model.stack_context_kv)
 
     def embed_input_ids(
         self,
@@ -998,50 +959,18 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             result = result.squeeze(0)
         return result
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        model_weights = {}
-        includes_draft_id_mapping = False
-        includes_embed_tokens = False
-        for name, loaded_weight in weights:
-            assert "mask_hidden" not in name, (
-                "DFlash embeds masked slots via mask_token_id (optionally "
-                "overridden by a mask_embedding.pt file); it should not ship a "
-                "mask_hidden weight."
-            )
-            if "t2d" in name:
-                continue
-            if "d2t" in name:
-                name = name.replace("d2t", "draft_id_to_target_id")
-                includes_draft_id_mapping = True
-            elif "lm_head" not in name:
-                name = "model." + name
-            if "embed_tokens" in name:
-                includes_embed_tokens = True
-            model_weights[name] = loaded_weight
-            process_eagle_weight(self, name)
-
-        # Route the separately-trained mask embedding (if shipped) through the
-        # standard weight loader alongside the rest of the draft weights.
-        mask_embedding = self._read_mask_embedding()
-        if mask_embedding is not None:
-            model_weights["model.mask_embedding"] = mask_embedding
-            self.model.has_separate_mask_embedding = True
-
-        orig_to_new_substr: dict[str, None] = {}
-        if not includes_draft_id_mapping:
-            orig_to_new_substr["draft_id_to_target_id"] = None
-        if not includes_embed_tokens:
-            orig_to_new_substr["embed_tokens"] = None
-        if not self.model.use_aux_hidden_state:
-            orig_to_new_substr["fc."] = None
-        if not self.model.has_separate_mask_embedding:
-            orig_to_new_substr["mask_embedding"] = None
-        mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(model_weights.items(), mapper=mapper)
-
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_kv_buffers()
+
+    def _with_mask_embedding(self, weights):
+        """The stream, then the separately-shipped mask embedding when there is one"""
+        yield from weights
+        mask = self._read_mask_embedding()
+        if mask is None:  # embed_tokens[mask_token_id] is used instead
+            self.model.mask_embedding.loaded_at_init = True
+        else:
+            self.model.has_separate_mask_embedding = True
+            yield "model.mask_embedding", mask
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

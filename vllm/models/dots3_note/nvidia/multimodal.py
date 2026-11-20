@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM composition layer for Dots3Note image and audio encoders."""
 
-from collections.abc import Iterable
 from contextlib import contextmanager
+from functools import partial
 
 import torch
 from torch import nn
@@ -16,9 +16,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     IntermediateTensors,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -38,7 +36,7 @@ from ..common.processor import (
     load_note_config_section,
 )
 from .audio import Dots3NoteAudioConfig, Dots3NoteAudioModel
-from .model import Dots3NoteLanguageModelForCausalLM
+from .model import Dots3NoteLanguageModelForCausalLM, pad_dense_mlp_weights
 from .vision import DotsMoEVitConfig, DotsMoEVitModel
 
 
@@ -67,16 +65,6 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     supports_encoder_tp_data = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-            "mtp.": "language_model.mtp.",
-            "vision_encoder.": "visual.",
-            "audio_encoder.": "audio_tower.",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -94,6 +82,14 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.quant_config = vllm_config.quant_config
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
+        # the language model's dense MLPs padded to whole blocks a rank
+        self.checkpoint_transforms = [
+            partial(
+                pad_dense_mlp_weights,
+                getattr(self.quant_config, "weight_block_size", None),
+                prefix="model.",
+            )
+        ]
 
         added_tokens = get_hf_file_to_dict(
             "added_tokens.json",
@@ -159,16 +155,6 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
-
-        orig_to_new_prefix = dict[str, None]()
-        if self.visual is None:
-            orig_to_new_prefix["visual."] = None
-        if self.audio_tower is None:
-            orig_to_new_prefix["audio_tower."] = None
-        if orig_to_new_prefix:
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix=orig_to_new_prefix
-            )
 
     def _process_image_input(
         self,
@@ -311,12 +297,6 @@ class Dots3NoteForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(
-            weights,
-            mapper=self.hf_to_vllm_mapper,
-        )
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

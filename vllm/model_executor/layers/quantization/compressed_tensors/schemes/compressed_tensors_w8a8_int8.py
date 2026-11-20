@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
@@ -42,7 +41,6 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         layer.logical_widths = output_partition_sizes
@@ -62,7 +60,6 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
 
         layer.register_parameter("weight", weight)
@@ -72,13 +69,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
             weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
                 output_dim=0,
-                weight_loader=weight_loader,
             )
         else:
             assert self.strategy == QuantizationStrategy.TENSOR
             weight_scale = PerTensorScaleParameter(
                 data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
             )
         layer.register_parameter("weight_scale", weight_scale)
 
@@ -86,15 +81,13 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
         input_zero_point = None
         input_scale = None
         if self.is_static_input_scheme:
-            input_scale = BasevLLMParameter(
-                data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader
-            )
+            input_scale = BasevLLMParameter(data=torch.empty(1, dtype=torch.float32))
             if not self.input_symmetric:
                 # Note: compressed-tensors stores the zp using the same dtype
                 # as the weights
                 # AZP loaded as int8 but used as int32
                 input_zero_point = BasevLLMParameter(
-                    data=torch.empty(1, dtype=torch.int8), weight_loader=weight_loader
+                    data=torch.empty(1, dtype=torch.int8)
                 )
 
         layer.register_parameter("input_zero_point", input_zero_point)

@@ -10,7 +10,6 @@ output channel for weights and one fp32 scale per token for activations
 """
 
 from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 import torch
@@ -96,33 +95,14 @@ def test_gfx942_moe_weight_quant_avoids_dynamic_per_token_op(monkeypatch) -> Non
 
     method = object.__new__(Fp8PtpcOnlineMoEMethod)
     method.moe = SimpleNamespace(tp_size=1)
-    layer = SimpleNamespace(local_num_experts=2)
 
     def fail_dynamic_quant(*args, **kwargs):
         raise AssertionError("gfx942 must not call dynamic per-token FP8 quant")
 
     monkeypatch.setattr(ops, "scaled_fp8_quant", fail_dynamic_quant)
-    with (
-        mock.patch.object(
-            method,
-            "get_weights_for_quantization",
-            return_value=(w13_weight, w2_weight),
-        ) as get_weights,
-        mock.patch.object(method, "_setup_kernel") as setup_kernel,
-        mock.patch.object(
-            method, "release_requantization_source_weights"
-        ) as release_weights,
-    ):
-        method.process_weights_after_loading(layer)
-
-    get_weights.assert_called_once_with(layer)
-    setup_kernel.assert_called_once()
-    release_weights.assert_called_once_with(layer)
-    _, got_w13, got_w2, got_w13_scale, got_w2_scale = setup_kernel.call_args.args
-    assert setup_kernel.call_args.kwargs == {
-        "w13_input_scale": None,
-        "w2_input_scale": None,
-    }
+    # the plan's quantize op of each expert weight
+    got_w13, got_w13_scale = method.quantize_experts(None, "w13_weight", w13_weight)
+    got_w2, got_w2_scale = method.quantize_experts(None, "w2_weight", w2_weight)
 
     fp8_min, fp8_max = get_fp8_min_max()
 
@@ -143,4 +123,3 @@ def test_gfx942_moe_weight_quant_avoids_dynamic_per_token_op(monkeypatch) -> Non
     assert torch.equal(got_w13, expected_w13)
     assert torch.equal(got_w2_scale, expected_w2_scale)
     assert torch.equal(got_w2, expected_w2)
-    assert layer._already_called_process_weights_after_loading

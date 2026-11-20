@@ -19,6 +19,7 @@ from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.models.hy_v4.nvidia.attention import HYV4MLAAttention
 from vllm.models.hy_v4.nvidia.flashmla_sparse import HYV4FlashMLASparseImpl
@@ -82,7 +83,10 @@ def _check_sinks(rank, world, num_heads, offload, port, model_path):
             if offload:
                 layer.cpu()
             checkpoint_sinks = torch.arange(num_heads, device=device).float() + offset
-            sinks.weight_loader(sinks, checkpoint_sinks.to(sinks.device))
+            load_with_ops(
+                layer,
+                iter([("learnable_sink_param", checkpoint_sinks.to(sinks.device))]),
+            )
             finalize_model_weights(layer, device)
             layer.to(device)
             local = impl._sinks_for_query(local_query, 2, 64)

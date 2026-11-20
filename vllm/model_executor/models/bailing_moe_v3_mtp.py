@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Bailing MoE v3 MTP model."""
 
-from collections.abc import Callable, Iterable
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -10,9 +10,6 @@ from transformers.configuration_utils import PreTrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -21,17 +18,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
+from vllm.model_executor.models.bailing_moe_mtp import lm_head_into_shared_heads
 from vllm.model_executor.models.bailing_moe_v3 import (
-    BailingMoeV3ForCausalLM,
     BailingMoeV3MLAAttention,
     BailingMoeV3MoE,
     _configure_ling_fp8_quant_config,
-    _maybe_pad_block_fp8_shared_expert_checkpoint_tensor,
-    _maybe_remap_ling_mxfp4_weight_names,
+    ling_checkpoint,
 )
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -216,8 +208,6 @@ class BailingMoeV3MultiTokenPredictor(nn.Module):
     }
 )
 class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
-    hf_to_vllm_mapper = BailingMoeV3ForCausalLM.hf_to_vllm_mapper
-
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -247,6 +237,10 @@ class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
             prefix=maybe_prefix(prefix, "model"),
         )
         self.lm_head: nn.Module | None = None
+        self.checkpoint_transforms = [
+            partial(lm_head_into_shared_heads, self),
+            partial(ling_checkpoint, self),  # its target's MXFP4 / block-FP8 layout
+        ]
 
     def embed_input_ids(
         self,
@@ -290,131 +284,3 @@ class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states, spec_step_idx, self.lm_head)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = self.hf_to_vllm_mapper.apply(weights)
-        weights = _maybe_remap_ling_mxfp4_weight_names(weights, self.quant_config)
-        stacked_params_mapping = [
-            (".fused_qkv_a_proj", ".q_a_proj", 0),
-            (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        expert_params_mapping = list(self.get_expert_mapping())
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        def load_param(
-            name: str,
-            loaded_weight: torch.Tensor,
-            shard_id=None,
-        ) -> bool:
-            remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            if remapped_name is None:
-                return False
-            name = remapped_name
-            if name not in params_dict:
-                return False
-
-            param = params_dict[name]
-            weight_loader: Callable[..., None] = getattr(
-                param, "weight_loader", default_weight_loader
-            )
-            if shard_id is None:
-                weight_loader(param, loaded_weight)
-            elif isinstance(shard_id, int):
-                weight_loader(param, loaded_weight, shard_id)
-            else:
-                weight_loader(
-                    param,
-                    loaded_weight,
-                    name,
-                    expert_id=shard_id[0],
-                    shard_id=shard_id[1],
-                )
-            loaded_params.add(name)
-            return True
-
-        def get_spec_layer_idx(name: str) -> int | None:
-            if not name.startswith("model.layers."):
-                return None
-            try:
-                layer_idx = int(name.split("model.layers.", 1)[1].split(".", 1)[0])
-            except (IndexError, ValueError):
-                return None
-            mtp_idx = layer_idx - self.config.num_hidden_layers
-            if 0 <= mtp_idx < self.config.num_nextn_predict_layers:
-                return layer_idx
-            return None
-
-        def normalize_name(name: str) -> str:
-            return name.replace(
-                "mlp.gate.e_score_correction_bias",
-                "mlp.gate.expert_bias",
-            )
-
-        def load_lm_head(loaded_weight: torch.Tensor) -> None:
-            for layer_idx in range(
-                self.model.mtp_start_layer_idx,
-                self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
-            ):
-                name = f"model.layers.{layer_idx}.shared_head.head.weight"
-                load_param(name, loaded_weight)
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if name == "model.word_embeddings.weight":
-                load_param("model.embed_tokens.weight", loaded_weight)
-                continue
-            if name == "lm_head.weight":
-                load_lm_head(loaded_weight)
-                continue
-
-            spec_layer = get_spec_layer_idx(name)
-            if spec_layer is None:
-                continue
-            name = normalize_name(name)
-            loaded_weight = _maybe_pad_block_fp8_shared_expert_checkpoint_tensor(
-                self.quant_config,
-                self.config,
-                name,
-                loaded_weight,
-            )
-
-            loaded = False
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "mlp.experts." in name and name not in params_dict:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                if load_param(mapped_name, loaded_weight, stacked_shard_id):
-                    loaded = True
-                    break
-            if loaded:
-                continue
-
-            if "mlp.experts" in name:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    mapped_name = name.replace(weight_name, param_name)
-                    if load_param(mapped_name, loaded_weight, (expert_id, shard_id)):
-                        break
-                continue
-
-            load_param(name, loaded_weight)
-
-        return loaded_params

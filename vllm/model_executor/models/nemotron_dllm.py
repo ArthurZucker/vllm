@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,8 +27,6 @@ from vllm.model_executor.models.llama import (
     LlamaModel,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
@@ -147,12 +144,6 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuan
     `NemotronLabsDiffusionModelState.prepare_attn` via a per-request causal tensor.
     """
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "encoder.": "model.",
-        }
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -205,10 +196,6 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuan
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.diffusion_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @torch.compile(dynamic=True)

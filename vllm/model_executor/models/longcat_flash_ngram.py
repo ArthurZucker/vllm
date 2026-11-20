@@ -11,6 +11,7 @@ embedding fuses the token embedding with hashed embeddings of the preceding
 """
 
 from collections.abc import Iterable
+from functools import partial
 from typing import Any
 
 import torch
@@ -32,7 +33,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .longcat_flash import FlashModel
-from .utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
+from .utils import PPMissingLayer, maybe_prefix
 
 
 def uses_ngram_embedding(config: LongcatFlashConfig) -> bool:
@@ -167,6 +168,25 @@ class NgramEmbedding(nn.Module):
         return all_h.mean(dim=0)  # [N, H]
 
 
+def concat_ngram_embedders(
+    num_embedders: int, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The per-embedder n-gram tables (`ngram_embeddings.embedders.N.weight`) as
+    the one table `NgramEmbedding.oe_embedder` concatenates them into, in order"""
+    tables: dict[int, torch.Tensor] = {}
+    for name, weight in weights:
+        head, sep, rest = name.partition("ngram_embeddings.embedders.")
+        if not sep:
+            yield name, weight
+            continue
+        tables[int(rest.split(".")[0])] = (
+            weight if isinstance(weight, torch.Tensor) else weight[...]
+        )
+        if len(tables) == num_embedders:
+            table = torch.cat([tables.pop(i) for i in range(num_embedders)])
+            yield f"{head}ngram_embeddings.oe_embedder.weight", table
+
+
 class FlashNgramModel(FlashModel):
     """FlashModel whose input embedding is an `NgramEmbedding`."""
 
@@ -178,29 +198,11 @@ class FlashNgramModel(FlashModel):
         else:
             self.ngram_embeddings = None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Names arrive with the ``model.`` prefix already stripped (routed here
-        # by AutoWeightsLoader). Split the concatenated/sharded ngram tables and
-        # stacked projections; delegate everything else to FlashModel.
-        loaded: set[str] = set()
-        rest: list[tuple[str, torch.Tensor]] = []
-        for name, w in weights:
-            if self.ngram_embeddings is not None and (
-                "ngram_embeddings.embedders." in name
-                or "ngram_embeddings.post_projs." in name
-            ):
-                loaded.add(self.ngram_embeddings.load_weight(name, w))
-            else:
-                rest.append((name, w))
-        loaded |= super().load_weights(rest)
-        return loaded
-
 
 class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     """LongCat-Flash-Lite for causal LM (n-gram embedding)."""
 
     # MTP weights are not part of this model.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.mtp.": None})
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -216,6 +218,10 @@ class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.model = FlashNgramModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        if (ngram := self.model.ngram_embeddings) is not None:
+            self.checkpoint_transforms = [
+                partial(concat_ngram_embedders, ngram.num_embedders)
+            ]
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -249,15 +255,6 @@ class LongcatFlashNgramForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def get_expert_mapping(self):
-        return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # AutoWeightsLoader routes ``model.*`` to FlashNgramModel.load_weights
-        # (which handles the ngram split) and ``lm_head.*`` to the head.
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class LongcatNgramModelState(DefaultModelState):

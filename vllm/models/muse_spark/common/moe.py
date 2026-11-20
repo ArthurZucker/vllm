@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Platform-neutral Muse Spark MoE pieces: routing, config, expert loading."""
 
-from collections.abc import Iterable
 
 import torch
 
@@ -141,62 +140,8 @@ class MuseSparkConsolidatedRoutedExperts(RoutedExperts):
 
     Vendor subclasses supply `_get_quant_method`.
     """
+    pass
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        for name, tensor in weights:
-            param = getattr(self, name, None)
-            if param is None:
-                raise AttributeError(
-                    f"{self.layer_name}: unexpected expert weight {name!r}"
-                )
-            if name in ("w13_weight", "w13_weight_scale"):
-                # [E, 2I, ...] -> per-shard (w1/w3) -> per-expert
-                for shard_id, col in (("w1", 0), ("w3", 1)):
-                    shard = tensor.chunk(2, dim=1)[col]
-                    for expert_id, loaded in enumerate(shard.unbind(0)):
-                        param.weight_loader(
-                            param=param,
-                            loaded_weight=loaded,
-                            weight_name=name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
-            elif name in ("w2_weight", "w2_weight_scale"):
-                for expert_id, loaded in enumerate(tensor.unbind(0)):
-                    param.weight_loader(
-                        param=param,
-                        loaded_weight=loaded,
-                        weight_name=name,
-                        shard_id="w2",
-                        expert_id=expert_id,
-                    )
-            elif name in ("w13_weight_scale_2", "w13_input_scale"):
-                # [E, 2] -> per-expert, per-shard scalars
-                for expert_id in range(tensor.shape[0]):
-                    for shard_id, col in (("w1", 0), ("w3", 1)):
-                        param.weight_loader(
-                            param=param,
-                            loaded_weight=tensor[expert_id, col],
-                            weight_name=name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
-            elif name in ("w2_weight_scale_2", "w2_input_scale"):
-                for expert_id in range(tensor.shape[0]):
-                    param.weight_loader(
-                        param=param,
-                        loaded_weight=tensor[expert_id],
-                        weight_name=name,
-                        shard_id="w2",
-                        expert_id=expert_id,
-                    )
-            else:
-                raise ValueError(
-                    f"{self.layer_name}: unsupported expert weight {name!r}"
-                )
-            yield name
 
 
 __all__ = [

@@ -10,7 +10,7 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-from collections.abc import Iterable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import regex as re
@@ -25,9 +25,6 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
 )
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -39,30 +36,27 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
 )
-from vllm.model_executor.models.utils import extract_layer_index, maybe_prefix
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
     sp_shard,
 )
 from vllm.models.deepseek_v4.common.eplb_util import collect_moe_layers
-from vllm.models.deepseek_v4.nvidia.dspark import _duplicate_context_wkv_weights
+from vllm.models.deepseek_v4.nvidia.dspark import context_wkv_sources
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4MixtureOfExperts,
-    DeepseekV4Model,
     DeepseekV4MoE,
     _linear_scale_param_name,
     _use_mega_gate,
     _use_sequence_parallel,
-    make_deepseek_v4_expert_params_mapping,
     maybe_init_gemm_rs,
     prepare_mega_gate_routing_metadata,
 )
@@ -415,6 +409,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
             self.num_speculative_steps = spec_config.num_speculative_tokens
 
         self.set_moe_parameters()
+        self.checkpoint_transforms = [
+            partial(context_wkv_sources, layers=len(self.model.layers))
+        ]
 
     def set_moe_parameters(self) -> None:
         collect_moe_layers(
@@ -542,134 +539,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
     # --- Weight loading ----------------------------------------------------
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load the `mtp.{0,1,2}.*` draft weights from the target checkpoint.
-
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. `embed_tokens`/`lm_head` are aliased from the target.
-        """
-        first_layer = self.model.layers[0]
-        use_native_mega_moe = first_layer.ffn.use_native_mega_moe
-        # Draft MoE layers use the dspark_* expert counts, not the
-        # backbone's (see DeepseekV4MoE and the reference
-        # ModelArgs.get_moe_config).
-        n_draft_experts = (
-            getattr(self.config, "dspark_n_routed_experts", 0)
-            or self.config.n_routed_experts
-        )
-        if use_native_mega_moe:
-            expert_mapping = make_deepseek_v4_expert_params_mapping(n_draft_experts)
-        else:
-            expert_mapping = fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="w1",
-                ckpt_down_proj_name="w2",
-                ckpt_up_proj_name="w3",
-                num_experts=n_draft_experts,
-                num_redundant_experts=first_layer.ffn.n_redundant_experts,
-            )
-        expert_scale_suffix = (
-            ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
-            else ".weight_scale_inv"
-        )
-
-        # (param_name, ckpt_shard_name, shard_id) for non-expert stacked params.
-        stacked_params_mapping = [
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
-        for name, loaded_weight in weights:
-            mapped = self._remap_dspark_name(name)
-            if mapped is None:
-                continue
-            name = mapped
-            # ``.scale`` -> per-method scale suffix.
-            if name.endswith(".scale"):
-                suffix = (
-                    expert_scale_suffix
-                    if _EXPERT_SCALE_RE.search(name)
-                    else f".{self.linear_scale_name}"
-                )
-                name = name.removesuffix(".scale") + suffix
-            if ".shared_experts." in name:
-                experts = self.model.layers[extract_layer_index(name)].ffn.experts
-                if getattr(experts, "has_fused_shared_experts", False):
-                    loaded_params.add(
-                        experts.load_shared_expert_weight(name, loaded_weight)
-                    )
-                    continue
-            if ".shared_experts.w2" in name:
-                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
-            if self.pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
-                    self.quant_config, name, loaded_weight
-                )
-
-            if name.startswith("model.context_wkv_proj."):
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, loaded_weight.shard_id)
-                loaded_params.add(name)
-                continue
-
-            # E8M0 expert scales: keep raw exponent bytes.
-            if ".experts." in name:
-                if (
-                    "weight_scale" in name
-                    and loaded_weight.dtype == torch.float8_e8m0fnu
-                ):
-                    loaded_weight = loaded_weight.view(torch.uint8)
-                # A checkpoint expert can map to multiple local physical replicas.
-                # Load every local slot or the remaining replicas stay uninitialized.
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
-                    if weight_name not in name:
-                        continue
-                    name_mapped = name.replace(weight_name, param_name)
-                    param = params_dict[name_mapped]
-                    success = param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        loaded_params.add(name_mapped)
-                continue
-
-            # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/markov_head/confidence_head) load directly —
-            # otherwise e.g. "markov_w1" would collide with the "w1" shard rule.
-            is_layer_param = name.startswith("model.layers.")
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if not is_layer_param or weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if name.endswith(".ffn.gate.bias"):
-                    name = name.replace(
-                        ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
-                    )
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
-        return loaded_params
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint `mtp.{i}.*` name to this model's parameter path.

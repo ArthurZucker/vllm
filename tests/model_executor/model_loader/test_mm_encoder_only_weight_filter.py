@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from vllm.config.load import LoadConfig
+from vllm.model_executor.model_loader import default_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
     filter_mm_encoder_only_safetensors_files,
@@ -261,11 +262,14 @@ def test_dropped_key_under_lm_prefix_keeps_shard_filtering():
         assert kept == files[1:]
 
 
-def test_default_loader_passes_the_model_mapper_to_the_shard_filter():
+def test_default_loader_passes_the_model_mapper_to_the_shard_filter(monkeypatch):
     """The filter can only classify HF keys if it receives the model's mapper."""
     loader = DefaultModelLoader(LoadConfig())
     mapper = _molmo_mapper()
-    model = SimpleNamespace(hf_to_vllm_mapper=mapper, _language_model_names=["model"])
+    model = SimpleNamespace(_language_model_names=["model"])
+    monkeypatch.setattr(
+        default_loader, "rename_mapper", lambda m: mapper if m is model else None
+    )
     mm_config = SimpleNamespace(mm_encoder_only=True)
     model_config = SimpleNamespace(multimodal_config=mm_config)
 

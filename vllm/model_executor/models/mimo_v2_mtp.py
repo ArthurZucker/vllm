@@ -18,17 +18,12 @@ Checkpoint weight layout (model.mtp.layers.{idx}.*):
   final_layernorm  - norm applied before logit computation
 """
 
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 from transformers import PreTrainedConfig
 
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -37,7 +32,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import (
@@ -45,7 +39,7 @@ from .interfaces import (
     SupportsMultiModal,
     _require_is_multimodal,
 )
-from .mimo_v2 import MiMoV2Attention, MiMoV2MLP, _shard_fp8_qkv_proj
+from .mimo_v2 import MiMoV2Attention, MiMoV2MLP
 from .utils import _merge_multimodal_embeddings, maybe_prefix
 
 # MiMo-V2 checkpoints contain multiple MTP layers, but vLLM currently supports
@@ -256,134 +250,6 @@ class MiMoV2MTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, self.lm_head, spec_step_idx)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-
-        stacked_params_mapping: list[tuple[str, str, str | int]] = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            # Flash format: separate projections → fused qkv_proj
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        # The pairing state must outlive this call: AutoWeightsLoader delegates
-        # per contiguous group of names, so a pair can straddle two calls and
-        # would otherwise be dropped silently.
-        pending_qkv_proj = getattr(self, "_pending_qkv_proj", None)
-        if pending_qkv_proj is None:
-            self._pending_qkv_proj = pending_qkv_proj = {}
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            # Only load MTP-related weights, shared embeddings, and lm_head
-            if (
-                "model.mtp" not in name
-                and "model.embed_tokens" not in name
-                and not name.startswith("lm_head")
-            ):
-                continue
-
-            # Fused qkv_proj: the fp8 weight and its block scales arrive as
-            # separate tensors and are pre-sharded at `config.num_key_value_heads`
-            # chunks of [Q_c | K_c | V_c] (see _shard_fp8_qkv_proj for the
-            # layout). Shard them together: a plain chunk(tp_size) only happens
-            # to be right when tp_size is that chunk count *and* the scales are
-            # tiled per chunk (they are 4 x 29 = 116 rows for MiMo-V2.5, not
-            # tp_size slices of an even split).
-            if "qkv_proj" in name:
-                is_fp8_weight = (
-                    name.endswith("qkv_proj.weight")
-                    and loaded_weight.dtype == torch.float8_e4m3fn
-                )
-                is_fp8_scale = name.endswith("qkv_proj.weight_scale_inv")
-                if is_fp8_weight or is_fp8_scale:
-                    prefix, kind = name.rsplit(".", 1)
-                    if (
-                        f"{prefix}.weight" not in params_dict
-                        or f"{prefix}.weight_scale_inv" not in params_dict
-                    ):
-                        continue
-                    entry = pending_qkv_proj.setdefault(prefix, {})
-                    entry[kind] = loaded_weight
-                    if "weight" not in entry or "weight_scale_inv" not in entry:
-                        # Waiting for the other half of the fused projection.
-                        continue
-                    del pending_qkv_proj[prefix]
-
-                    # Geometry comes from the module the weights belong to.
-                    attn = self.get_submodule(prefix.rsplit(".", 1)[0])
-                    w_rank, s_rank = _shard_fp8_qkv_proj(
-                        entry["weight"],
-                        entry["weight_scale_inv"],
-                        num_heads=attn.total_num_heads,
-                        num_kv_heads=attn.total_num_kv_heads,
-                        head_dim=attn.head_dim,
-                        v_head_dim=attn.v_head_dim,
-                        tp_rank=tp_rank,
-                        tp_size=tp_size,
-                        ckpt_tp=self.config.num_key_value_heads,
-                    )
-                    for k, tensor in (("weight", w_rank), ("weight_scale_inv", s_rank)):
-                        param = params_dict[f"{prefix}.{k}"]
-                        if tensor.shape[0] > param.shape[0]:
-                            tensor = tensor[: param.shape[0]]
-                        default_weight_loader(param, tensor)
-                        loaded_params.add(f"{prefix}.{k}")
-                elif name in params_dict:
-                    # Non-fp8 fused checkpoint: unchanged behaviour.
-                    param = params_dict[name]
-                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    default_weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-                continue
-
-            # gate_proj/up_proj → gate_up_proj stacking (both formats);
-            # Flash: q_proj/k_proj/v_proj → qkv_proj merging.
-            stacked_matched = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name_rewritten = name.replace(weight_name, param_name)
-                if (
-                    name_rewritten.endswith(".bias")
-                    and name_rewritten not in params_dict
-                ):
-                    continue
-                if name_rewritten not in params_dict:
-                    continue
-                param = params_dict[name_rewritten]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is None:
-                    default_weight_loader(param, loaded_weight)
-                else:
-                    weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name_rewritten)
-                stacked_matched = True
-                break
-
-            if stacked_matched:
-                continue
-
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            if name not in params_dict:
-                continue
-
-            param = params_dict[name]
-            direct_weight_loader = getattr(
-                param, "weight_loader", default_weight_loader
-            )
-            direct_weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
 
 
 class MiMoV2OmniMTP(MiMoV2MTP, SupportsMultiModal):

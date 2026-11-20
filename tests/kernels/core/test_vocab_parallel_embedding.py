@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch import nn
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -20,6 +21,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
     pad_vocab_size,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -157,7 +159,9 @@ def test_embedding_optionally_reduces_output(dtype, use_fused, default_vllm_conf
                     reduce_results=reduce_results,
                 )
                 embedding.use_fused_embedding = use_fused
-                embedding.weight_loader(embedding.get_parameter("weight"), table)
+                model = nn.Module()
+                model.embedding = embedding
+                load_with_ops(model, iter([("embedding.weight", table)]), [])
                 actual = embedding(ids)
                 assert actual.dtype == dtype
                 torch.testing.assert_close(

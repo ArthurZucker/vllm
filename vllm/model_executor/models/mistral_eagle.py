@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -184,7 +183,3 @@ class EagleMistralForCausalLM(
             is_multimodal=is_multimodal,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Pretend embed_tokens is loaded; the actual weight is shared
-        # from the target model at runtime by `load_eagle_model`.
-        return super().load_weights(weights) | {"model.embed_tokens.weight"}

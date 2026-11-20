@@ -85,8 +85,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
@@ -753,17 +751,6 @@ class Molmo2VisionBackbone(nn.Module, SupportsQuant):
 
     # Runs after the top-level mapper, so image_pooling_2d/image_projector
     # source names are already renamed to q/k/v_proj and gate/up_proj.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            "wq": ("merged_qkv", "q"),
-            "wk": ("merged_qkv", "k"),
-            "wv": ("merged_qkv", "v"),
-            "k_proj": ("merged_kv", 0),
-            "v_proj": ("merged_kv", 1),
-            "gate_proj": ("merged_linear", 0),
-            "up_proj": ("merged_linear", 1),
-        },
-    )
 
     def __init__(
         self,
@@ -866,10 +853,6 @@ class Molmo2VisionBackbone(nn.Module, SupportsQuant):
         return pooled_features.view(-1, pooled_features.shape[-1])[
             valid_token.flatten()
         ]
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Molmo2Attention(nn.Module):
@@ -1237,9 +1220,6 @@ class Molmo2TextModel(nn.Module, SupportsQuant):
         else:
             hidden_states = self.norm(hidden_states)
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
 
 
 def get_patches_grid_size(
@@ -2317,35 +2297,6 @@ class Molmo2MultiModalProcessor(BaseMultiModalProcessor[Molmo2ProcessingInfo]):
 class Molmo2ForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA, SupportsQuant
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # vision backbone mapping
-            "image_pooling_2d.wq": "image_pooling_2d.q_proj",
-            "image_pooling_2d.wk": "image_pooling_2d.k_proj",
-            "image_pooling_2d.wv": "image_pooling_2d.v_proj",
-            "image_pooling_2d.wo": "image_pooling_2d.o_proj",
-            "image_projector.w1": "image_projector.gate_proj",
-            "image_projector.w3": "image_projector.up_proj",
-            "image_projector.w2": "image_projector.down_proj",
-            # language backbone mapping
-            "att_proj": "qkv_proj",
-            "attn_out": "o_proj",
-            "q_norm": "q_norm",
-            "k_norm": "k_norm",
-            "ff_proj": "up_gate_proj",
-            "ff_out": "down_proj",
-            "attn_norm": "input_layernorm",
-            "ff_norm": "post_attention_layernorm",
-        },
-        orig_to_new_prefix={
-            # vision backbone mapping
-            "model.vision_backbone.": "vision_backbone.",
-            # language backbone mapping
-            "model.transformer.blocks.": "model.layers.",
-            "model.transformer.ln_f.": "model.norm.",
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["qkv_proj"],
         "up_gate_proj": ["up_gate_proj"],  # language model
@@ -2396,6 +2347,8 @@ class Molmo2ForConditionalGeneration(
             )
 
         self.img_patch_id = config.image_patch_id
+        # the embedding is two tables on disk (`wte.embedding`, `wte.new_embedding`)
+        self.checkpoint_transforms = [_get_weights_with_merged_embedding]
 
         if hasattr(config, "text_config"):
             hf_text_config = config.text_config
@@ -2649,11 +2602,6 @@ class Molmo2ForConditionalGeneration(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        weights = _get_weights_with_merged_embedding(weights)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
         return MultiModelKeys.from_string_field(
@@ -2683,7 +2631,8 @@ def _get_weights_with_merged_embedding(
         )
 
     embedding_weights = torch.cat(
-        [embedding_weights["embedding"], embedding_weights["new_embedding"]],
+        # read, if lazy safetensors slices
+        [embedding_weights[k][...] for k in ("embedding", "new_embedding")],
         dim=0,
     )
     yield ("model.embed_tokens.weight", embedding_weights)

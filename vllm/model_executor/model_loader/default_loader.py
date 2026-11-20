@@ -16,13 +16,16 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import StackedColumnParallelLinear
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_eplb_local_expert_ids,
     compute_local_expert_ids,
+)
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
@@ -374,7 +377,8 @@ class DefaultModelLoader(BaseModelLoader):
                     weights_iterator = safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
-                        self.load_config.safetensors_load_strategy,
+                        # slices: each rank reads its shard only (`ops_loader`)
+                        self.load_config.safetensors_load_strategy or "slices",
                         local_expert_ids=self.local_expert_ids,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
@@ -454,9 +458,7 @@ class DefaultModelLoader(BaseModelLoader):
         self._encoder_only_lm_prefixes = resolve_mm_encoder_only_lm_prefixes(
             getattr(model, "_language_model_names", None)
         )
-        self._encoder_only_weights_mapper = cast(
-            "WeightsMapper | None", getattr(model, "hf_to_vllm_mapper", None)
-        )
+        self._encoder_only_weights_mapper = rename_mapper(model)
 
     def _init_ep_weight_filter(
         self, model: nn.Module, model_config: ModelConfig
@@ -564,7 +566,9 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model, model_config)
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        loaded_weights = load_model_weights(
+            model, self.get_all_weights(model_config, model)
+        )
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
@@ -595,10 +599,6 @@ class DefaultModelLoader(BaseModelLoader):
         weights_to_load = {name for name, _ in model.named_parameters()}
         if loaded_weights is not None:
             for name, module in model.named_modules():
-                if isinstance(module, StackedColumnParallelLinear):
-                    weights_to_load.update(
-                        f"{name}.{shard_id}" for shard_id in module.pop_missing_shards()
-                    )
                 # ignore online quantization scales
                 quant_method = getattr(module, "quant_method", None)
                 has_online_quant = getattr(quant_method, "uses_meta_device", False)

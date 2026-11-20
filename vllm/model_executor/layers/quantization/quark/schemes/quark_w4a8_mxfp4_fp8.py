@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from fractions import Fraction
 
 import torch
@@ -82,7 +81,6 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
         output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
-        weight_loader: Callable,
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -101,7 +99,6 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
             output_dim=0,
             packed_dim=1,
             packed_factor=self.packed_factor,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 
@@ -114,7 +111,6 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
 
@@ -124,7 +120,6 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
                 len(output_partition_sizes),
                 dtype=torch.float32,
             ),
-            weight_loader=weight_loader,
         )
         # Initialize to avoid NaN
         input_scale[:] = torch.finfo(torch.float32).min

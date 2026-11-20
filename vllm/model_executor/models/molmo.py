@@ -74,8 +74,6 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -671,14 +669,6 @@ class MolmoDecoderNormAfterLayer(MolmoDecoderLayer):
 class MolmoVisionBackbone(nn.Module, SupportsQuant):
     packed_modules_mapping = {"merged_linear": ["gate_proj", "up_proj"]}
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # image_projector gate_up merge
-            "gate_proj": ("merged_linear", 0),
-            "up_proj": ("merged_linear", 1),
-        }
-    )
-
     def __init__(
         self,
         config: PreTrainedConfig,
@@ -804,10 +794,6 @@ class MolmoVisionBackbone(nn.Module, SupportsQuant):
         # image_features: (batch_size, num_image, num_patch, d_model)
         return image_features
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 @support_torch_compile
 class MolmoModel(nn.Module, SupportsQuant):
@@ -883,9 +869,6 @@ class MolmoModel(nn.Module, SupportsQuant):
         else:
             hidden_states = self.norm(hidden_states)
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
 
 
 def _lowest_multiple(x: int, k: int) -> int:
@@ -1276,34 +1259,6 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
 class MolmoForCausalLM(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA, SupportsQuant
 ):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            # vision backbone mapping
-            "image_projector.w1.": "image_projector.gate_proj.",
-            "image_projector.w3.": "image_projector.up_proj.",
-            "image_projector.w2.": "image_projector.down_proj.",
-            # language backbone mapping
-            "att_proj": "self_attn.qkv_proj",
-            "attn_out": "self_attn.o_proj",
-            "q_norm": "self_attn.q_norm",
-            "k_norm": "self_attn.k_norm",
-            "ff_proj": "mlp.gate_up_proj",
-            "ff_out": "mlp.down_proj",
-            "attn_norm": "input_layernorm",
-            "ff_norm": "post_attention_layernorm",
-        },
-        orig_to_new_prefix={
-            # vision backbone mapping
-            "model.vision_backbone.": "vision_backbone.",
-            # language backbone mapping
-            "model.transformer.blocks.": "model.layers.",
-            "model.transformer.ln_f.": "model.norm.",
-            # lm_head is renamed to model.transformer.mlp.down_proj firstly,
-            # we need to run a second renaming for it
-            "model.transformer.mlp.down_proj.": "lm_head.",
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["qkv_proj"],
         "gate_up_proj": ["gate_up_proj"],  # language model
@@ -1359,6 +1314,7 @@ class MolmoForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.checkpoint_transforms = [_get_weights_with_merged_embedding]
 
     def _parse_and_validate_image_input(
         self,
@@ -1443,11 +1399,6 @@ class MolmoForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(self)
-        weights = _get_weights_with_merged_embedding(weights)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
         return MultiModelKeys.from_string_field(
@@ -1463,9 +1414,9 @@ def _get_weights_with_merged_embedding(
     embedding_weights = {}
     for name, weight in weights:
         if "wte.embedding" in name:
-            embedding_weights["embedding"] = weight
+            embedding_weights["embedding"] = weight[...]  # a lazy slice: read
         elif "wte.new_embedding" in name:
-            embedding_weights["new_embedding"] = weight
+            embedding_weights["new_embedding"] = weight[...]
         else:
             yield (name, weight)
     # this is compatible with most of quantization,

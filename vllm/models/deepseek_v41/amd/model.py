@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
-from collections.abc import Callable, Iterable
 from functools import partial
 from itertools import islice
 
-import regex as re
 import torch
 import torch.nn as nn
 
@@ -15,7 +13,6 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pcp_group,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import (
@@ -25,9 +22,6 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.triton import MHC_POST_COLLAPSE_RMS_NORM_KERNEL
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
@@ -35,12 +29,10 @@ from vllm.model_executor.layers.mhc import (
     MHCPostOp,
     MHCPreDelayedOp,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
@@ -49,11 +41,8 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
-    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
 )
@@ -86,7 +75,6 @@ from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.platforms.rocm import on_gfx942
 from vllm.sequence import IntermediateTensors
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -1125,170 +1113,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         logger.warning_once("Decoder SWA bounded replay is off: %s.", reason)
         return False
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        def _resolve_param_name(name: str) -> str:
-            """Resolve scale naming across ROCm FP8 and MXFP8 methods."""
-            if name.endswith("_inv"):
-                direct_name = name.removesuffix("_inv")
-                if direct_name in params_dict:
-                    return direct_name
-            inv_name = f"{name}_inv"
-            if name not in params_dict and inv_name in params_dict:
-                return inv_name
-            return name
-
-        # Pre-compute expert mapping ONCE.
-        expert_mapping = self.get_expert_mapping()
-
-        # Block-FP8 shared experts: pad the intermediate up to the TP-uniform
-        # block count so the standard loaders below slice it evenly (trailing
-        # ranks land on the zero pad). SP / unquantized ones need no padding.
-        pad_shared_expert = (
-            getattr(self.quant_config, "weight_block_size", None) is not None
-            and not self.use_sequence_parallel
-        )
-
-        for name, loaded_weight in weights:
-            if name.startswith(("vision.", "aligner.", "image_")):
-                # Vision weights are loaded by the outer multimodal wrapper.
-                logger.warning_once("Skipping non-text weight: %s", name)
-                continue
-            if pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = self._pad_shared_expert_weight(
-                    self.quant_config, name, loaded_weight
-                )
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if ".experts." in name:
-                    continue
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                if is_pp_missing_parameter(name, self):
-                    break
-                if name not in params_dict:
-                    head, _, leaf = name.rpartition(".")
-                    suffixed = f"{head}.base_layer.{leaf}"
-                    if suffixed in params_dict:
-                        name = suffixed
-                name = _resolve_param_name(name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if ".experts." in name:
-                    # E8M0 scales are stored as float8_e8m0fnu in
-                    # checkpoints but the MoE param is uint8. copy_()
-                    # would do a numeric conversion (e.g. 2^-7 → 0),
-                    # destroying the raw exponent bytes.
-                    if (
-                        "weight_scale" in name
-                        and loaded_weight.dtype == torch.float8_e8m0fnu
-                    ):
-                        loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, expert_shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        name_mapped = _resolve_param_name(name_mapped)
-                        param = params_dict[name_mapped]
-                        # We should ask the weight loader to return success or not
-                        # here since otherwise we may skip experts with other
-                        # available replicas.
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=expert_shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
-                    continue
-                else:
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    # Non-LoRA params on a LoRA-wrapped module live at
-                    # ``<head>.base_layer.<leaf>``; the checkpoint is plain.
-                    if name not in params_dict:
-                        head, _, leaf = name.rpartition(".")
-                        suffixed = f"{head}.base_layer.{leaf}"
-                        if suffixed in params_dict:
-                            name = suffixed
-                    name = _resolve_param_name(name)
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-                    continue
-
-        return loaded_params
-
-    @staticmethod
-    def _pad_shared_expert_weight(
-        quant_config: QuantizationConfig | None,
-        name: str,
-        loaded_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
-        axis so the standard TP loaders split it into even, block-aligned shards
-        (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
-        down (w2 -> down_proj) [H, I] pads dim 1.
-        """
-        block_size = getattr(quant_config, "weight_block_size", None)
-        assert block_size is not None
-        # Round the intermediate axis up to a whole number of TP shards. The axis
-        # is in elements for weights (step = block) and in blocks for scales.
-        step = (
-            1 if name.endswith(("weight_scale_inv", "weight_scale")) else block_size[0]
-        )
-        dim = 1 if ".down_proj." in name else 0
-        mult = get_tensor_model_parallel_world_size() * step
-        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
-        if pad == 0:
-            return loaded_weight
-        pad_shape = list(loaded_weight.shape)
-        pad_shape[dim] = pad
-        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-            routed_experts_prefix="" if self.use_mega_moe else "routed_experts",
-        )
-
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
             finalize_mega_moe_weights(self)
@@ -1321,73 +1145,6 @@ def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
         and expert_dtype == "fp4"
     )
     return "weight_scale" if use_mxfp8 else "weight_scale_inv"
-
-
-def _make_deepseek_v4_weights_mapper(
-    expert_dtype: str, linear_scale_name: str = "weight_scale_inv"
-) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). Linear scales use the
-        # parameter name registered by their quantization method.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant (LoRA-wrapped experts).
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale",
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            # The ``embed.weight`` -> ``embed_tokens.weight`` suffix rule
-            # renames the engram fp8 table but not its scale; route the
-            # scale explicitly to the same module.
-            re.compile(r"(engram\.embed)\.scale$"): r"\1_tokens.weight_scale_inv",
-            # Quark exports spell the same tensor ``embed.weight_scale``,
-            # which the ``\.scale$`` rules never match.
-            re.compile(
-                r"(engram\.embed)\.weight_scale$"
-            ): r"\1_tokens.weight_scale_inv",
-            re.compile(r"\.scale$"): f".{linear_scale_name}",
-        }
-    else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
-        scale_regex = {
-            # ``.base_layer.``-namespace variant of the above.
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale_inv",
-            # Same engram reroute as the fp4 branch above.
-            re.compile(r"(engram\.embed)\.scale$"): r"\1_tokens.weight_scale_inv",
-            # Quark exports spell the same tensor ``embed.weight_scale``,
-            # which the ``\.scale$`` rules never match.
-            re.compile(
-                r"(engram\.embed)\.weight_scale$"
-            ): r"\1_tokens.weight_scale_inv",
-            re.compile(r"\.scale$"): f".{linear_scale_name}",
-        }
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed.",
-            "norm.": "model.norm.",
-            "mtp.": "model.mtp.",
-        },
-        orig_to_new_regex=scale_regex,
-        orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
-            "embed.weight": "embed_tokens.weight",
-            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
-        },
-        orig_to_new_substr={
-            ".shared_experts.w2": ".shared_experts.down_proj",
-            "mtp.": None,
-            # The v4.1 checkpoint declares the VL arch even for text-only
-            # use; the text backbone drops the vision-tower weights.
-            "vision.": None,
-            "aligner.": None,
-            "image_": None,
-        },
-    )
 
 
 class DeepseekV4MixtureOfExperts(MixtureOfExperts):
@@ -1436,10 +1193,6 @@ class DeepseekV41LLMForCausalLM(
 ):
     model_cls = DeepseekV4Model
 
-    # Default mapper assumes the original FP4-expert checkpoint layout.
-    # Overridden per-instance in __init__ when expert_dtype != "fp4".
-    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
-
     packed_modules_mapping = {
         "gate_up_proj": ["w1", "w3"],
         "fused_wqa_wkv": ["wq_a", "wkv"],
@@ -1455,9 +1208,8 @@ class DeepseekV41LLMForCausalLM(
         config = vllm_config.model_config.hf_config
         self.config = config
         expert_dtype = getattr(config, "expert_dtype", "fp4")
-        self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
-            expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
-        )
+        # read by its checkpoint's conversion mapping (`.scale` tensors)
+        self.linear_scale_name = _linear_scale_param_name(vllm_config, expert_dtype)
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -1564,13 +1316,6 @@ class DeepseekV41LLMForCausalLM(
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

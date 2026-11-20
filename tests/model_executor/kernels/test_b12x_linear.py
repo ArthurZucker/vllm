@@ -269,10 +269,6 @@ def test_b12x_tensor_fp8_process_weights_packs_modelopt_layout(
     layer.weight = torch.nn.Parameter(original_weight, requires_grad=False)
     layer.weight_scale = torch.nn.Parameter(torch.tensor(0.25), requires_grad=False)
     layer.input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
-    weight_loader = object()
-    scale_loader = object()
-    layer.weight.weight_loader = weight_loader
-    layer.weight_scale.weight_loader = scale_loader
     kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
     kernel.config = types.SimpleNamespace(weight_shape=(64, 128))
     kernel.layer_param_names = (
@@ -292,8 +288,6 @@ def test_b12x_tensor_fp8_process_weights_packs_modelopt_layout(
     torch.testing.assert_close(output_scale, torch.tensor([0.125]))
     assert layer.weight.numel() == 0
     assert layer.weight_scale.numel() == 0
-    assert layer.weight.weight_loader is weight_loader
-    assert layer.weight_scale.weight_loader is scale_loader
     torch.testing.assert_close(layer.input_scale, torch.tensor(0.5))
 
 
@@ -441,10 +435,6 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
         torch.empty((64, 8), dtype=torch.uint8),
         requires_grad=False,
     )
-    weight_loader = object()
-    scale_loader = object()
-    layer.weight.weight_loader = weight_loader
-    layer.weight_scale.weight_loader = scale_loader
     kernel = object.__new__(B12xMxfp8LinearKernel)
 
     kernel.process_weights_after_loading(layer)
@@ -459,8 +449,6 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     assert weight_scale.dtype == torch.uint8
     assert layer.weight.numel() == 0
     assert layer.weight_scale.numel() == 0
-    assert layer.weight.weight_loader is weight_loader
-    assert layer.weight_scale.weight_loader is scale_loader
 
 
 def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
@@ -555,10 +543,6 @@ def test_b12x_block_fp8_process_weights_keeps_native_block_layout() -> None:
         requires_grad=False,
     )
     layer.weight_block_size = [128, 128]
-    weight_loader = object()
-    scale_loader = object()
-    layer.weight.weight_loader = weight_loader
-    layer.weight_scale_inv.weight_loader = scale_loader
     kernel = object.__new__(B12xFp8BlockScaledMMKernel)
 
     kernel.process_weights_after_loading(layer)
@@ -568,8 +552,6 @@ def test_b12x_block_fp8_process_weights_keeps_native_block_layout() -> None:
     assert layer.weight.dtype == torch.float8_e4m3fn
     assert layer.weight_scale_inv.shape == (1, 1)
     assert layer.weight_scale_inv.dtype == torch.float32
-    assert layer.weight.weight_loader is weight_loader
-    assert layer.weight_scale_inv.weight_loader is scale_loader
 
 
 @pytest.mark.parametrize("scale_dtype", [torch.float8_e8m0fnu, torch.uint8])
@@ -706,7 +688,7 @@ def test_b12x_mxfp4_requires_dynamic_activations() -> None:
         ),
     ],
 )
-def test_b12x_fp4_processes_scale_and_preserves_loader(
+def test_b12x_fp4_processes_scale_in_place(
     monkeypatch,
     kernel_cls,
     module_name: str,
@@ -723,14 +705,11 @@ def test_b12x_fp4_processes_scale_and_preserves_loader(
     layer = torch.nn.Module()
     layer.prefix = "model.layers.0.mlp.shared_expert.down_proj"
     layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
-    weight_loader = object()
-    layer.weight_scale.weight_loader = weight_loader
     kernel = object.__new__(kernel_cls)
 
     kernel.process_weights_after_loading(layer)
 
     assert layer.weight_scale.data_ptr() == swizzled_scale.data_ptr()
-    assert layer.weight_scale.weight_loader is weight_loader
     assert layer.b12x_warmup_provider is kernel
 
 

@@ -519,7 +519,10 @@ class M2NWeightTransferEngine(
         if has_fallback:
             # Some model loaders keep invocation-local state to combine
             # related checkpoint tensors, so preserve one iterable scope.
-            self.model.load_weights(received_weights)
+            from vllm.model_executor.model_loader.ops_loader import (
+                load_weights as load_model_weights,
+            )
+            load_model_weights(self.model, received_weights)
         else:
             # The iterator performs the reshards. With nothing to yield to
             # `load_weights`, exhaust it here to execute direct transfers.

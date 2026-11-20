@@ -462,6 +462,33 @@ class ModelArchConfigConvertorBase:
 
 
 class CohereAsrModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def __init__(self, hf_config, hf_text_config, revision=None):
+        super().__init__(hf_config, hf_text_config, revision)
+        # vLLM's model reads the NeMo dicts; Transformers' sub-configs, when there,
+        # are what the checkpoint was saved with (they win where both are set)
+        encoder = getattr(hf_config, "encoder_config", None)
+        if encoder is not None:
+            hf_config.encoder.update(
+                d_model=encoder.hidden_size,
+                n_layers=encoder.num_hidden_layers,
+                n_heads=encoder.num_attention_heads,
+                ff_expansion_factor=encoder.intermediate_size // encoder.hidden_size,
+                feat_in=encoder.num_mel_bins,
+                subsampling_conv_channels=encoder.subsampling_conv_channels,
+                subsampling_factor=encoder.subsampling_factor,
+                conv_kernel_size=encoder.conv_kernel_size,
+            )
+            hf_config.transf_decoder["config_dict"].update(
+                hidden_size=hf_config.hidden_size,
+                inner_size=hf_config.intermediate_size,
+                num_attention_heads=hf_config.num_attention_heads,
+                num_layers=hf_config.num_hidden_layers,
+                lm_dec_hidden=encoder.hidden_size,
+            )
+            hf_config.head.update(
+                hidden_size=hf_config.hidden_size, num_classes=hf_config.vocab_size
+            )
+
     def get_total_num_attention_heads(self) -> int:
         return self.hf_text_config.transf_decoder["config_dict"]["num_attention_heads"]
 
@@ -848,6 +875,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "diffusion_gemma_text": Gemma4ModelArchConfigConvertor,
     "ernie_mtp": ErnieMTPModelArchConfigConvertor,
     "falcon": FalconModelArchConfigConvertor,
+    "gpt_bigcode": FalconModelArchConfigConvertor,  # `multi_query`: one KV head
     "falcon_mamba": MambaModelArchConfigConvertor,
     "gemma4": Gemma4ModelArchConfigConvertor,
     "gemma4_mtp": Gemma4MTPModelArchConfigConvertor,

@@ -193,18 +193,20 @@ class TransformersRoutedExperts(RoutedExperts):
         mixtral_fused, mixtral_unfused = mixtral_map[:3], mixtral_map[3:]
         return common_fused + mixtral_fused + common_unfused + mixtral_unfused
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[str]:
-        return super().load_weights(self._detect_mixtral_format(weights))
 
-    def _detect_mixtral_format(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in weights:
-            uses_w123 = any(f".{w}." in f".{name}" for w in ("w1", "w2", "w3"))
-            self._is_mixtral_format = bool(self._is_mixtral_format) or uses_w123
-            yield name, weight
+def _detect_mixtral_format(
+    model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The checkpoint, noting whether its experts are Mixtral's (`w1`/`w2`/`w3`):
+    their `TransformersRoutedExperts._is_mixtral_format`, read by LoRA"""
+    mixtral = False
+    for name, weight in weights:
+        if not mixtral and "experts." in name:
+            mixtral = any(f".{w}." in f".{name}" for w in ("w1", "w2", "w3"))
+        yield name, weight
+    for module in model.modules():
+        if isinstance(module, TransformersRoutedExperts):
+            module._is_mixtral_format = bool(module._is_mixtral_format) or mixtral
 
 
 class MoEMixin(MixtureOfExperts, Base):
@@ -219,6 +221,10 @@ class MoEMixin(MixtureOfExperts, Base):
             self.check_version("5.18.0", "Aria")
         # Skip MixtureOfExperts.__init__ and call the next class in MRO
         super(MixtureOfExperts, self).__init__(vllm_config=vllm_config, prefix=prefix)
+        self.checkpoint_transforms = [
+            *getattr(self, "checkpoint_transforms", []),
+            partial(_detect_mixtral_format, self),
+        ]
 
     def update_physical_experts_metadata(
         self,

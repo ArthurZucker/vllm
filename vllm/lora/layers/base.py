@@ -41,9 +41,9 @@ class BaseLayerWithLoRA(nn.Module):
         if callable(base_load_weights):
             return base_load_weights(weights)
 
-        from vllm.model_executor.models.utils import AutoWeightsLoader
+        from vllm.model_executor.model_loader.ops_loader import load_with_ops
 
-        return AutoWeightsLoader(self.base_layer).load_weights(weights)
+        return load_with_ops(self.base_layer, weights)
 
     @overload
     def slice_lora_a(

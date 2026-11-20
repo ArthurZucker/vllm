@@ -26,7 +26,6 @@
 # limitations under the License.
 """Inference-only MiMo model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -41,7 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 
 from .qwen3 import Qwen3ForCausalLM, Qwen3Model, use_qwen2_attention
-from .utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
+from .utils import PPMissingLayer, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -90,7 +89,6 @@ class MiMoModel(Qwen3Model):
 
 class MiMoForCausalLM(Qwen3ForCausalLM, nn.Module):
     # MTP layers are loaded by the draft model, not the main model.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"model.mtp_layers.": None})
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -123,10 +121,6 @@ class MiMoForCausalLM(Qwen3ForCausalLM, nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def compute_logits(
         self,

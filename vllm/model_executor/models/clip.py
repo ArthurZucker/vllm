@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import cached_property
 from typing import Annotated, Literal
 
@@ -55,7 +55,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal
 from .interfaces_base import default_pooling_type
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .utils import maybe_prefix
 from .vision import (
     VisionEncoderInfo,
     VisionFeatureSelectStrategy,
@@ -558,14 +558,6 @@ class CLIPEncoder(nn.Module):
 
 
 class CLIPTextTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -615,20 +607,8 @@ class CLIPTextTransformer(nn.Module):
 
         return last_hidden_state
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class CLIPVisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -672,9 +652,6 @@ class CLIPVisionTransformer(nn.Module):
             self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         else:
             self.post_layernorm = None
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={"post_layernorm.": None}
-            )
 
     @property
     def dtype(self):
@@ -711,20 +688,6 @@ class CLIPVisionTransformer(nn.Module):
         )
 
         return encoder_outputs
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-
-        # Drop layers beyond num_hidden_layers_override.
-        def _filter(ws):
-            for name, w in ws:
-                if name.startswith("encoder.layers.") and int(
-                    name.split(".")[2]
-                ) >= len(self.encoder.layers):
-                    continue
-                yield name, w
-
-        return loader.load_weights(_filter(weights), mapper=self.hf_to_vllm_mapper)
 
 
 class CLIPVisionModel(nn.Module):
@@ -777,8 +740,6 @@ class CLIPVisionModel(nn.Module):
 )
 class CLIPEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
     is_pooling_model = True
-
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_substr={".position_ids": None})
 
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
@@ -991,11 +952,3 @@ class CLIPEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
         return merge_dual_encoder_text_and_vision(
             text_features, vision_embeds, self._mm_token_mask
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=["logit_scale."],
-        )
-
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

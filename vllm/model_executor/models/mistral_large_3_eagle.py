@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
-from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
 
-import regex
 import torch
 import torch.nn as nn
 
@@ -30,7 +28,6 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
@@ -137,14 +134,6 @@ class EagleMistralLarge3Model(DeepseekV2Model):
 class EagleMistralLarge3ForCausalLM(
     _EagleMistralLarge3ForCausalLMBase, SupportsMultiModalEmbeddings
 ):
-    hf_to_vllm_mapper = MistralLarge3ForCausalLM.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_regex={
-            regex.compile(r"\Aeagle_linear\.weight\Z"): r"model.fc.weight",
-            regex.compile(r"\Aeagle_linear\.qscale_act\Z"): r"model.fc.input_scale",
-            regex.compile(r"\Aeagle_linear\.qscale_weight\Z"): r"model.fc.weight_scale",
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
@@ -190,11 +179,3 @@ class EagleMistralLarge3ForCausalLM(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.model(input_ids, positions, hidden_states, inputs_embeds)
         return hidden_states, hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Pretend we've loaded the embedding and lm_head weights
-        # (later copied from target model)
-        return super().load_weights(weights) | {
-            "model.embed_tokens.weight",
-            "lm_head.weight",
-        }

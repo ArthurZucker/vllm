@@ -61,7 +61,6 @@ from .nemotron3_5_transcribe_audio import Nemotron3_5TranscribeAudioTower
 from .nemotron_h import NemotronHForCausalLM
 from .nemotron_h_mtp import NemotronHMTP
 from .utils import (
-    WeightsMapper,
     _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
@@ -358,33 +357,6 @@ def _unpack_experts(
     yield name, tensor
 
 
-def _pad_vocab_rows(tensor: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    if tensor.shape[0] >= vocab_size:
-        return tensor
-    return torch.cat(
-        [tensor, tensor.new_zeros(vocab_size - tensor.shape[0], tensor.shape[1])], dim=0
-    )
-
-
-def _decoder_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], vocab_size: int
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Shape the mapped decoder tensors for `NemotronHForCausalLM`.
-
-    NeMo packs the routed experts of each MoE layer into two tensors; the FP8 and
-    NVFP4 checkpoints have one tensor per expert, with its quantization scales.
-    The embedding and LM head are zero-padded to the decoder's padded vocabulary.
-    """
-    for name, tensor in weights:
-        if name in (
-            "model.embed_tokens.weight",
-            "model.embeddings.weight",
-            "lm_head.weight",
-        ):
-            tensor = _pad_vocab_rows(tensor, vocab_size)
-        yield from _unpack_experts(name, tensor)
-
-
 def _mtp_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -416,17 +388,6 @@ class Nemotron3_5TranscribeForConditionalGeneration(
     # The BF16 checkpoint names the decoder in NeMo's layout (``llm.*``; Mamba
     # ``A_log``/``D``/``dt_bias`` in a float32 holder; final norm ``norm``). The FP8
     # and NVFP4 checkpoints, and their quantization configs, use Hugging Face names.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".mixer._fp32_params.": ".mixer."},
-        orig_to_new_prefix={
-            "llm.model.norm.": "language_model.model.norm_f.",
-            "llm.model.": "language_model.model.",
-            "llm.lm_head.": "language_model.lm_head.",
-            "backbone.": "language_model.model.",
-            "lm_head": "language_model.lm_head",
-            "perception.": "audio_tower.",
-        },
-    )
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
     @classmethod
@@ -575,43 +536,6 @@ class Nemotron3_5TranscribeForConditionalGeneration(
             tower_model=["audio_tower.preprocessor", "audio_tower.encoder"],
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        load_audio = isinstance(self.audio_tower, Nemotron3_5TranscribeAudioTower)
-        audio_weights: list[tuple[str, torch.Tensor]] = []
-
-        def decoder_source() -> Iterator[tuple[str, torch.Tensor]]:
-            for name, tensor in self.hf_to_vllm_mapper.apply(weights):
-                if name.endswith("._extra_state"):
-                    continue
-                if name.startswith("audio_tower."):
-                    if load_audio:
-                        # Copied so the tensor outlives a reusable read buffer.
-                        audio_weights.append(
-                            (name[len("audio_tower.") :], tensor.detach().clone())
-                        )
-                elif name.startswith("llm.mtp."):
-                    continue  # loaded by the multi-token-prediction drafter
-                elif name.startswith("ctc_timestamp."):
-                    continue  # the CTC timestamp head and its tokenizer
-                elif name.startswith("language_model."):
-                    yield name[len("language_model.") :], tensor
-                else:
-                    raise ValueError(f"Unexpected checkpoint weight {name!r}.")
-
-        decoder_weights = _decoder_weights(
-            decoder_source(), self.config.text_config.vocab_size
-        )
-        loaded = {
-            f"language_model.{name}"
-            for name in self.language_model.load_weights(decoder_weights)
-        }
-        if load_audio:
-            loaded |= {
-                f"audio_tower.{name}"
-                for name in self.audio_tower.load_weights(audio_weights)
-            }
-        return loaded
-
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
         text_config = vllm_config.model_config.hf_config.text_config
@@ -665,6 +589,3 @@ class Nemotron3_5TranscribeMTP(NemotronHMTP, SupportsMultiModalEmbeddings):
         # Shard selection passes the raw llm.mtp.* names; load_weights passes
         # the mtp.* names that _mtp_weights produces.
         return super().is_unused_checkpoint_weight(name.removeprefix("llm."))
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_mtp_weights(weights))

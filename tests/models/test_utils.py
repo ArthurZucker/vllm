@@ -11,8 +11,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
 )
@@ -40,6 +40,7 @@ class ModuleWithNestedBatchNorm(torch.nn.Module):
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("dist_init")
 def test_module_with_batchnorm_can_load():
     """Ensure the auto weight loader can load batchnorm stats."""
     mod = ModuleWithBatchNorm()
@@ -56,8 +57,7 @@ def test_module_with_batchnorm_can_load():
     assert not torch.all(new_mod.bn.running_var == mod.bn.running_var)
     assert new_mod.bn.num_batches_tracked.item() == 0
 
-    loader = AutoWeightsLoader(new_mod)
-    loader.load_weights(weight_generator())
+    load_weights(new_mod, weight_generator())
 
     # Ensure the stats are updated
     assert torch.all(new_mod.bn.running_mean == mod.bn.running_mean)
@@ -66,6 +66,7 @@ def test_module_with_batchnorm_can_load():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("dist_init")
 def test_module_with_child_containing_batchnorm_can_autoload():
     """Ensure the auto weight loader can load nested modules batchnorm stats."""
     mod = ModuleWithNestedBatchNorm()
@@ -86,8 +87,7 @@ def test_module_with_child_containing_batchnorm_can_autoload():
     )
     assert new_mod.nested_mod.bn.num_batches_tracked.item() == 0
 
-    loader = AutoWeightsLoader(new_mod)
-    loader.load_weights(weight_generator())
+    load_weights(new_mod, weight_generator())
 
     # Ensure the stats are updated
     assert torch.all(
@@ -128,7 +128,7 @@ def test_module_skip_tied_weights(tie: bool):
         ("model.embed_tokens.weight", make_embedding_weights(1.0)),
         ("lm_head.weight", make_embedding_weights(2.0)),
     ]
-    loaded = AutoWeightsLoader(mod).load_weights(iter(weights))
+    loaded = load_weights(mod, iter(weights))
 
     if tie:
         assert loaded == {"model.embed_tokens.weight"}
@@ -149,12 +149,13 @@ class ModuleWithSharedParam(torch.nn.Module):
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("dist_init")
 def test_module_load_shared_params_that_are_not_tied_embeddings():
     """Only tied embeddings are skipped; other shared params must still load."""
     mod = ModuleWithSharedParam()
 
     weights = [("gate.weight", torch.Tensor([[1, 2], [3, 4]]))]
-    loaded = AutoWeightsLoader(mod).load_weights(iter(weights))
+    loaded = load_weights(mod, iter(weights))
 
     assert loaded == {"gate.weight"}
     assert torch.all(mod.gate.weight == torch.Tensor([[1, 2], [3, 4]]))

@@ -31,14 +31,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.interfaces import SupportsHCSP, SupportsPP
-from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     get_draft_quant_config,
     get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
-    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
@@ -48,8 +45,6 @@ from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
-    _EXTRA_WEIGHTS_MAPPER,
-    _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
@@ -112,6 +107,20 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     if name.startswith("model.embed_tokens.") or name.startswith("lm_head."):
         return name
     return None
+
+
+def _mtp_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The draft's tensors of the target's checkpoint, at its names; the final
+    mixer's block injection is not the draft's"""
+    for name, tensor in weights:
+        name = _remap_mtp_weight_name(name)
+        if (
+            name is not None
+            and "hyper_connection_mixer.block_inject_weight" not in name
+        ):
+            yield name, tensor
 
 
 def _make_draft_vllm_config(
@@ -180,8 +189,6 @@ def _make_draft_vllm_config(
     }
 )
 class Qwen4ExpMultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
@@ -364,23 +371,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             multi_hidden = multi_hidden.contiguous()
         return sample_hidden_states, multi_hidden
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = maybe_fuse_shared_experts(
-            weights,
-            fused_shared_expert_layers=self.fused_shared_expert_layers,
-            n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
-            n_shared_experts=1,
-            ckpt_prefix="mlp.shared_expert",
-        )
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}
-        )
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
-        )
-        return loader.load_weights(weights, mapper=mapper)
-
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -429,6 +419,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.checkpoint_transforms = [_mtp_weights]
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
 
@@ -457,22 +448,6 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def remap_weight_names():
-            for name, weight in weights:
-                remapped_name = _remap_mtp_weight_name(name)
-                if remapped_name is not None:
-                    yield remapped_name, weight
-
-        mapper = WeightsMapper(
-            orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}
-        )
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
-        )
-        return loader.load_weights(remap_weight_names(), mapper=mapper)
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

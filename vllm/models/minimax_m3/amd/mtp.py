@@ -29,9 +29,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     in_single_pp_stage,
 )
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
@@ -41,10 +38,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.reload import weight_update_active
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
@@ -63,6 +56,8 @@ from .model import (
     MiniMAXGemmaRMSNorm,
     MiniMaxM3DecoderLayer,
 )
+
+EMBED = "model.embed_tokens.weight"
 
 
 class _SparseIndexerContext(NamedTuple):
@@ -273,6 +268,7 @@ class MiniMaxM3MTP(nn.Module):
         if self._tracks_own_embed:
             # Preserve embeddings from loaders that bypass load_weights.
             self.has_own_embed_tokens = vllm_config.load_config.load_format != "dummy"
+            self.checkpoint_transforms = [self._track_own_embed]
 
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -315,119 +311,17 @@ class MiniMaxM3MTP(nn.Module):
             self.lm_head, mtp_layer.final_layernorm(hidden_states)
         )
 
-    def _map_checkpoint_name(self, name: str) -> str | None:
-        """Map a full checkpoint key to this MTP module's parameter name.
-
-        The MTP module only owns the *.mtp.layers.* weights plus the token
-        embedding and LM head, which the checkpoint shares with the main model.
-        Everything else belongs to other modules and is ignored here by returning
-        None.
-        """
-        # In the bundled checkpoint, the MTP weights are prefixed with
-        # "language_model". The standalone MTP checkpoint has no such prefix.
-        # Strip it if present.
-        name = name.removeprefix("language_model.")
-
-        if name == "model.embed_tokens.weight":
-            return "model.embed_tokens.weight"
-        if name == "lm_head.weight":
-            return "lm_head.weight"
-        if "model.mtp.layers" in name:
-            if "weight_scale_inv" in name:
-                # The checkpoint stores block scales as "weight_scale_inv".
-                # The ModelOpt MXFP8 layers expose them as "weight_scale".
-                name = name.replace("weight_scale_inv", "weight_scale")
-            # Strip "mtp" from prefix.
-            return name.replace(".mtp.", ".")
-        return None
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map q/k/v projections to qkv_proj, and gate/up projections to gate_up_proj.
-        stacked_params_mapping: list[tuple[str, str, int | str]] = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".qkv_proj", ".index_q_proj", "index_q"),
-            (".qkv_proj", ".index_k_proj", "index_k"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
-        # Map expert weights w1/w2/w3 to gate/down/up.
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
-        )
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            mapped_name = self._map_checkpoint_name(name)
-            if mapped_name is None:
-                # This weight does not belong to the MTP module, so skip it.
-                continue
-            name = mapped_name
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                # Routed experts (w1/w2/w3) are handled below. Don't let the
-                # stacked mapping rewrite them.
-                if ("block_sparse_moe.experts." in name) and name not in params_dict:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for (
-                    param_name,
-                    weight_name,
-                    expert_id,
-                    expert_shard_id,
-                ) in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-
-                    name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=expert_shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                    if remapped_name is None or remapped_name not in params_dict:
-                        continue
-                    name = remapped_name
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-
-            loaded_params.add(name)
-
-        if self._tracks_own_embed:
-            if "model.embed_tokens.weight" in loaded_params:
-                self.has_own_embed_tokens = True
-            elif not weight_update_active():
-                # A complete checkpoint without embeddings borrows the target's.
-                self.has_own_embed_tokens = False
-        return loaded_params
+    def _track_own_embed(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """The stream as is; whether it ships the input embedding decides
+        `has_own_embed_tokens` (a partial weight update keeps the last answer)"""
+        own = False
+        for name, weight in weights:
+            own = own or name.removeprefix("language_model.") == EMBED
+            yield name, weight
+        if own:
+            self.has_own_embed_tokens = True
+        elif not weight_update_active():
+            # A complete checkpoint without embeddings borrows the target's.
+            self.has_own_embed_tokens = False

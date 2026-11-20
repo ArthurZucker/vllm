@@ -21,7 +21,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -70,9 +69,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -651,10 +648,7 @@ class OpenPanguSinkAttention(nn.Module):
             )
             set_weight_attrs(
                 self.param_sink_key,
-                {
-                    "output_dim": 1,
-                    "weight_loader": self.weight_loader,
-                },
+                {"shard_dim": 1},  # kv heads over the TP ranks
             )
 
             if self.param_sink_with_value:
@@ -671,10 +665,7 @@ class OpenPanguSinkAttention(nn.Module):
                 )
                 set_weight_attrs(
                     self.param_sink_value,
-                    {
-                        "output_dim": 1,
-                        "weight_loader": self.weight_loader,
-                    },
+                    {"shard_dim": 1},
                 )
             else:
                 self.register_buffer(
@@ -692,25 +683,6 @@ class OpenPanguSinkAttention(nn.Module):
                 )
         # To enable dummy run with out weight
         self.post_weight_load()
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        output_dim = getattr(param, "output_dim", None)
-
-        is_sharded_weight = getattr(param, "is_sharded_weight", False)
-
-        param_data = param.data
-        if output_dim is not None and not is_sharded_weight:
-            shard_size = param_data.shape[output_dim]
-            start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-        # Special case for loading scales off disk, which often do not
-        # have a shape (such as in the case of AutoFP8).
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
 
     def forward(
         self,
@@ -759,6 +731,9 @@ class OpenPanguSinkAttention(nn.Module):
             param_sink_key = self.param_sink_key
 
         self.attn.update_sink_kv(param_sink_key, self.param_sink_value)
+
+    def process_weights_after_loading(self) -> None:
+        self.post_weight_load()  # the sinks from the loaded weights
 
 
 class OpenPanguDecoderLayer(nn.Module):
@@ -1042,49 +1017,6 @@ class OpenPanguModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def _filter_spec_layers(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        # Skip the MTP (spec-decode) layers that follow the main model's layers.
-        num_mtp = getattr(self.config, "num_nextn_predict_layers", 0)
-        for name, loaded_weight in weights:
-            if "layers" in name and num_mtp > 0:
-                layer_idx = int(name.split("layers.")[-1].split(".")[0])
-                mtp_idx = layer_idx - self.config.num_hidden_layers
-                if 0 <= mtp_idx < num_mtp:
-                    continue
-            yield name, loaded_weight
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # .experts.gate_up_proj must be handled by MoERunner.load_weights for EP
-        stacked: dict[str, tuple[str, int | str]] = {
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-            ".shared_experts.gate_proj": (".shared_experts.gate_up_proj", 0),
-            ".shared_experts.up_proj": (".shared_experts.gate_up_proj", 1),
-        }
-        # The attention layout is config-dependent: MLA with a fused low-rank
-        # projection, MLA without it, or standard qkv. Only add the stacked
-        # entries whose fused target actually exists as a parameter.
-        param_names = list(dict(self.named_parameters()))
-        if any(".fused_qkv_a_proj." in n for n in param_names):
-            stacked[".q_a_proj"] = (".fused_qkv_a_proj", 0)
-            stacked[".kv_a_proj_with_mqa"] = (".fused_qkv_a_proj", 1)
-        if any(".qkv_proj." in n for n in param_names):
-            stacked[".q_proj"] = (".qkv_proj", "q")
-            stacked[".k_proj"] = (".qkv_proj", "k")
-            stacked[".v_proj"] = (".qkv_proj", "v")
-        mapper = WeightsMapper(
-            orig_to_new_substr={
-                "e_score_correction_bias": "gate.e_score_correction_bias",
-            },
-            orig_to_new_stacked=stacked,
-        )
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(self._filter_spec_layers(weights), mapper=mapper)
-        self.post_weight_load()
-        return loaded
-
     def post_weight_load(self) -> None:
         for _, module in self.named_modules():
             if module is self:
@@ -1155,10 +1087,6 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
 
 class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):

@@ -9,7 +9,7 @@
 
 import math
 import weakref
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal
 
 import torch
@@ -38,7 +38,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MultiModalEmbeddings,
@@ -63,15 +62,6 @@ from vllm.renderers import TokenizeParams
 from vllm.transformers_utils.configs.radio import RadioConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backend import AttentionType
-
-_PARSE_MTP_WEIGHT_NAMES = frozenset(
-    {
-        "decoder.extra_heads.0.weight",
-        "decoder.extra_heads.0.bias",
-        "decoder.extra_proj.0.weight",
-        "decoder.extra_proj.0.bias",
-    }
-)
 
 
 def _content_normalized_positions(
@@ -353,44 +343,6 @@ class MBartDecoderNoPos(nn.Module, EagleModelMixin):
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if name.startswith("embed_positions"):
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            # Track destination parameters, not individual QKV source shards.
-            # Complete fused weights and biases rely on checkpoint integrity.
-            loaded_params.add(name)
-        return loaded_params
 
 
 class NemotronParsePackedPixelInputs(TensorSchema):
@@ -808,71 +760,3 @@ class RadioMBartPrefixForCausalLM(nn.Module, SupportsMultiModal, SupportsEagle3)
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load Parse 3.5 weights and report loaded destination parameters.
-
-        Returning fully-prefixed destinations lets `DefaultModelLoader` detect
-        missing parameters. Individual source shards of fused parameters are
-        not independently tracked, matching the common vLLM loader convention.
-        """
-        encoder_weights: list[tuple[str, torch.Tensor]] = []
-        decoder_weights: list[tuple[str, torch.Tensor]] = []
-        lm_head_params = dict(self.lm_head.named_parameters())
-        loaded: set[str] = set()
-
-        for name, weight in weights:
-            if name in _PARSE_MTP_WEIGHT_NAMES:
-                continue
-            if name.startswith("encoder."):
-                encoder_weights.append((name.removeprefix("encoder."), weight))
-            elif name.startswith("decoder."):
-                decoder_weights.append((name.removeprefix("decoder."), weight))
-            elif name.startswith("lm_head."):
-                short_name = name.removeprefix("lm_head.")
-                if short_name not in lm_head_params:
-                    raise KeyError(f"Unknown Parse 3.5 LM-head parameter: {short_name}")
-                weight_loader = getattr(
-                    lm_head_params[short_name], "weight_loader", default_weight_loader
-                )
-                weight_loader(lm_head_params[short_name], weight)
-                loaded.add(name)
-            else:
-                raise KeyError(f"Unexpected Parse 3.5 checkpoint tensor: {name}")
-
-        encoder_adaptor = {
-            name: param
-            for name, param in self.encoder.named_parameters()
-            if not name.startswith("model_encoder")
-        }
-        radio_weights: list[tuple[str, torch.Tensor]] = []
-        for name, weight in encoder_weights:
-            if name.startswith("model_encoder."):
-                radio_weights.append((name.removeprefix("model_encoder."), weight))
-                continue
-            if name not in encoder_adaptor:
-                raise KeyError(f"Unknown Parse 3.5 encoder parameter: {name}")
-            param = encoder_adaptor[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight)
-            loaded.add(f"encoder.{name}")
-
-        radio_loaded = self.encoder.model_encoder.load_weights(radio_weights)
-
-        # The shared InternViT implementation materializes LayerScale parameters
-        # that checkpoints of encoders without LayerScale (SO400M) omit.
-        radio_loaded.update(
-            name
-            for name, _ in self.encoder.model_encoder.named_parameters()
-            if name.endswith((".layer_scale1.lambda1", ".layer_scale2.lambda1"))
-        )
-        loaded.update(f"encoder.model_encoder.{name}" for name in radio_loaded)
-        decoder_loaded = self.decoder.load_weights(decoder_weights)
-        loaded.update(f"decoder.{name}" for name in decoder_loaded)
-
-        if (
-            self.config.tie_word_embeddings
-            and self.lm_head.weight is not self.decoder.embed_tokens.weight
-        ):
-            raise RuntimeError("Parse 3.5 tied LM-head weight lost its alias")
-        return loaded

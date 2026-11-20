@@ -27,7 +27,6 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -44,17 +43,11 @@ class InklingShortConv(nn.Module):
         self.kernel_size = kernel_size
         self.owner = owner
         self.stream_idx = stream_idx
-        self.tp_rank = get_tensor_model_parallel_rank()
 
         # Depthwise conv weight; checkpoint stores (dim, 1, W).
         self.weight = Parameter(torch.empty(dim, 1, kernel_size), requires_grad=False)
-        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
-
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
-        if loaded_weight.shape[0] != param.shape[0]:
-            shard = param.shape[0]
-            loaded_weight = loaded_weight.narrow(0, self.tp_rank * shard, shard)
-        param.data.copy_(loaded_weight)
+        # channels over the TP ranks
+        set_weight_attrs(self.weight, {"shard_dim": 0})
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # x: (num_tokens, dim); positions: (num_tokens,) absolute positions.

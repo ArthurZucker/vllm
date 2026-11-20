@@ -34,7 +34,10 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from vllm.model_executor.layers.quantization.input_hadamard import (
+    InputHadamardFusable,
     InputHadamardLinearMethod,
+    block_hadamard_rotate,
+    hadamard_matrix,
 )
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineLinearMethod,
@@ -97,6 +100,36 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 logger = init_logger(__name__)
+
+
+class _RotatedOnLoad(InputHadamardLinearMethod):
+    """An online linear method's weight rotated in its quantize op, right before
+    it is quantized (the loaded weight is already quantized)."""
+
+    def checkpoint_quantizer(self, layer: torch.nn.Module):
+        quantizer = self.quant_method.checkpoint_quantizer(layer)
+        quantize, scales, stacked = quantizer.targets["weight"]
+
+        def rotated(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            hadamard = hadamard_matrix(self.size, weight.device)
+            return quantize(block_hadamard_rotate(weight, hadamard))
+
+        quantizer.targets["weight"] = (rotated, scales, stacked)
+        return quantizer
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.quant_method.process_weights_after_loading(layer)
+        layer.input_hadamard_fused = isinstance(
+            self.quant_method, InputHadamardFusable
+        ) and self.quant_method.fuse_input_hadamard(layer, self.size)
+        if layer.input_hadamard_fused:
+            logger.info_once(
+                "%s rotates its input by the %d-wide Hadamard matrix itself.",
+                type(self.quant_method).__name__,
+                self.size,
+            )
+        else:
+            layer.input_hadamard = hadamard_matrix(self.size, layer.weight.device)
 
 
 class OnlineQuantizationSource(StrEnum):
@@ -534,7 +567,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
 
             assert issubclass(quant_method_cls, OnlineLinearBase)
             if quant_spec.hadamard_size is not None:
-                return InputHadamardLinearMethod(
+                return _RotatedOnLoad(
                     quant_method_cls(**kwargs),
                     quant_spec.hadamard_size,
                     rotate_weight=True,

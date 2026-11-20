@@ -12,6 +12,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     DeepGemmMegaMoEExperts,
 )
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.models.minimax_m3.nvidia.model import (
     MEGA_MOE_FC2_INPUT_SCALE,
     _redirect_fused_shared_experts,
@@ -56,8 +57,10 @@ def _load_checkpoint(moe, tensors: dict[str, torch.Tensor]) -> None:
     weights = _redirect_fused_shared_experts(tensors.items(), model)
     prefix = "layers.0.block_sparse_moe.experts."
     weights = ((name.removeprefix(prefix), tensor) for name, tensor in weights)
-    loaded = set(moe.experts.load_weights(weights))
+    loaded = load_with_ops(moe.experts, weights)
     assert loaded == {name for name, _ in moe.experts.named_parameters()}
+    # the kernel layout, laid out in place after loading
+    moe.experts.quant_method.process_weights_after_loading(moe.experts)
 
 
 def _fuse_experts(

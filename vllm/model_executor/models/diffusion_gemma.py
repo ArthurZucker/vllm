@@ -16,7 +16,7 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -58,8 +58,6 @@ from vllm.model_executor.models.gemma4_mm import (
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -152,16 +150,6 @@ class DiffusionGemmaForConditionalGeneration(
     In practice, the model's forward() dispatches based on the `mode` kwarg
     set by DiffusionGemmaModelState.prepare_inputs().
     """
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.decoder.self_conditioning.": "self_conditioning.",
-            "model.decoder.": "model.",
-            "model.encoder.language_model.": "model.",
-            "model.encoder.vision_tower.": "vision_tower.",
-            "model.encoder.embed_vision.": "embed_vision.",
-        },
-    )
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -355,13 +343,6 @@ class DiffusionGemmaForConditionalGeneration(
             else:
                 logits = torch.tanh(logits.float() / cap) * cap
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Some checkpoints carry a vestigial Gemma3n-style embedding table.
-        loader = AutoWeightsLoader(
-            self, ignore_unexpected_prefixes=["embed_vision.embedding."]
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

@@ -22,10 +22,8 @@ Triton combine. Both paths read the same weights in FlashInfer's layout (see
 `FlintMoEWeights.from_modelopt`).
 """
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 
-import regex as re
 import torch
 from torch import nn
 
@@ -780,11 +778,6 @@ def flint_moe(
     return out
 
 
-_EXPERT_PARAM = re.compile(
-    r"(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale|weight_scale_2)"
-)
-
-
 def _start_shared(
     shared: torch.Tensor | nn.Module,
     x: torch.Tensor,
@@ -874,8 +867,9 @@ class FlintNvfp4Experts(nn.Module):
     """Routed experts of one Flint MoE layer (NVFP4 GGUF checkpoints).
 
     Loads per-expert ModelOpt NVFP4 tensors (`{e}.{gate,up,down}_proj.
-    {weight, weight_scale, weight_scale_2}`) and, once every expert is loaded,
-    repacks them into `FlintMoEWeights` and frees the checkpoint layout.
+    {weight, weight_scale, weight_scale_2}`, its `conversion_mapping` entry) and,
+    after loading, repacks them into `FlintMoEWeights` and frees the checkpoint
+    layout.
     """
 
     def __init__(
@@ -899,47 +893,24 @@ class FlintNvfp4Experts(nn.Module):
 
         self.w13_weight = param(e, 2 * i, h // 2, dtype=torch.uint8)
         self.w13_weight_scale = param(e, 2 * i, h // 16, dtype=torch.float8_e4m3fn)
-        self.w13_weight_scale_2 = param(e, 2, dtype=torch.float32)
+        # gate and up share one global scale (`EqualSources` on load)
+        self.w13_weight_scale_2 = param(e, dtype=torch.float32)
         self.w2_weight = param(e, h, i // 2, dtype=torch.uint8)
         self.w2_weight_scale = param(e, h, i // 16, dtype=torch.float8_e4m3fn)
         self.w2_weight_scale_2 = param(e, dtype=torch.float32)
         self.register_buffer("route_counter", make_route_counter(), persistent=False)
-        self._loaded_names: set[str] = set()
         self._fork = torch.cuda.Event()
         self._join = torch.cuda.Event()
         self.weights: FlintMoEWeights | None = None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded: set[str] = set()
-        inter = self.w2_weight.shape[2] * 2
-        for name, w in weights:
-            m = _EXPERT_PARAM.fullmatch(name)
-            if m is None:
-                raise ValueError(f"Unexpected Flint expert weight: {name}")
-            e, proj, kind = int(m.group(1)), m.group(2), m.group(3)
-            param_name = ("w2_" if proj == "down_proj" else "w13_") + kind
-            param = getattr(self, param_name)
-            if proj == "down_proj":
-                param.data[e].copy_(w)
-            elif kind == "weight_scale_2":
-                param.data[e, int(proj == "up_proj")].copy_(w)
-            else:
-                rows = slice(inter, 2 * inter) if proj == "up_proj" else slice(inter)
-                param.data[e, rows].copy_(w)
-            loaded.add(param_name)
-            self._loaded_names.add(name)
-        if len(self._loaded_names) == 9 * self.num_experts:
-            self._repack()
-        return loaded
+    def process_weights_after_loading(self) -> None:
+        self._repack()
 
     def _repack(self) -> None:
-        gs = self.w13_weight_scale_2.data
-        if not torch.equal(gs[:, 0], gs[:, 1]):
-            raise ValueError("Flint NVFP4 gate/up global scales must match")
         self.weights = FlintMoEWeights.from_modelopt(
             self.w13_weight.data,
             self.w13_weight_scale.data,
-            gs[:, 0],
+            self.w13_weight_scale_2.data,
             self.w2_weight.data,
             self.w2_weight_scale.data,
             self.w2_weight_scale_2.data,

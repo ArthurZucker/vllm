@@ -67,8 +67,6 @@ from .minicpmv import (
 from .module_mapping import MultiModelKeys
 from .qwen3_5 import Qwen3_5ForCausalLM
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     flatten_bn,
     maybe_prefix,
@@ -1173,26 +1171,6 @@ class MiniCPMV4_6ForConditionalGeneration(
 ):
     supports_encoder_tp_data = True
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        },
-        orig_to_new_prefix={
-            # transformers v5.7+ uses `vision_tower` and nests `vit_merger`
-            # inside it. Order matters: more specific prefix must come first.
-            "model.vision_tower.vit_merger.": "vit_merger.",
-            "model.vision_tower.": "vpm.",
-            "model.vpm.": "vpm.",
-            "model.vit_merger.": "vit_merger.",
-            "model.merger.": "merger.",
-            "model.language_model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-            "mtp.": None,
-        },
-    )
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1512,16 +1490,6 @@ class MiniCPMV4_6ForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     # ----- Weight loading -----
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            _stack_vit_merger_qkv(weights),
-            mapper=self.hf_to_vllm_mapper,
-        )
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(

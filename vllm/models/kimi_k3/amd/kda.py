@@ -28,8 +28,6 @@ from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     _KDA_GATE_LOGBOUND_MIN,
     _KimiGDNMergedColumnParallelLinear,
-    _make_fused_conv1d_weight_loader,
-    a_log_weight_loader,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
@@ -41,7 +39,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.amd.kda_metadata import (
     PREFILL_CONV_BLOCK_M,
@@ -175,7 +172,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.dt_bias = nn.Parameter(
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -187,7 +184,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        delattr(self.conv1d.weight, "weight_loader")
+        # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+        self.conv1d.shard_ids = (0, 1, 2)
         # ROCm can fuse the whole decode step (conv + recurrence + gated norm)
         # into one kernel, which wants a width-major fp32 conv weight staged at
         # load time. Everything else keeps the [channel, width] layout.
@@ -230,17 +228,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.register_buffer(
             "decode_conv1d_weight", decode_conv1d_weight, persistent=False
         )
-        conv1d_weight_loader = _make_fused_conv1d_weight_loader(
-            [self.projection_size] * 3,
-            self.tp_size,
-            self.tp_rank,
-        )
-        set_weight_attrs(self.conv1d.weight, {"weight_loader": conv1d_weight_loader})
+        set_weight_attrs(self.conv1d.weight, {"shard_dim": 0})
 
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
 
         self.gate_lower_bound: float | None = kda_config.get("gate_lower_bound", None)
         if self.gate_lower_bound is not None:

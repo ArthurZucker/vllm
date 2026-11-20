@@ -58,12 +58,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     selective_state_update_replayssm_flashinfer,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import (
-    LoaderFunction,
-    composed_weight_loader,
-    sharded_weight_loader,
-)
-from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.model_loader.weight_ops import NegExp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -114,7 +109,7 @@ class Mixer2RMSNormGated(CustomOp):
         if self.use_rms_norm:
             # Register norm weight only if we're actually applying RMSNorm
             self.weight = nn.Parameter(torch.ones(self.per_rank_hidden_size))
-            set_weight_attrs(self.weight, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(self.weight, {"shard_dim": 0})
         else:
             # Avoid checkpoint mismatch by skipping unused parameter
             self.register_parameter("weight", None)
@@ -203,67 +198,6 @@ class Mixer2RMSNormGated(CustomOp):
         return self.forward_cuda(x, gate)
 
 
-def mamba_v2_sharded_weight_loader(
-    shard_spec: list[tuple[int, int, float]],
-    tp_size: int,
-    tp_rank: int,
-) -> LoaderFunction:
-    """Create a weight loader for mamba v2. This ensures that the projections
-    are correctly sharded so that they can be split into x, B, C. It also
-    ensures that all the groups corresponding to a head shard is placed
-    together with it.
-    """
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        # - track boundary of (sharded) param, and loaded_weight, respectively
-        boundary, loaded_boundary = 0, 0
-
-        # - iterate over the shard specs
-        for full_dim, extra, duplicate_groups in shard_spec:
-            # - full dim is the model dim (before TP).
-            # - extra > 0, means there is expected overall increase
-            #   of dimensions. This is so because of replication.
-            # - ratio is used map the tp_rank to the actual shard
-            #   rank. This is useful when there is replication of
-            #   groups to accompany head shards.
-
-            # - size of the loaded shard
-            shard_size = full_dim // tp_size
-
-            # - compute the rank into the loaded shard.
-            # - if there is replication, different TP shards will
-            #   take from the same rank.
-            # NOTE: currently we only support duplication
-            # in the case where num_groups == 1
-            rank = 0 if duplicate_groups else tp_rank
-
-            # - leftmost boundary index into loaded weight.
-            loaded_skip = rank * shard_size
-            loaded_start_idx = loaded_boundary + loaded_skip
-
-            # - take these many dims from the loaded weight.
-            take = min(shard_size, full_dim - extra - loaded_skip)
-
-            # - always shard on dim 0
-            # - the ignore is for a mundane mypy error as it does not
-            #   seem to handle slices well.
-            # https://github.com/python/mypy/issues/2410
-            target_slice = param.data[boundary : (boundary + take), ...]
-            param.data[
-                boundary : (boundary + take), ...  # type: ignore[misc]
-            ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
-            ].view_as(target_slice)
-
-            # move indexing boundaries
-            boundary += shard_size
-            loaded_boundary += full_dim - extra
-
-    return loader
-
-
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
 # --8<-- [start:mamba_mixer2]
 @PluggableLayer.register("mamba_mixer2")
@@ -315,7 +249,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         self.tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
 
         assert num_heads % self.tp_size == 0, (
             "Tensor parallel world size must divide num heads."
@@ -398,7 +331,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             # - because in_proj is a concatenation of 3 weights, we
             #   need to interleave them before sharding
-            # - use the custom weight loader mamba_v2_sharded_weight_loader
+            # - shard them segment by segment (`shard_segments`)
             #   for conv1d.bias, covn1d.weight and in_proj.weight
             # - need to set these settings, to assign the groups
             #   to the head shards
@@ -410,73 +343,23 @@ class MambaMixer2(MambaBase, PluggableLayer):
             intermediate_settings = (intermediate_size, 0, False)
             head_settings = (self.num_heads, 0, False)
 
-            # - the weight already has a "weight_loader" attribute
-            #   which set_weight_attrs will raise if we do not
-            #   delete before trying to override it
-            # - ditto for the other two weights below
-            delattr(self.conv1d.bias, "weight_loader")
-            set_weight_attrs(
-                self.conv1d.bias,
-                {
-                    "weight_loader": mamba_v2_sharded_weight_loader(
-                        [
-                            intermediate_settings,
-                            group_shard_settings,
-                            group_shard_settings,
-                        ],
-                        self.tp_size,
-                        tp_rank,
-                    )
-                },
-            )
-
-            delattr(self.conv1d.weight, "weight_loader")
-            set_weight_attrs(
-                self.conv1d.weight,
-                {
-                    "weight_loader": mamba_v2_sharded_weight_loader(
-                        [
-                            intermediate_settings,
-                            group_shard_settings,
-                            group_shard_settings,
-                        ],
-                        self.tp_size,
-                        tp_rank,
-                    )
-                },
-            )
-
-            # Create the custom weight loader for Mamba sharding with group
-            # replication. This handles the interleaved projections correctly.
-            mamba_loader = mamba_v2_sharded_weight_loader(
-                [
-                    intermediate_settings,  # for gate
-                    intermediate_settings,
-                    group_shard_settings,
-                    group_shard_settings,
-                    head_settings,  # for dt
-                ],
-                self.tp_size,
-                tp_rank,
-            )
-
-            # Apply the custom weight loader to in_proj.weight and its scales.
-            # Works for both non-quantized (Parameter) and quantized
-            # (ModelWeightParameter which extends BasevLLMParameter)
-            for attr_name in ("weight", "weight_scale", "input_scale"):
-                param = getattr(self.in_proj, attr_name, None)
+            # The projections are concatenations sharded segment by segment, the
+            # single group replicated to every rank (`ops_loader.VllmShard`)
+            conv_segments = [intermediate_settings, *[group_shard_settings] * 2]
+            for param in (self.conv1d.weight, self.conv1d.bias):
                 if param is not None:
-                    if isinstance(param, BasevLLMParameter):
-                        param.weight_loader = mamba_loader
-                    else:
-                        if hasattr(param, "weight_loader"):
-                            delattr(param, "weight_loader")
-                        set_weight_attrs(param, {"weight_loader": mamba_loader})
+                    param.shard_segments = conv_segments
+            in_proj_segments = [
+                intermediate_settings,  # gate
+                intermediate_settings,
+                *[group_shard_settings] * 2,
+                head_settings,  # dt
+            ]
+            for attr_name in ("weight", "weight_scale", "input_scale"):
+                if (param := getattr(self.in_proj, attr_name, None)) is not None:
+                    param.shard_segments = in_proj_segments
 
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
-        # Can't do this in `weight_loader` since it already exists in
-        # `ColumnParallelLinear` and `MergedColumnParallelLinear`,
-        # and `set_weight_attrs` doesn't allow to override it
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -495,12 +378,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.dt_bias = nn.Parameter(torch.ones(num_heads // self.tp_size))
         self.use_rms_norm = use_rms_norm
 
-        set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
-        a_weight_loader = composed_weight_loader(
-            sharded_weight_loader(0), lambda x: -torch.exp(x.float())
-        )
-        set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.D, {"shard_dim": 0})
+        set_weight_attrs(self.A, {"shard_dim": 0, "load_ops": [NegExp()]})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         self.out_proj = RowParallelLinear(
             intermediate_size,

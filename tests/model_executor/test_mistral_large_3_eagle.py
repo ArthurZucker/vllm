@@ -11,6 +11,7 @@ from transformers import DeepseekV2Config
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.models import deepseek_v2 as deepseek_mod
 from vllm.model_executor.models import mistral_large_3_eagle as eagle_mod
 
@@ -173,5 +174,5 @@ def test_eagle_mistral_large3_loads_weights(tmp_path: Path):
     with set_current_vllm_config(vllm_config):
         model = eagle_mod.EagleMistralLarge3Model(vllm_config=vllm_config)
         weight = torch.arange(config.hidden_size, dtype=model.norm.weight.dtype)
-        assert model.load_weights([("norm.weight", weight)]) == {"norm.weight"}
+        assert load_weights(model, iter([("norm.weight", weight)])) == {"norm.weight"}
         torch.testing.assert_close(model.norm.weight, weight, rtol=0, atol=0)

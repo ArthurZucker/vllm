@@ -3,6 +3,7 @@
 """Inference-only Qwen4Exp model."""
 
 from collections.abc import Iterable
+from functools import partial
 from itertools import islice
 
 import torch
@@ -42,7 +43,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
-    Qwen3_5Model,
 )
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
@@ -55,16 +55,13 @@ from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLProcessingInfo,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     StageMissingLayer,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
     make_layers,
-    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
@@ -76,6 +73,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
+from ..common.ngram_embedding import ple_table_shards
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.sequence_parallel import sp_reduce_scatter, sp_shard
@@ -96,42 +94,6 @@ def without_modelopt_fp4(
     return quant_config
 
 
-def _remap_qsa_cache_scale_name(
-    name: str,
-    qsa_layer_ids: frozenset[int],
-) -> str:
-    """Map serialized main-cache scales onto the merged QSA owner.
-
-    Regular attention keeps cache scales below its `attn` child. QSA owns
-    that cache directly, so only QSA layers need the final path component
-    moved to the owner's persistent `_k_scale`/`_v_scale` buffers.
-    """
-    scale_suffixes = {
-        "k_proj.k_scale": "_k_scale",
-        "k_proj.output_scale": "_k_scale",
-        "attn.k_scale": "_k_scale",
-        "attn._k_scale": "_k_scale",
-        "k_scale": "_k_scale",
-        "_k_scale": "_k_scale",
-        "v_proj.v_scale": "_v_scale",
-        "v_proj.output_scale": "_v_scale",
-        "attn.v_scale": "_v_scale",
-        "attn._v_scale": "_v_scale",
-        "v_scale": "_v_scale",
-        "_v_scale": "_v_scale",
-    }
-    for layer_id in qsa_layer_ids:
-        marker = f"layers.{layer_id}.self_attn."
-        marker_start = name.find(marker)
-        if marker_start < 0 or (marker_start > 0 and name[marker_start - 1] != "."):
-            continue
-        suffix = name[marker_start + len(marker) :]
-        mapped_suffix = scale_suffixes.get(suffix)
-        if mapped_suffix is not None:
-            return f"{name[: marker_start + len(marker)]}{mapped_suffix}"
-    return name
-
-
 _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     ".bias",
     "_bias",
@@ -142,23 +104,6 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_weight_scale",
     "_input_scale",
 ]
-
-# The checkpoint stores these projections separately; runtime packs each group
-# into adjacent logical shards of a MergedColumnParallelLinear.
-_EXTRA_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_stacked={
-        "hyper_connection.input_mix_weight_down.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            0,
-        ),
-        "hyper_connection.block_inject_weight.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            1,
-        ),
-        "ple.key_proj": ("ple.kv_proj", 0),
-        "ple.value_proj": ("ple.kv_proj", 1),
-    }
-)
 
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
@@ -407,8 +352,6 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     }
 )
 class Qwen4ExpModel(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -608,49 +551,6 @@ class Qwen4ExpModel(nn.Module):
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
         return sample_hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = (
-            (
-                _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
-                weight,
-            )
-            for name, weight in weights
-        )
-        weights = maybe_fuse_shared_experts(
-            weights,
-            fused_shared_expert_layers=self.fused_shared_expert_layers,
-            n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
-            n_shared_experts=1,
-            ckpt_prefix="mlp.shared_expert",
-        )
-        # Non-persistent PLE state rebuilt in __init__; skip any ckpt
-        # column for them.
-        skip_substrs = (
-            "hashstats_",
-            "token_lookup",
-            "hyper_connection_mixer.block_inject_weight",
-        )
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={substr: None for substr in skip_substrs}
-        )
-        # The final HC mixer only exists on the last PP rank; earlier ranks
-        # must drop its checkpoint weights instead of failing to place them.
-        ignore_prefixes = (
-            None
-            if self.hyper_connection_mixer is not None
-            else ["hyper_connection_mixer."]
-        )
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=ignore_prefixes,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
-        )
-        loaded = loader.load_weights(
-            weights,
-            mapper=mapper,
-        )
-        return loaded
-
 
 class Qwen4ExpForCausalLM(
     nn.Module,
@@ -674,9 +574,6 @@ class Qwen4ExpForCausalLM(
             "_input_mix_padding",
         ],
     }
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.language_model.": "model."}
-    )
     requires_raw_input_tokens = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -704,6 +601,8 @@ class Qwen4ExpForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
+        # the n-gram tables' row shards, as one table
+        self.checkpoint_transforms = [partial(ple_table_shards, self)]
         enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
 
     @staticmethod
@@ -868,16 +767,6 @@ class Qwen4ExpForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None}
-        )
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
-        )
-        return loader.load_weights(weights, mapper=mapper)
-
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self) -> Qwen4ExpConfig:
@@ -992,6 +881,8 @@ class Qwen4ExpForConditionalGeneration(
                 "len(deepstack_visual_indexes)"
             )
         self.set_moe_parameters(self.language_model.model.layers)
+        # the n-gram tables' row shards, as one table
+        self.checkpoint_transforms = [partial(ple_table_shards, self)]
 
     def embed_input_ids(
         self,
@@ -1065,17 +956,6 @@ class Qwen4ExpForConditionalGeneration(
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None},
-            orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
-        )
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
-        )
-        return loader.load_weights(weights, mapper=mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

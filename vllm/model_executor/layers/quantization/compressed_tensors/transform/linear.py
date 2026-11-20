@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable, Generator
+from collections.abc import Generator
 from itertools import accumulate
 
 import torch
@@ -12,10 +12,7 @@ from compressed_tensors.transform import (
 )
 from compressed_tensors.utils import is_match
 
-from vllm.model_executor.layers.linear import (
-    WEIGHT_LOADER_V2_SUPPORTED,
-    LinearMethodBase,
-)
+from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsScheme,
 )
@@ -81,18 +78,6 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
         # The transform must see the raw activation, before any quantization
         layer.requires_unquantized_input = bool(self.input_tfms)
 
-        # get weight loader for transforms
-        weight_loader: Callable = extra_weight_attrs.get("weight_loader")  # type: ignore[assignment]
-
-        # HACK: UnquantizedLinearMethod does not support weight loader v2, but
-        # transforms (specifically SharedWeightParameter) requires
-        # weight loader v2. Until UnquantizedLinearMethod supports v2, we must
-        # hack around this by getting weight loader v1 so ULM can load correctly
-        quant_method_name = self.quant_method.__class__.__name__
-        if quant_method_name not in WEIGHT_LOADER_V2_SUPPORTED:
-            weight_loader_v1 = layer.weight_loader
-            extra_weight_attrs["weight_loader"] = weight_loader_v1
-
         self.quant_method.create_weights(
             layer=layer,
             input_size_per_partition=input_size_per_partition,
@@ -116,7 +101,6 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
             transform = HadamardTransform(
                 self.input_tfms,
                 layer,
-                weight_loader,
                 input_size_per_partition,
                 output_partition_sizes,
             )
@@ -131,7 +115,6 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
             transform = HadamardTransform(
                 self.output_tfms,
                 layer,
-                weight_loader,
                 input_size_per_partition,
                 output_partition_sizes,
             )

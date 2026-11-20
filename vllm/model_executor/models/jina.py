@@ -5,6 +5,7 @@ import json
 import logging
 from collections import defaultdict
 from collections.abc import Iterable
+from functools import partial
 
 import torch
 from safetensors.torch import load as safetensors_load
@@ -31,9 +32,7 @@ from .interfaces_base import VllmModelForPooling
 from .llama import LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM, Qwen3Model
 from .utils import (
-    AutoWeightsLoader,
     StageMissingLayer,
-    WeightsMapper,
     maybe_prefix,
     no_init_weights,
 )
@@ -43,8 +42,6 @@ logger = logging.getLogger(__name__)
 
 class JinaForRanking(nn.Module, SupportsLateInteraction):
     is_pooling_model = True
-
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"lm_head.": None})
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -88,10 +85,6 @@ class JinaForRanking(nn.Module, SupportsLateInteraction):
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class JinaForRankingPool(StepPool):
@@ -228,53 +221,28 @@ def _setup_jina_v5_task_and_pooler(model: nn.Module, vllm_config: VllmConfig) ->
     pooler_config = vllm_config.model_config.pooler_config
     assert pooler_config is not None
     model.pooler = DispatchPooler.for_embedding(pooler_config)
+    model.checkpoint_transforms = [partial(_merge_task_lora, model)]
 
 
-def _load_jina_v5_weights(
+def _merge_task_lora(
     model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
-) -> set[str]:
-    """Shared loader: merge the selected task LoRA adapter into the base weights."""
-    lora_pairs: dict[str, dict[str, torch.Tensor]] = {}
-    scaling = 1.0
-
-    result = _load_adapter(model._model_name, model._task, model._revision)
-    if result is None:
-        logger.warning(
-            "No adapter found for task %r in %r. Loading raw base weights.",
-            model._task,
-            model._model_name,
-        )
-    else:
-        adapter_config, adapter_weights = result
-        scaling = adapter_config["lora_alpha"] / adapter_config["r"]
-        lora_pairs = _build_lora_pairs(adapter_weights)
-        logger.info(
-            "Loaded %d adapter tensors for task %r (scaling=%.4f, %d LoRA pairs)",
-            len(adapter_weights),
-            model._task,
-            scaling,
-            len(lora_pairs),
-        )
-
-    def _merge_weights(
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for name, tensor in weights:
-            clean_name = name
-            if clean_name.startswith("model."):
-                clean_name = clean_name[len("model.") :]
-
-            if clean_name in lora_pairs:
-                pair = lora_pairs[clean_name]
-                if "A" in pair and "B" in pair:
-                    lora_A = pair["A"].to(device=tensor.device, dtype=tensor.dtype)
-                    lora_B = pair["B"].to(device=tensor.device, dtype=tensor.dtype)
-                    tensor = tensor + (lora_B @ lora_A) * scaling
-            yield name, tensor
-
-    loader = AutoWeightsLoader(model, ignore_unexpected_prefixes=["lm_head."])
-    weights = _merge_weights(weights)
-    return loader.load_weights(weights, mapper=model.hf_to_vllm_mapper)
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The selected task's LoRA adapter merged into the base weights (`W + B A s`)"""
+    adapter = _load_adapter(model._model_name, model._task, model._revision)
+    if adapter is None:
+        logger.warning("No adapter for task %r: raw base weights", model._task)
+        yield from weights
+        return
+    config, adapter_weights = adapter
+    scaling = config["lora_alpha"] / config["r"]
+    pairs = _build_lora_pairs(adapter_weights)
+    for name, tensor in weights:
+        pair = pairs.get(name.removeprefix("model."), {})
+        if "A" in pair and "B" in pair:
+            tensor = tensor if isinstance(tensor, torch.Tensor) else tensor[...]
+            a, b = (pair[k].to(tensor.device, tensor.dtype) for k in ("A", "B"))
+            tensor = tensor + (b @ a) * scaling
+        yield name, tensor
 
 
 class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):
@@ -285,9 +253,6 @@ class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):
     """
 
     is_pooling_model = True
-    hf_to_vllm_mapper = Qwen3ForCausalLM.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={"": "model."}
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         with no_init_weights(
@@ -297,9 +262,6 @@ class JinaEmbeddingsV5DecoderModel(Qwen3ForCausalLM, VllmModelForPooling):
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _setup_jina_v5_task_and_pooler(self, vllm_config)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_jina_v5_weights(self, weights)
 
 
 class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
@@ -312,9 +274,6 @@ class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
     """
 
     is_pooling_model = True
-    hf_to_vllm_mapper = LlamaForCausalLM.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={"": "model."}
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         with no_init_weights(
@@ -324,9 +283,6 @@ class JinaEmbeddingsV5EncoderModel(LlamaForCausalLM, VllmModelForPooling):
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _setup_jina_v5_task_and_pooler(self, vllm_config)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_jina_v5_weights(self, weights)
 
 
 class JinaEmbeddingsV5Model(JinaEmbeddingsV5DecoderModel):

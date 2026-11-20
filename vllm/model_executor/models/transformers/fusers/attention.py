@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from torch import fx, nn
 
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.models.transformers.fusers.base import BaseFuser
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -126,7 +125,7 @@ class AttentionFuser(BaseFuser):
             device = vllm_config.device_config.device
             data = torch.empty(size, dtype=sinks.dtype, device=device)
             sinks_param = nn.Parameter(data, requires_grad=False)
-            set_weight_attrs(sinks_param, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(sinks_param, {"shard_dim": 0})
             setattr(module, self.s_aux_expr.attr, sinks_param)
         return module
 

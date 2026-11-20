@@ -54,7 +54,7 @@ def test_shared_weight_partitions_are_hashed_and_reset(monkeypatch):
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
     model = nn.Module()
-    model.transform = parameter.SharedWeightParameter(weight_loader=None)
+    model.transform = parameter.SharedWeightParameter()
     model.transform.add_partition(0, object(), 2, 2)
     model.transform.partitions[0].data.fill_(3.0)
 

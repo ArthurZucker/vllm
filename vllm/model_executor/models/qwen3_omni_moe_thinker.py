@@ -22,7 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-Omni-Moe model (thinker part)."""
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Any, ClassVar
 
@@ -124,9 +124,7 @@ from .qwen2_5_vl import (
 )
 from .qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
 from .utils import (
-    AutoWeightsLoader,
     StageMissingLayer,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
 )
@@ -360,14 +358,6 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
 class Qwen3OmniMoeAudioEncoder(nn.Module):
     """vLLM-native Qwen3-Omni Audio Encoder."""
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj.": (".self_attn.qkv_proj.", "q"),
-            ".self_attn.k_proj.": (".self_attn.qkv_proj.", "k"),
-            ".self_attn.v_proj.": (".self_attn.qkv_proj.", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: Qwen3OmniMoeAudioEncoderConfig,
@@ -577,10 +567,6 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             lengths = (lengths - 1) // 2 + 1
         return lengths
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class Qwen3_VisionPatchEmbed(nn.Module):
     def __init__(
@@ -757,14 +743,6 @@ class Qwen3_VisionPatchMerger(nn.Module):
 
 
 class Qwen3Omni_VisionTransformer(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".attn.q.": (".attn.qkv.", "q"),
-            ".attn.k.": (".attn.qkv.", "k"),
-            ".attn.v.": (".attn.qkv.", "v"),
-        }
-    )
-
     def __init__(
         self,
         vision_config,
@@ -1063,10 +1041,6 @@ class Qwen3Omni_VisionTransformer(nn.Module):
             )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
 
         return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @support_torch_compile(
@@ -1617,18 +1591,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     is_3d_moe_weight: ClassVar[bool] = True
     supports_mm_device_do_normalize = True
     supports_tower_connector_lora: ClassVar[bool] = True
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "thinker.lm_head.": "language_model.lm_head.",
-            "thinker.model.": "language_model.model.",
-            "thinker.": "",
-            "talker.": None,
-            "code2wav.": None,
-            # Adapter trained/saved directly from the thinker model
-            "model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1993,12 +1955,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-        return loaded_weights
 
     def _compute_audio_token_count(self, audio_feature_length: int) -> int:
         """Compute audio tokens from feature length using Qwen3-Omni formula."""

@@ -18,7 +18,6 @@ Checkpoint options select the trained variant:
   `sliding_window` context tokens before the anchor plus their whole block.
 """
 
-from collections.abc import Iterable
 
 import regex as re
 import torch
@@ -28,13 +27,11 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import get_draft_quant_config, maybe_prefix
 from vllm.models.mistral.common.layer_spec import MistralLayerSpec
 from vllm.models.mistral.common.rope import MistralRotaryEmbedding
 from vllm.models.mistral.mistral_large4.nvidia.model import (
-    _STACKED_PARAMS,
     MistralLarge4DecoderLayer,
     _to_vllm_weight_name,
 )
@@ -349,40 +346,3 @@ class MistralLarge4DSparkForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.markov_logits_processor)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.named_parameters())
-        loaded: set[str] = set()
-        for ckpt_name, weight in weights:
-            if not ckpt_name.startswith(_DSPARK_PREFIX):
-                continue
-            name = _to_draft_weight_name(ckpt_name)
-            for param_part, ckpt_part, shard_id in _STACKED_PARAMS:
-                if ckpt_part not in name:
-                    continue
-                name = name.replace(ckpt_part, param_part)
-                param = params[name]
-                if shard_id < 0:
-                    param.weight_loader(param, weight)
-                else:
-                    param.weight_loader(param, weight, shard_id)
-                break
-            else:
-                if name not in params:
-                    raise ValueError(f"Unexpected DSpark weight: {ckpt_name}")
-                param = params[name]
-                getattr(param, "weight_loader", default_weight_loader)(param, weight)
-            loaded.add(name)
-
-        # A missing mask or head would silently serve zeros.
-        required = {"model.mask_embedding"}
-        if self.model.target_projection is not None:
-            required.add("model.target_projection.weight")
-        if self.model.joint_proj is not None:
-            required |= {
-                name
-                for name in params
-                if name.startswith(("model.markov_head.", "model.joint_proj."))
-            }
-        if missing := required - loaded:
-            raise ValueError(f"DSpark checkpoint is missing {sorted(missing)}")
-        return loaded

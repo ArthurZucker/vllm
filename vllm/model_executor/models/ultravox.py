@@ -5,7 +5,7 @@
 """PyTorch Ultravox model."""
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
 import numpy as np
@@ -56,8 +56,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
@@ -65,7 +63,6 @@ from .utils import (
 from .whisper import (
     WhisperEncoder,
     WhisperEncoderLayer,
-    _create_fake_bias_for_k_proj,
 )
 
 _AUDIO_PLACEHOLDER_OVERRIDE = "<|audio|>"
@@ -377,27 +374,6 @@ def _build_chunk_attn_metadata(
     }
 
 
-# Maps HF whisper encoder layer names to vLLM's fused qkv_proj and nested
-# mlp; `_create_fake_bias_for_k_proj` supplies the fused bias' k-slice
-# (HF whisper k_proj has no bias).
-_WHISPER_ENCODER_MAPPER = WeightsMapper(
-    orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."},
-    orig_to_new_stacked={
-        ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-        ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-        ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-    },
-)
-
-
-def _load_whisper_layer_weights(
-    module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
-) -> set[str]:
-    weights = _create_fake_bias_for_k_proj(weights, ".self_attn.k_proj.weight")
-    loader = AutoWeightsLoader(module)
-    return loader.load_weights(weights, mapper=_WHISPER_ENCODER_MAPPER)
-
-
 class UltravoxFeedForwardProjector(nn.Module):
     def __init__(
         self,
@@ -541,9 +517,6 @@ class UltravoxTransformerProjector(nn.Module):
         hidden_states, _ = self.linear_out(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_whisper_layer_weights(self, weights)
-
 
 class UltravoxWhisperEncoder(WhisperEncoder):
     """Ultravox's `ModifiedWhisperEncoder` on top of vLLM's `WhisperEncoder`.
@@ -609,9 +582,6 @@ class UltravoxWhisperEncoder(WhisperEncoder):
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return _load_whisper_layer_weights(self, weights)
-
 
 @MULTIMODAL_REGISTRY.register_processor(
     UltravoxMultiModalProcessor,
@@ -623,16 +593,6 @@ class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "audio_tower.model.encoder.": "audio_tower.",
-            # A whisper checkpoint loaded via `audio_model_id` also carries
-            # decoder and LM-head weights the tower does not use.
-            "audio_tower.model.": None,
-            "audio_tower.proj_out.": None,
-        }
-    )
 
     supports_tower_connector_lora = True
 
@@ -942,10 +902,6 @@ class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 def pad_and_concat_to_dim3(

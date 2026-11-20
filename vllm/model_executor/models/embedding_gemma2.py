@@ -3,12 +3,12 @@
 """EmbeddingGemma2: bidirectional Gemma4-derived multimodal embedding model."""
 
 import dataclasses
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import torch
 from torch import nn
-from transformers import AutoModel, BatchFeature, PreTrainedConfig
+from transformers import AutoModel, BatchFeature
 from transformers.models.embedding_gemma2.configuration_embedding_gemma2 import (
     EmbeddingGemma2Config,
     EmbeddingGemma2TextConfig,
@@ -57,8 +57,6 @@ from vllm.model_executor.models.transformers.utils import (
     recursive_replace_linear,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -953,25 +951,6 @@ class EmbeddingGemma2MultiModalProcessor(Gemma4MultiModalProcessor):
         return prompt_updates
 
 
-def _embedding_gemma2_weights_mapper(
-    config_or_layers: PreTrainedConfig | int | None = None,
-) -> WeightsMapper:
-    return WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj.weight": (".self_attn.qkv_proj.weight", "q"),
-            ".self_attn.k_proj.weight": (".self_attn.qkv_proj.weight", "k"),
-            ".self_attn.v_proj.weight": (".self_attn.qkv_proj.weight", "v"),
-            ".self_attn.q_proj.bias": (".self_attn.qkv_proj.bias", "q"),
-            ".self_attn.k_proj.bias": (".self_attn.qkv_proj.bias", "k"),
-            ".self_attn.v_proj.bias": (".self_attn.qkv_proj.bias", "v"),
-            ".mlp.gate_proj.weight": (".mlp.gate_up_proj.weight", 0),
-            ".mlp.up_proj.weight": (".mlp.gate_up_proj.weight", 1),
-            ".mlp.gate_proj.bias": (".mlp.gate_up_proj.bias", 0),
-            ".mlp.up_proj.bias": (".mlp.gate_up_proj.bias", 1),
-        }
-    )
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     EmbeddingGemma2MultiModalProcessor,
     info=EmbeddingGemma2ProcessingInfo,
@@ -983,7 +962,6 @@ class EmbeddingGemma2Model(nn.Module, SupportsMultiModal, VllmModelForPooling):
 
     is_pooling_model = True
 
-    hf_to_vllm_mapper = _embedding_gemma2_weights_mapper()
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1036,7 +1014,6 @@ class EmbeddingGemma2Model(nn.Module, SupportsMultiModal, VllmModelForPooling):
         self.multimodal_config = multimodal_config
         self.model_dtype = vllm_config.model_config.dtype
         self.vllm_config = vllm_config
-        self.hf_to_vllm_mapper = _embedding_gemma2_weights_mapper(config)
         lora_config = vllm_config.lora_config
         self._enable_mm_lora = bool(
             lora_config is not None and lora_config.enable_tower_connector_lora
@@ -1124,20 +1101,6 @@ class EmbeddingGemma2Model(nn.Module, SupportsMultiModal, VllmModelForPooling):
         **kwargs: object,
     ) -> torch.Tensor:
         return self.language_model(input_ids, positions, inputs_embeds=inputs_embeds)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        ignore_prefixes = [
-            "embed_vision.embedding.",
-            "embed_audio.embedding.",
-        ]
-        if self.audio_tower is None:
-            ignore_prefixes.extend(["audio_tower.", "embed_audio."])
-        if self.vision_tower is None:
-            ignore_prefixes.extend(["vision_tower.", "embed_vision."])
-        return AutoWeightsLoader(
-            self,
-            ignore_unexpected_prefixes=ignore_prefixes,
-        ).load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int = 0) -> str | None:

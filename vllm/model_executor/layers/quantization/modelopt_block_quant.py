@@ -21,7 +21,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
-    register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -153,58 +152,10 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
                 ),
             ),
         ):
-            layer.register_parameter(
-                name,
-                ModelWeightParameter(
-                    data=torch.empty(shape, dtype=torch.uint8),
-                    input_dim=2,
-                    output_dim=1,
-                    weight_loader=self.weight_loader,
-                ),
+            param = ModelWeightParameter(
+                data=torch.empty(shape, dtype=torch.uint8), input_dim=2, output_dim=1
             )
-
-    def weight_loader(
-        self,
-        param,
-        loaded_weight,
-        weight_name,
-        shard_id,
-        expert_id,
-        return_success=False,
-    ):
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(f"invalid Block-quantized expert projection: {shard_id}")
-        if not self.gated and shard_id == "w3":
-            raise ValueError("non-gated Block-quantized experts have no w3 projection")
-        local_i = self.moe.intermediate_size_per_partition
-        global_i = local_i * self.moe.moe_parallel_config.tp_size
-        hidden = self.moe.hidden_dim
-        expected = (
-            (hidden, global_i // self.block_size, self.block_bytes)
-            if shard_id == "w2"
-            else (global_i, hidden // self.block_size, self.block_bytes)
-        )
-        if loaded_weight.dtype != torch.uint8 or tuple(loaded_weight.shape) != expected:
-            raise ValueError(
-                f"invalid packed tensor {weight_name}: expected uint8{expected}, "
-                f"got {loaded_weight.dtype}{tuple(loaded_weight.shape)}"
-            )
-        if not 0 <= expert_id < param.shape[0]:
-            raise ValueError(f"invalid Block-quantized expert index: {expert_id}")
-        destination = param.data[expert_id]
-        if shard_id == "w2":
-            source = loaded_weight.narrow(
-                1,
-                self.moe.tp_rank * (local_i // self.block_size),
-                local_i // self.block_size,
-            )
-        else:
-            source = loaded_weight.narrow(0, self.moe.tp_rank * local_i, local_i)
-            destination = destination.narrow(
-                0, 0 if shard_id == "w1" else local_i, local_i
-            )
-        destination.copy_(source)
-        return True if return_success else None
+            layer.register_parameter(name, param)
 
     def get_fused_moe_quant_config(self, layer):
         return FusedMoEQuantConfig(
@@ -252,10 +203,6 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         )
 
 
-ModelOptBlockQuantMoEMethod.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
-
-
-@register_weight_loader_v2_supported_method
 class ModelOptBlockQuantLinearMethod(LinearMethodBase):
     """Load native block payloads and execute the prepared b12x dense API."""
 
@@ -312,7 +259,6 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=extra_weight_attrs["weight_loader"],
             ),
         )
 

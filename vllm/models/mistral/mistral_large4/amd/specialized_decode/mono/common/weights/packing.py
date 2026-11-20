@@ -51,19 +51,6 @@ def pack_ptpc_fp8(q: torch.Tensor) -> torch.Tensor:
     return values.permute(*order).contiguous().view(-1)
 
 
-def pack_mxfp8_weight(q: torch.Tensor) -> torch.Tensor:
-    """Preshuffle row-major MXFP8 weights for gfx950 scaled MFMA GEMM."""
-    if q.ndim != 2:
-        raise ValueError(f"MXFP8 packing expects a matrix, got shape {tuple(q.shape)}")
-    rows, k = q.shape
-    if rows % 16 or k % 64:
-        raise ValueError(
-            f"MXFP8 matrix dimensions must be divisible by (16, 64), got {(rows, k)}"
-        )
-    values = q.view(torch.uint8).reshape(rows // 16, 16, k // 64, 4, 16)
-    return values.permute(0, 2, 3, 1, 4).contiguous().view(-1)
-
-
 def pack_mxfp8_scale(scale: torch.Tensor) -> torch.Tensor:
     """Preshuffle per-1x32 E8M0 scales in the ATOM/AITER layout."""
     scale = scale.view(torch.uint8)

@@ -43,7 +43,6 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointExporter,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
@@ -68,9 +67,6 @@ from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.utils import cuda_unquantized_gemm
-from vllm.model_executor.model_loader.weight_utils import (
-    sharded_weight_loader,
-)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
@@ -785,15 +781,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
-        self.conv1d.weight.weight_loader = mamba_v2_sharded_weight_loader(
-            [
-                query_key_settings,
-                query_key_settings,
-                value_settings,
-            ],
-            self.tp_size,
-            self.tp_rank,
-        )
+        self.conv1d.weight.shard_segments = [
+            query_key_settings,
+            query_key_settings,
+            value_settings,
+        ]
 
         # selective projection used to make dt, B and C input dependent
 
@@ -809,8 +801,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         output_gate_type = getattr(config, "output_gate_type", "silu")
         if output_gate_type == "swish":

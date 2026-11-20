@@ -7,7 +7,7 @@ or all sliding). The draft checkpoint shares token embedding and lm_head
 weights with the target model through the generic spec-decode proposer.
 """
 
-from collections.abc import Iterable
+from functools import partial
 
 import torch
 from torch import nn
@@ -23,10 +23,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
 from vllm.model_executor.utils import refill_derived
 from vllm.multimodal.inputs import NestedTensors
@@ -35,10 +31,9 @@ from vllm.v1.worker.gpu.spec_decode.dflash.config import DFlashSpeculatorConfig
 from .laguna import LagunaDecoderLayer
 from .qwen3_dflash import DFlashQwen3Model
 from .utils import (
-    AutoWeightsLoader,
     get_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -224,23 +219,6 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         )
         return all_k_normed
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if self.quant_config is not None:
-            weights = self.quant_config.get_cache_scale_mapper().apply(weights)
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "scale" in name:
-                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                if remapped_name is None:
-                    continue
-                name = remapped_name
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
 
 class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
     # The speculator this is a draft model of (see SpeculativeDraftModel).
@@ -255,6 +233,7 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
             raise ValueError("Laguna DFlash config requires `draft_vocab_size`.")
         self.has_own_embed_tokens = False
         self.has_own_lm_head = False
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.config.target_layer_count = target_layer_num
         target_vocab_size = vllm_config.model_config.get_vocab_size()
@@ -329,20 +308,6 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
         if needs_squeeze:
             result = result.squeeze(0)
         return result
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        model_weights = {}
-        for name, loaded_weight in weights:
-            if "lm_head" not in name:
-                name = "model." + name
-            model_weights[name] = loaded_weight
-            process_eagle_weight(self, name)
-
-        loader = AutoWeightsLoader(self)
-        loaded_weight_names = loader.load_weights(model_weights.items())
-        loaded_weight_names.add("lm_head.weight")
-        loaded_weight_names.add("model.embed_tokens.weight")
-        return loaded_weight_names
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_kv_buffers()

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""`BeamModel.hf_to_vllm_mapper` must fuse only the dense projections.
+"""Beam's conversion_mapping entry must fuse only the dense projections.
 
 Beam's checkpoints carry two `gate_proj` names that are *not* the SwiGLU
-gate -- the per-expert `mlp.experts.N.gate_proj` (owned by
-`MoERunner.load_weights`) and the attention output gate `self_attn.gate_proj`.
+gate -- the per-expert `mlp.experts.N.gate_proj` (merged into the fused experts
+by the experts' converters) and the attention output gate `self_attn.gate_proj`.
 Folding either into `mlp.gate_up_proj` silently corrupts the weights, so pin the
 mapping. The attention gate is additionally renamed to `output_gate_proj` so
 that `packed_modules_mapping` consumers (LoRA) cannot match it as a
@@ -17,19 +17,26 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.model_loader.conversion_mapping import _beam
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.models.beam import attention
 from vllm.models.beam import model as beam
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.beam import BeamConfig
 
+from .utils import map_checkpoint_name
+
 BeamModel = beam.BeamModel
-MAPPER = BeamModel.hf_to_vllm_mapper
+# Beam's own entry, unmerged (fewer KV heads than ranks: no `merged_qkv_gate`)
+TRANSFORMS = _beam(nn.Module())
+SHARD_IDS = {"qkv_proj": ("q", "k", "v"), "gate_up_proj": (0, 1)}
 
 
 def _map(name: str) -> tuple[str, int | str | None]:
-    weight = torch.empty(0)
-    ((mapped, out),) = MAPPER.apply([(name, weight)])
-    return mapped, getattr(out, "shard_id", None)
+    mapped, index = map_checkpoint_name(TRANSFORMS, name)
+    if index is None:
+        return mapped, None
+    return mapped, SHARD_IDS[mapped.rsplit(".", 2)[-2]][index]
 
 
 @pytest.mark.parametrize(
@@ -69,7 +76,7 @@ def test_dense_projections_are_fused(checkpoint_name, expected_name, expected_sh
 @pytest.mark.parametrize(
     "checkpoint_name",
     [
-        # Owned by MoERunner.load_weights, which is also what keeps expert
+        # The experts' converters' (`_layer_experts`), which also keep expert
         # weights correct under EP and redundant experts.
         "model.layers.1.mlp.experts.7.gate_proj.weight",
         "model.layers.1.mlp.experts.7.up_proj.weight",
@@ -94,7 +101,9 @@ def test_attention_output_gate_is_renamed_not_fused():
 
 @pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="CUDA required")
 @torch.inference_mode()
-def test_checkpoint_norm_names_match_sublayer_order(default_vllm_config, monkeypatch):
+def test_checkpoint_norm_names_match_sublayer_order(
+    default_vllm_config, dist_init, monkeypatch
+):
     """Load reference names directly and use each weight on its intended branch."""
 
     class Attention(nn.Module):
@@ -125,7 +134,7 @@ def test_checkpoint_norm_names_match_sublayer_order(default_vllm_config, monkeyp
         f"layers.0.{name}.weight": torch.arange(1, 9, device="cuda").float().roll(i) / 8
         for i, name in enumerate(names)
     }
-    assert model.load_weights(weights.items()) == set(weights)
+    assert load_weights(model, iter(weights.items())) == set(weights)
     x = torch.arange(1, 17, device="cuda").float().view(2, 8) / 16
 
     def norm(value, name):
@@ -183,7 +192,6 @@ def test_checkpoint_loads_into_merged_qkv_gate(
     model = BeamModel.__new__(BeamModel)
     nn.Module.__init__(model)
     model.config = config
-    model.hf_to_vllm_mapper = model.get_weights_mapper(config, tp_size)
     layer = nn.Module()
     layer.self_attn = attn
     model.layers = nn.ModuleList([layer])
@@ -194,9 +202,12 @@ def test_checkpoint_loads_into_merged_qkv_gate(
             torch.randn(n, 64, device="cuda", dtype=torch.bfloat16)
             for n in (384, 64, 64, 384)
         ]
-        loaded = model.load_weights(
-            (f"layers.0.self_attn.{name}.weight", w)
-            for name, w in zip(("q_proj", "k_proj", "v_proj", "gate_proj"), weights)
+        loaded = load_weights(
+            model,
+            (
+                (f"layers.0.self_attn.{name}.weight", w)
+                for name, w in zip(("q_proj", "k_proj", "v_proj", "gate_proj"), weights)
+            ),
         )
         assert loaded == {"layers.0.self_attn.qkv_gate_proj.weight"}
         assert param.data_ptr() == initial_pointer

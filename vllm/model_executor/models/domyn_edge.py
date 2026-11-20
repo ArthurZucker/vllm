@@ -5,7 +5,6 @@
 # Adapted from https://huggingface.co/domyn/Domyn-Edge-Base
 """Inference-only DomynEdge model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -24,7 +23,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from .qwen3 import Qwen3MLP, Qwen3Model
-from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
+from .utils import PPMissingLayer, extract_layer_index, maybe_prefix
 
 
 class DomynEdgeAttention(nn.Module):
@@ -281,6 +280,3 @@ class DomynEdgeForCausalLM(nn.Module):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

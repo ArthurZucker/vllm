@@ -24,7 +24,6 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from itertools import islice
 from typing import ClassVar, cast
 
@@ -98,7 +97,6 @@ from vllm.model_executor.models.qwen3_moe import Qwen3MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
-    Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
 )
@@ -110,9 +108,7 @@ from vllm.model_executor.models.qwen3_vl import (
     mrope_positions_factor,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
@@ -484,14 +480,6 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 class Qwen3_5Model(nn.Module, EagleModelMixin):
     # Qwen3.5 ships the GDN in_proj checkpoints separately (qwen3-next
     # pre-fuses them); fuse them on top of the qwen3-next QKV/gate_up mapping.
-    hf_to_vllm_mapper = Qwen3NextModel.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_stacked={
-            ".in_proj_qkv": (".in_proj_qkvz", (0, 1, 2)),
-            ".in_proj_z": (".in_proj_qkvz", 3),
-            ".in_proj_b": (".in_proj_ba", 0),
-            ".in_proj_a": (".in_proj_ba", 1),
-        }
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -643,10 +631,6 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class Qwen3_5ForCausalLMBase(
     nn.Module,
@@ -677,9 +661,6 @@ class Qwen3_5ForCausalLMBase(
     # Some community text-only checkpoints keep the extraneous
     # `model.language_model.` prefix inherited from the VL training stack.
     # Strip it so both prefixed and clean checkpoints load correctly.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.language_model.": "model.", "mtp.": None},
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -789,10 +770,6 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
@@ -826,11 +803,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     supports_multimodal_pruning = True
-
-    hf_to_vllm_mapper = (
-        Qwen3VLForConditionalGeneration.hf_to_vllm_mapper
-        | WeightsMapper(orig_to_new_prefix={"mtp.": None})
-    )
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -937,10 +909,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.compute_logits_local(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

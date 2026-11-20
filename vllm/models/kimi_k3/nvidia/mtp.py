@@ -3,7 +3,6 @@
 """Inference-only Kimi-K3 Multi-Token-Prediction (MTP) draft model."""
 
 import copy
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -12,9 +11,6 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -23,11 +19,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
-from vllm.model_executor.models.utils import get_pp_missing_layer_names, maybe_prefix
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -40,9 +32,6 @@ from ..common.mtp import fused_mtp_input
 from .low_latency_gemm import enable_kimi_k3_low_latency_gemm
 from .model import (
     KimiDecoderLayer,
-    KimiMoE,
-    get_spec_layer_idx_from_weight_name,
-    make_kimi_k3_mega_moe_expert_params_mapping,
 )
 
 logger = init_logger(__name__)
@@ -247,193 +236,3 @@ class KimiK3MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Mirror KimiLinearForCausalLM.load_weights naming: leading-dot shard
-        # names, q_lora-conditional fused QKV, and w1/w2/w3 expert weights.
-        kda_config = self.config.linear_attn_config
-        use_full_rank_gate = bool(
-            kda_config and kda_config.get("use_full_rank_gate", False)
-        )
-        beta_shard_id = 5 if use_full_rank_gate else 3
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".in_proj_qkvgfab", ".q_proj", 0),
-            (".in_proj_qkvgfab", ".k_proj", 1),
-            (".in_proj_qkvgfab", ".v_proj", 2),
-            (".in_proj_qkvgfab", ".b_proj", beta_shard_id),
-            (".in_proj_qkvgfab", ".f_a_proj", 4),
-            (".conv1d", ".q_conv1d", 0),
-            (".conv1d", ".k_conv1d", 1),
-            (".conv1d", ".v_conv1d", 2),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        if use_full_rank_gate:
-            stacked_params_mapping.append((".in_proj_qkvgfab", ".g_proj", 3))
-        if getattr(self.config, "q_lora_rank", None) is not None:
-            if self.config.mla_use_output_gate:
-                stacked_params_mapping += [
-                    (".fused_qkv_a_g_proj", ".q_a_proj", 0),
-                    (".fused_qkv_a_g_proj", ".kv_a_proj_with_mqa", 1),
-                    (".fused_qkv_a_g_proj", ".g_proj", 2),
-                ]
-            else:
-                stacked_params_mapping += [
-                    (".fused_qkv_a_proj", ".q_a_proj", 0),
-                    (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-                ]
-
-        use_mega_moe = any(
-            module.use_mega_moe
-            for module in self.modules()
-            if isinstance(module, KimiMoE)
-        )
-        if self.config.is_moe and use_mega_moe:
-            expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
-                self.config.num_experts
-            )
-        elif self.config.is_moe:
-            expert_params_mapping = fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="w1",
-                ckpt_down_proj_name="w2",
-                ckpt_up_proj_name="w3",
-                num_experts=self.config.num_experts,
-            )
-        else:
-            expert_params_mapping = []
-
-        pp_missing_layer_names = get_pp_missing_layer_names(self)
-        params_dict = dict(self.named_parameters())
-        # Under the MXFP4 quant interface the routed experts register unpacked
-        # params (``w13_weight``), while the compressed-tensors checkpoint names
-        # them ``.weight_packed``. Rebind so the expert mapping resolves; scales
-        # already share the ``.weight_scale`` suffix.
-        experts_unpacked = not use_mega_moe and not any(
-            n.endswith("w13_weight_packed") for n in params_dict
-        )
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            # The multimodal checkpoint prefixes text weights with
-            # ``language_model.``; strip it so names match this draft model's
-            # parameter paths (``model.layers.{i}.``). Non-text weights
-            # (vision_tower, mm_projector, ...) never match a spec layer below.
-            if name.startswith("language_model."):
-                name = name[len("language_model.") :]
-            if experts_unpacked and name.endswith(".weight_packed"):
-                name = name.replace(".weight_packed", ".weight")
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is None:
-                continue
-            name = self._rewrite_spec_layer_name(spec_layer, name)
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                # Routed experts (``.experts.{i}.w1/w2/w3``) are handled by the
-                # expert mapping below; skip them here. Shared experts
-                # (``.shared_experts.``) use gate/up_proj and fall through.
-                if ".experts." in name:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                # Only take this mapping if the fused destination actually
-                # exists (e.g. QKV fusion is only present when q_lora is used).
-                if name_mapped not in params_dict:
-                    continue
-                if name_mapped in pp_missing_layer_names:
-                    continue
-                name = name_mapped
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for (
-                    expert_param_name,
-                    expert_weight_name,
-                    expert_id,
-                    expert_shard_id,
-                ) in expert_params_mapping:
-                    if expert_weight_name not in name:
-                        continue
-                    name_mapped = name.replace(expert_weight_name, expert_param_name)
-                    if name_mapped in pp_missing_layer_names:
-                        continue
-                    param = params_dict[name_mapped]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=expert_shard_id,
-                        expert_id=expert_id,
-                    )
-                    name = name_mapped
-                    break
-                else:
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-                    if remapped_name is None:
-                        continue
-                    name = remapped_name
-
-                    # The embedding is shared across MTP layers; only the first
-                    # spec layer carries the hoisted (non-".layers") copy.
-                    if spec_layer != self.model.mtp_start_layer_idx and (
-                        ".layers" not in name
-                    ):
-                        continue
-                    if name in pp_missing_layer_names:
-                        continue
-                    # The base model uses an attn-residual scheme whose per-layer
-                    # weights (self_attention_res_*, mlp_res_*) are not used by
-                    # the draft block; such names have no matching parameter and
-                    # are safely skipped.
-                    if name not in params_dict:
-                        continue
-
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """Rewrite a checkpoint weight name to this module's parameter path.
-
-        Top-level MTP submodules (enorm/hnorm/eh_proj/shared_head) stay under
-        `model.layers.{spec_layer}.*`; the shared `embed_tokens` is hoisted
-        to `model.*`; everything else is a transformer-block weight and gets
-        `.mtp_block` inserted.
-        """
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "eh_proj",
-            "shared_head",
-        ]
-        shared_weight_names = ["embed_tokens"]
-        spec_layer_weight = False
-        shared_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                if weight_name in shared_weight_names:
-                    shared_weight = True
-                break
-        if not spec_layer_weight:
-            name = name.replace(
-                f"model.layers.{spec_layer}.",
-                f"model.layers.{spec_layer}.mtp_block.",
-            )
-        elif shared_weight:
-            name = name.replace(f"model.layers.{spec_layer}.", "model.")
-        return name

@@ -17,6 +17,7 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.models.muse_spark import MuseSparkDSparkForCausalLM
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.muse_spark import (
@@ -149,7 +150,7 @@ def test_dspark_draft_loads_weights(tmp_path, dist_init):
         "d2t": torch.zeros(128, dtype=torch.long),
     }
 
-    loaded = model.load_weights(checkpoint.items())
+    loaded = load_weights(model, iter(checkpoint.items()))
 
     assert loaded == {"model.fc.weight", "lm_head.weight", "draft_id_to_target_id"}
 

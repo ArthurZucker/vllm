@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Moondream3 model implementation."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import islice
@@ -46,7 +46,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -472,6 +472,9 @@ class Moondream3TextMoE(nn.Module):
         self.fc2_weight = nn.Parameter(
             torch.empty(self.num_local_experts, hidden_size, expert_inner_dim)
         )
+        # each TP rank holds its experts, consecutive
+        for param in (self.fc1_weight, self.fc2_weight):
+            set_weight_attrs(param, {"shard_dim": 0})
         self._use_fused_moe = True
 
         local_expert_start = get_tensor_model_parallel_rank() * self.experts_per_rank
@@ -661,6 +664,8 @@ class Moondream3Attention(nn.Module):
         self.tau_alpha = nn.Parameter(torch.zeros(self.num_heads_per_partition))
         self.tau_wq = nn.Parameter(torch.zeros(self.num_heads_per_partition, qkv_dim))
         self.tau_wv = nn.Parameter(torch.zeros(self.num_heads_per_partition, qkv_dim))
+        for param in (self.tau_alpha, self.tau_wq, self.tau_wv):
+            set_weight_attrs(param, {"shard_dim": 0})  # this rank's heads
         self.tp_size = tp_size
 
     def forward(
@@ -1318,109 +1323,3 @@ class Moondream3ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if logits is not None:
             logits[:, self._answer_id] = float("-inf")
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with remapping from HuggingFace format."""
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        # Get expert intermediate size for fc1 splitting
-
-        for name, loaded_weight in weights:
-            # Map from HF naming to vLLM naming
-            # model.vision.* -> vision.*
-            # model.text.* -> text.*
-            if name.startswith("model."):
-                name = name[6:]  # Remove "model." prefix
-
-            # Specific name mappings
-            # Vision projection: vision.proj_mlp.fc1 -> vision_proj.fc1
-            name = name.replace("vision.proj_mlp.", "vision_proj.")
-
-            # Text embedding: text.wte (no suffix) -> text.wte.weight
-            if name == "text.wte":
-                name = "text.wte.weight"
-
-            # LM head: text.lm_head -> lm_head
-            name = name.replace("text.lm_head.", "lm_head.")
-
-            # Attention mapping
-            name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
-            name = name.replace(".attn.proj.", ".attn.out_proj.")
-
-            # Tau attention scaling weights
-            # HF format: .attn.tau.alpha -> .attn.tau_alpha
-            name = name.replace(".attn.tau.alpha", ".attn.tau_alpha")
-            name = name.replace(".attn.tau.wq", ".attn.tau_wq")
-            name = name.replace(".attn.tau.wv", ".attn.tau_wv")
-
-            # MoE router mapping: mlp.router -> mlp.gate
-            name = name.replace(".mlp.router.", ".mlp.gate.")
-
-            # Handle MoE expert weights for layers 4+ with expert parallelism
-            # fc1.weight: [n_experts, expert_inner_dim * 2, hidden_size] (gate+up)
-            # fc2.weight: [n_experts, hidden_size, expert_inner_dim] (down)
-            # Each GPU stores n_experts/tp_size experts
-            # Note: Only 3D weights are MoE, 2D weights are standard MLP
-            if ".mlp.fc1.weight" in name and loaded_weight.dim() == 3:
-                from vllm.distributed import get_tensor_model_parallel_rank
-
-                tp_size = get_tensor_model_parallel_world_size()
-                tp_rank = get_tensor_model_parallel_rank()
-                num_experts = loaded_weight.shape[0]
-                experts_per_rank = num_experts // tp_size
-                expert_start = tp_rank * experts_per_rank
-                expert_end = expert_start + experts_per_rank
-                # Shard by expert dimension
-                loaded_weight = loaded_weight[expert_start:expert_end].contiguous()
-                # Map to our custom MoE format: mlp.fc1_weight
-                name = name.replace(".mlp.fc1.weight", ".mlp.fc1_weight")
-
-            if ".mlp.fc2.weight" in name and loaded_weight.dim() == 3:
-                from vllm.distributed import get_tensor_model_parallel_rank
-
-                tp_size = get_tensor_model_parallel_world_size()
-                tp_rank = get_tensor_model_parallel_rank()
-                num_experts = loaded_weight.shape[0]
-                experts_per_rank = num_experts // tp_size
-                expert_start = tp_rank * experts_per_rank
-                expert_end = expert_start + experts_per_rank
-                # Shard by expert dimension
-                loaded_weight = loaded_weight[expert_start:expert_end].contiguous()
-                # Map to our custom MoE format: mlp.fc2_weight
-                name = name.replace(".mlp.fc2.weight", ".mlp.fc2_weight")
-
-            # Handle tau weights with tensor parallelism
-            # tau_alpha: [num_heads] -> [num_heads/tp]
-            # tau_wq: [num_heads, qkv_dim] -> [num_heads/tp, qkv_dim/tp]
-            # tau_wv: [num_heads, qkv_dim] -> [num_heads/tp, qkv_dim/tp]
-            if ".tau_alpha" in name:
-                from vllm.distributed import get_tensor_model_parallel_rank
-
-                tp_size = get_tensor_model_parallel_world_size()
-                tp_rank = get_tensor_model_parallel_rank()
-                num_heads = loaded_weight.shape[0]
-                heads_per_partition = num_heads // tp_size
-                start = tp_rank * heads_per_partition
-                end = start + heads_per_partition
-                loaded_weight = loaded_weight[start:end].contiguous()
-
-            if ".tau_wq" in name or ".tau_wv" in name:
-                from vllm.distributed import get_tensor_model_parallel_rank
-
-                tp_size = get_tensor_model_parallel_world_size()
-                tp_rank = get_tensor_model_parallel_rank()
-                num_heads, qkv_dim = loaded_weight.shape
-                heads_per_partition = num_heads // tp_size
-                # Only shard by head dimension, keep full qkv_dim for all-gather
-                head_start = tp_rank * heads_per_partition
-                head_end = head_start + heads_per_partition
-                loaded_weight = loaded_weight[head_start:head_end, :].contiguous()
-
-            if name in params_dict:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        return loaded_params

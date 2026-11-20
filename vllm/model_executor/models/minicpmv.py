@@ -26,7 +26,7 @@
 
 import math
 from collections import defaultdict
-from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence, Set
+from collections.abc import Callable, Hashable, Mapping, Sequence, Set
 from functools import cached_property, partial
 from itertools import chain
 from typing import Annotated, Any, ClassVar, Literal, TypeAlias, cast
@@ -116,8 +116,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
@@ -1297,6 +1295,10 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
         self.resampler.to(current_platform.device_type)
         self._resampler_moved = True
 
+    def process_weights_after_loading(self) -> None:
+        if hasattr(self, "_resampler_moved"):  # a vision tower is built
+            self._ensure_resampler_device()
+
     def _parse_and_validate_vision_input(
         self,
         modality: str,
@@ -1423,12 +1425,6 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.llm.compute_logits(hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights)
-        self._ensure_resampler_device()
-        return loaded
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
@@ -2143,10 +2139,6 @@ class MiniCPMV2_5(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
 
 
 class MiniCPMV2_6(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
-    hf_to_vllm_mapper = WeightsMapper(
-        # The vision-only models have no audio tower or TTS head to load weights into.
-        orig_to_new_prefix={"apm.": None, "audio": None, "tts": None}
-    )
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -2241,15 +2233,8 @@ class MiniCPMV2_6(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
 
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._ensure_resampler_device()
-        return loaded
-
 
 class MiniCPMV4_0(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
-    hf_to_vllm_mapper = MiniCPMV2_6.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -2340,15 +2325,8 @@ class MiniCPMV4_0(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
 
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._ensure_resampler_device()
-        return loaded
-
 
 class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
-    hf_to_vllm_mapper = MiniCPMV2_6.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -2443,12 +2421,6 @@ class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
         )
 
         return self.resampler(vision_embedding, tgt_sizes, all_temporal_ids)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self._ensure_resampler_device()
-        return loaded
 
 
 _SUPPORT_VERSION = {

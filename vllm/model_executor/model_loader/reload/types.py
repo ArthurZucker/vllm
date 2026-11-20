@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
-from inspect import BoundArguments
 
 import torch
 
@@ -19,17 +18,14 @@ class LayerReloadingInfo:
     # device to materialize layers with, recorded by `record_metadata_for_reloading`
     restore_device: torch.device
 
-    # materialize on the CPU instead: online quantization of a layer that the
-    # UVA offloader targets stages its full-precision weights there
-    stage_on_cpu: bool = False
-
-    # track how many elements are ready for loading, used by `online_process_loader`
+    # track how many elements are ready for loading, used by `reload_load_into`
     load_numel: int = 0
     load_numel_total: int | None = None
     defer_processing: bool = False
 
-    # used by `online_process_loader` to buffer args and tensors until ready to load
-    loaded_weights: list[tuple[str, BoundArguments]] = field(default_factory=list)
+    # writes buffered by `reload_load_into` until the layer is complete:
+    # (attribute name, name `load_with_ops` wrote, value)
+    loaded_weights: list[tuple[str, str, torch.Tensor]] = field(default_factory=list)
 
     # kernel formatted tensors, copied into by `_layerwise_process` when reloading
     kernel_tensors: LayerTensors | None = None
@@ -42,7 +38,6 @@ class LayerReloadingInfo:
         self.__init__(  # type: ignore[misc]
             restore_metadata=self.restore_metadata,
             restore_device=self.restore_device,
-            stage_on_cpu=self.stage_on_cpu,
         )
 
     def can_load(self) -> bool:

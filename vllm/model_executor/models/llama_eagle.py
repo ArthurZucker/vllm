@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -21,11 +21,9 @@ from vllm.model_executor.models.llama import (
 from vllm.model_executor.models.llama import LlamaForCausalLM
 
 from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
-    process_eagle_weight,
+    observe_eagle_weights,
 )
 
 logger = init_logger(__name__)
@@ -63,17 +61,6 @@ class LlamaDecoderLayer(BaseLlamaDecoderLayer):
 
 @support_torch_compile
 class LlamaModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(
         self,
         *,
@@ -138,10 +125,6 @@ class LlamaModel(nn.Module):
         hidden_states = hidden_states + residual
         return hidden_states, hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -165,6 +148,7 @@ class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=logit_scale
         )
+        self.checkpoint_transforms = [partial(observe_eagle_weights, self)]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -181,14 +165,3 @@ class EagleLlamaForCausalLM(_EagleLlamaForCausalLMBase):
                 f"{type(self).__name__} does not support multimodal inputs yet."
             )
         return self.model(input_ids, positions, hidden_states)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        def transform(inputs):
-            name, loaded_weight = inputs
-            if "lm_head" not in name:
-                name = "model." + name
-            process_eagle_weight(self, name)
-            return name, loaded_weight
-
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(map(transform, weights))

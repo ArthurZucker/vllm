@@ -10,6 +10,7 @@ against the pure-torch reference in `reference_mxfp4.py`.
 import pytest
 import torch
 
+from tests.quantization.utils import load_online_quantized
 from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
@@ -42,7 +43,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import PlatformEnum, current_platform
 
 from .reference_mxfp4 import dq_mxfp4_torch, qdq_mxfp4_torch
@@ -296,11 +296,9 @@ def test_online_mxfp4_moe_matches_quark(
     with same MOE backend used.
 
     The `padding` case additionally covers `maybe_roundup_sizes`: the online
-    path allocates its bf16 weights with `torch.empty_strided` and the loader
-    only writes the unpadded slice, so the padding is filled with NaN here to
-    reproduce that uninitialized state. It must be zeroed before quantization
-    for the two paths to agree, since Quark allocates its padding with
-    `torch.zeros`.
+    path's quantize op gets the unpadded merged experts and must zero-pad them
+    to the layer's sizes for the two paths to agree, since Quark allocates its
+    padding with `torch.zeros`.
     """
     if moe_backend == "aiter":
         from vllm._aiter_ops import rocm_aiter_ops
@@ -459,14 +457,8 @@ def test_online_mxfp4_moe_matches_quark(
         checkpoint_layer.w2_weight_scale.data.copy_(checkpoint_w2_scale)
         checkpoint_method.process_weights_after_loading(checkpoint_layer)
 
-        # Online path: feed the *same* raw bf16 source weights and let
-        # `Mxfp4OnlineMoEMethod` quantize them during
-        # `process_weights_after_loading`. The padding starts out
-        # uninitialized, standing in for the materialized meta tensor.
-        online_w13, online_w2 = scatter_into_padded(
-            gate_up_weight, down_weight, padding_value=float("nan")
-        )
-
+        # Online path: the plan's quantize op gets the *same* raw bf16 source
+        # weights, unpadded as the checkpoint's merged experts are.
         online_method.create_weights(
             layer=online_layer,
             num_experts=num_experts,
@@ -474,9 +466,11 @@ def test_online_mxfp4_moe_matches_quark(
             intermediate_size_per_partition=intermediate_size,
             params_dtype=torch.bfloat16,
         )
-        replace_parameter(online_layer, "w13_weight", online_w13)
-        replace_parameter(online_layer, "w2_weight", online_w2)
-        online_method.process_weights_after_loading(online_layer)
+        load_online_quantized(
+            online_layer,
+            {"w13_weight": gate_up_weight, "w2_weight": down_weight},
+            online_method,
+        )
 
     assert checkpoint_method.mxfp4_backend == online_method.mxfp4_backend
 
@@ -583,9 +577,8 @@ def test_online_mxfp4_dense_matches_quark(
         checkpoint_layer.weight_scale.data.copy_(checkpoint_weight_scale)
         checkpoint_scheme.process_weights_after_loading(checkpoint_layer)
 
-        # Online path: feed the *same* raw bf16 source weight and let
-        # `Mxfp4OnlineLinearMethod` quantize it during
-        # `process_weights_after_loading`.
+        # Online path: the plan's quantize op gets the *same* raw bf16 source
+        # weight.
         online_method = Mxfp4OnlineLinearMethod()
         online_method.create_weights(
             layer=online_layer,
@@ -596,8 +589,7 @@ def test_online_mxfp4_dense_matches_quark(
             params_dtype=torch.bfloat16,
             weight_loader=default_weight_loader,
         )
-        replace_parameter(online_layer, "weight", weight.clone())
-        online_method.process_weights_after_loading(online_layer)
+        load_online_quantized(online_layer, {"weight": weight.clone()}, online_method)
 
     assert type(checkpoint_scheme.ocp_mx_linear) is type(online_method.kernel)
 

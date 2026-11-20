@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
 )
+from vllm.model_executor.model_loader.ops_loader import copy_into
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 
@@ -146,152 +147,6 @@ def test_humming_fp8_matches_checkpoint_forward(
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="DSV4.1 requires CUDA or ROCm"
 )
-@pytest.mark.parametrize("tp_rank", [0, 1])
-@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
-def test_deepseek_v41_mxfp8_scale_loading(
-    dist_init, default_vllm_config, monkeypatch, tp_rank, scale_dtype
-):
-    """Expand linear scales before TP slicing, including padded shared experts."""
-    from vllm.model_executor.layers import linear as linear_module
-    from vllm.model_executor.layers.linear import (
-        ColumnParallelLinear,
-        MergedColumnParallelLinear,
-        RowParallelLinear,
-    )
-    from vllm.models.deepseek_v41 import quant_config as quant_module
-    from vllm.models.deepseek_v41.nvidia import model as model_module
-
-    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
-    quant_config = quant_module.DeepseekV4FP8Config(
-        is_checkpoint_fp8_serialized=True, weight_block_size=[32, 32]
-    )
-    quant_config._resolved_expert_dtype = "fp4"
-    for module in (model_module, linear_module):
-        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(
-        linear_module, "get_tensor_model_parallel_rank", lambda: tp_rank
-    )
-    block = torch.nn.Module()
-    block.attn = torch.nn.Module()
-    block.attn.wq_b = ColumnParallelLinear(
-        128, 128, quant_config=quant_config, bias=False
-    )
-    block.attn.fused_wqa_wkv = MergedColumnParallelLinear(
-        128, [128, 64], quant_config=quant_config, bias=False
-    )
-    block.ffn = torch.nn.Module()
-    block.ffn.shared_experts = torch.nn.Module()
-    block.ffn.shared_experts.gate_up_proj = MergedColumnParallelLinear(
-        128, [128, 128], quant_config=quant_config, bias=False
-    )
-    block.ffn.shared_experts.down_proj = RowParallelLinear(
-        128, 128, quant_config=quant_config, bias=False
-    )
-    block.ffn.experts = torch.nn.Module()
-    block.ffn.experts.register_parameter(
-        "weight_scale", torch.nn.Parameter(torch.empty(3, 4, dtype=torch.uint8), False)
-    )
-    block.engram = torch.nn.Module()
-    block.engram.register_parameter(
-        "weight_scale_inv",
-        torch.nn.Parameter(torch.empty(3, 4, dtype=scale_dtype), False),
-    )
-
-    def load_expert_scale(param, weight, *args, **kwargs):
-        param.data.copy_(weight)
-        return True
-
-    block.ffn.experts.weight_scale.weight_loader = load_expert_scale
-    model = model_module.DeepseekV4Model.__new__(model_module.DeepseekV4Model)
-    torch.nn.Module.__init__(model)
-    model.layers = torch.nn.ModuleList([block])
-    model.config = SimpleNamespace(num_attention_heads=2)
-    model.quant_config = quant_config
-    model.use_sequence_parallel = False
-    monkeypatch.setattr(
-        model,
-        "get_expert_mapping",
-        lambda: [("experts.weight_scale", "experts.0.w1.weight_scale", 0, "w1")],
-    )
-
-    checkpoints = [
-        ("attn.wq_b", "attn.wq_b", 128, 128, 0, None),
-        ("attn.wq_a", "attn.fused_wqa_wkv", 128, 128, 0, slice(0, 64)),
-        ("attn.wkv", "attn.fused_wqa_wkv", 64, 128, 0, slice(64, 96)),
-        (
-            "ffn.shared_experts.w1",
-            "ffn.shared_experts.gate_up_proj",
-            96,
-            128,
-            0,
-            slice(0, 64),
-        ),
-        (
-            "ffn.shared_experts.w3",
-            "ffn.shared_experts.gate_up_proj",
-            96,
-            128,
-            0,
-            slice(64, 128),
-        ),
-        (
-            "ffn.shared_experts.down_proj",
-            "ffn.shared_experts.down_proj",
-            128,
-            96,
-            1,
-            None,
-        ),
-    ]
-    weights = []
-    expected = []
-    for source, target, n, k, axis, shard in checkpoints:
-        weight = torch.randint(-4, 5, (n, k)).to(torch.float8_e4m3fn)
-        scale_bytes = torch.randint(124, 131, (n // 32, k // 32), dtype=torch.uint8)
-        weights.extend(
-            [
-                (f"layers.0.{source}.weight", weight),
-                (f"layers.0.{source}.scale", scale_bytes.view(scale_dtype)),
-            ]
-        )
-        dequant = (
-            weight.float().reshape(n // 32, 32, k // 32, 32)
-            * torch.exp2(scale_bytes.float() - 127)[:, None, :, None]
-        ).reshape(n, k)
-        if "shared_experts" in source:
-            padded = torch.zeros(128, 128)
-            padded[:n, :k] = dequant
-            dequant = padded
-        expected.append((target, shard, dequant.chunk(2, dim=axis)[tp_rank]))
-
-    expert_scale = torch.full((3, 4), 125, dtype=torch.uint8)
-    weights.append(
-        ("layers.0.ffn.experts.0.w1.weight_scale", expert_scale.view(scale_dtype))
-    )
-    weights.append(("layers.0.engram.weight_scale_inv", expert_scale.view(scale_dtype)))
-    mapper = model_module._make_deepseek_v4_weights_mapper("fp4", "weight_scale")
-    loaded = model.load_weights(
-        (name.removeprefix("model."), weight) for name, weight in mapper.apply(weights)
-    )
-    assert "layers.0.ffn.experts.weight_scale" in loaded
-    assert torch.equal(block.ffn.experts.weight_scale, expert_scale)
-    assert torch.equal(block.engram.weight_scale_inv.view(torch.uint8), expert_scale)
-    for target, shard, reference in expected:
-        linear = block.get_submodule(target)
-        assert isinstance(linear.quant_method, ModelOptLinearMethod)
-        assert f"layers.0.{target}.weight_scale" in loaded
-        weight = linear.weight if shard is None else linear.weight[shard]
-        scale = linear.weight_scale if shard is None else linear.weight_scale[shard]
-        actual = (
-            weight.float().unflatten(-1, (-1, 32))
-            * torch.exp2(scale.float() - 127).unsqueeze(-1)
-        ).flatten(-2)
-        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="DSV4.1 requires CUDA or ROCm"
-)
 @pytest.mark.parametrize(
     "weight_block_size,expert_dtype,scale_name",
     [
@@ -300,14 +155,11 @@ def test_deepseek_v41_mxfp8_scale_loading(
         ([32, 32], "fp8", "weight_scale_inv"),
     ],
 )
-def test_deepseek_v41_vl_mapper_routes_linear_scales(
+def test_deepseek_v41_linear_scale_param_name(
     weight_block_size, expert_dtype, scale_name
 ):
-    """The VL wrapper must map `.scale` keys to the parameter the linear
-    quant method registers, as the text model does. A hardcoded
-    `weight_scale_inv` raised KeyError for native MXFP8 checkpoints."""
+    """`.scale` maps to the registered scale param, not a fixed `weight_scale_inv`."""
     from vllm.models.deepseek_v41.nvidia import model as model_module
-    from vllm.models.deepseek_v41.nvidia import vl_model as vl_module
 
     vllm_config = SimpleNamespace(
         quant_config=SimpleNamespace(weight_block_size=weight_block_size)
@@ -317,19 +169,6 @@ def test_deepseek_v41_vl_mapper_routes_linear_scales(
         expert_dtype,
     )
     assert resolved == scale_name
-
-    mapper = vl_module._make_deepseek_v4_vl_weights_mapper(expert_dtype, resolved)
-    weight = torch.empty(0)
-    mapped = [
-        name
-        for name, _ in mapper.apply(
-            [("layers.0.attn.wq_a.scale", weight), ("layers.0.attn.wkv.weight", weight)]
-        )
-    ]
-    assert mapped == [
-        f"language_model.model.layers.0.attn.wq_a.{scale_name}",
-        "language_model.model.layers.0.attn.wkv.weight",
-    ]
 
 
 def test_deepseek_v41_vl_exposes_quant_mappings_on_class():
@@ -563,6 +402,7 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(
     )
     from vllm.model_executor.layers.linear import ColumnParallelLinear
     from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
     from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
         fused_inv_rope_fp8_quant,
     )
@@ -570,7 +410,6 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(
         compute_fp8_einsum_recipe,
         deep_gemm_fp8_o_proj,
     )
-    from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model
     from vllm.models.deepseek_v41.quant_config import DeepseekV4FP8Config
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
@@ -606,21 +445,21 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(
         if config_source == "deepseek"
         else scales.repeat_interleave(32, dim=0)
     )
-    model = DeepseekV4Model.__new__(DeepseekV4Model)
-    torch.nn.Module.__init__(model)
+    model = torch.nn.Module()
     block = torch.nn.Module()
     block.attn = torch.nn.Module()
     block.attn.wo_a = linear
     model.layers = torch.nn.ModuleList([block])
-    model.config = SimpleNamespace(num_attention_heads=2)
     model.quant_config = quant_config
-    model.use_sequence_parallel = False
-    monkeypatch.setattr(model, "get_expert_mapping", lambda: [])
-    model.load_weights(
-        [
-            ("layers.0.attn.wo_a.weight", weight),
-            ("layers.0.attn.wo_a.weight_scale", checkpoint_scales),
-        ]
+    load_with_ops(
+        model,
+        iter(
+            [
+                ("layers.0.attn.wo_a.weight", weight),
+                ("layers.0.attn.wo_a.weight_scale", checkpoint_scales),
+            ]
+        ),
+        [],
     )
     reference_weight = (
         weight.float().reshape(8, 32, 16, 32)
@@ -950,23 +789,18 @@ def test_fp8_reloading(
 
     # capture weights format during loading
     original_metadata = [
-        (name, param.shape, getattr(param, "weight_loader", default_weight_loader))
-        for name, param in layer.named_parameters()
+        (name, param.shape) for name, param in layer.named_parameters()
     ]
 
     # test loading
-    for name, shape, _ in original_metadata:
-        param = getattr(layer, name)
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, torch.zeros(shape))  # cannot use empty
+    for name, shape in original_metadata:
+        copy_into(name, getattr(layer, name), torch.zeros(shape))  # cannot use empty
 
     method.process_weights_after_loading(layer)
 
     # test reloading works after loading
-    for name, shape, _ in original_metadata:
-        param = getattr(layer, name)
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, torch.zeros(shape))  # cannot use empty
+    for name, shape in original_metadata:
+        copy_into(name, getattr(layer, name), torch.zeros(shape))  # cannot use empty
 
     method.process_weights_after_loading(layer)
 
@@ -983,8 +817,8 @@ def test_kv_cache_scale_sync_to_host_copies():
     method.create_weights(layer)
     # 0.3 stays != 1.0 even after the fp8_fnuz x2 rescale.
     checkpoint_scale = torch.tensor(0.3, dtype=torch.float32)
-    layer.k_scale.weight_loader(layer.k_scale, checkpoint_scale)
-    layer.v_scale.weight_loader(layer.v_scale, checkpoint_scale)
+    copy_into("k_scale", layer.k_scale, checkpoint_scale)
+    copy_into("v_scale", layer.v_scale, checkpoint_scale)
     method.process_weights_after_loading(layer)
 
     assert layer._k_scale_float != 1.0

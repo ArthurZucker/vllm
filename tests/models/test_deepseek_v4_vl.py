@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.model_loader.ops_loader import load_weights
 from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -45,20 +46,20 @@ def test_vl_wrapper_runs_language_model_hook(module, cls_name) -> None:
     model.vision.tensor_b = nn.Parameter(torch.zeros(1))
     model.hf_to_vllm_mapper = WeightsMapper()
 
-    def interleaved_weights():
-        yield "language_model.tensor_a", torch.tensor([1.0])
-        assert model.language_model.tensor_a.item() == 1.0
-        yield "vision.tensor_b", torch.tensor([2.0])
-        assert model.vision.tensor_b.item() == 2.0
-        yield "language_model.tensor_c", torch.tensor([3.0])
+    weights = [
+        ("language_model.tensor_a", torch.tensor([1.0])),
+        ("vision.tensor_b", torch.tensor([2.0])),
+        ("language_model.tensor_c", torch.tensor([3.0])),
+    ]
 
-    loaded = model.load_weights(interleaved_weights())
+    loaded = load_weights(model, iter(weights))
 
     assert loaded == {
         "language_model.tensor_a",
         "vision.tensor_b",
         "language_model.tensor_c",
     }
+    assert model.vision.tensor_b.item() == 2.0
     assert model.language_model.finalized_values == []
 
     finalize_model_weights(model)

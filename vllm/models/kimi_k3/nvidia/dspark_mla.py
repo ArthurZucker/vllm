@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 from dataclasses import replace
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -21,8 +22,6 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
 )
@@ -40,26 +39,18 @@ _GROUPED_KV_CACHE_DTYPES = frozenset(
 )
 
 
-def _duplicate_context_kv_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], num_layers: int
+def context_kv_sources(
+    weights: Iterable[tuple[str, torch.Tensor]], layers: int
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    """Load each layer's KV projection into the cross-layer linear."""
+    """Each layer's KV projection, and again as a source of the cross-layer
+    `context_kv_proj` (`conversion_mapping._k3_context_kv`)"""
     for name, weight in weights:
         yield name, weight
-        layer_prefix, marker, param_name = name.partition(
-            ".self_attn.kv_a_proj_with_mqa."
-        )
-        if not marker:
-            continue
-        layer_idx_str = layer_prefix.rsplit(".", 1)[-1]
-        if not layer_idx_str.isdecimal():
-            continue
-        layer_idx = int(layer_idx_str)
-        if layer_idx >= num_layers:
-            continue
-        fused_weight = weight.detach()
-        fused_weight.shard_id = layer_idx
-        yield f"context_kv_proj.{param_name}", fused_weight
+        prefix, marker, param = name.partition(".self_attn.kv_a_proj_with_mqa.")
+        head, _, index = prefix.rpartition(".")
+        if marker and index.isdecimal() and int(index) < layers:
+            stem = head.removesuffix("layers")
+            yield f"{stem}context_kv_proj_src.{index}.{param}", weight
 
 
 class K3DSparkAttention(MultiHeadLatentAttention):
@@ -448,34 +439,12 @@ class K3DSparkForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
-    hf_to_vllm_mapper = WeightsMapper(
-        # confidence_head is training-only. The frozen target embedding and LM
-        # head are shared after this draft-specific checkpoint is loaded.
-        orig_to_new_substr={
-            "confidence_head": None,
-            "embed_tokens": None,
-            "lm_head": None,
-        },
-        orig_to_new_prefix={"": "model."},
-        orig_to_new_stacked={
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-            ".q_a_proj": (".fused_qkv_a_proj", 0),
-            ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
-        },
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        if getattr(self.config, "enable_confidence_head", False):
-            # The class mapper drops the head as training-only; keep it for drafts
-            # that actually built one, since adaptive verification reads it.
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_substr={"confidence_head": "confidence_head"}
-            )
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = K3DSparkModel(
             vllm_config=vllm_config,
@@ -490,6 +459,9 @@ class K3DSparkForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        self.checkpoint_transforms = [
+            partial(context_kv_sources, layers=self.model.config.num_hidden_layers)
+        ]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -540,12 +512,6 @@ class K3DSparkForCausalLM(nn.Module):
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        # read: 1. all weights. 2. context kv weights
-        weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()

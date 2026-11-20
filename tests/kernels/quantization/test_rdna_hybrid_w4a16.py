@@ -394,8 +394,6 @@ def _build_dummy_layer(
         PackedvLLMParameter,
     )
 
-    weight_loader = lambda *args, **kwargs: None
-
     class DummyLayer(torch.nn.Module):
         pass
 
@@ -404,7 +402,6 @@ def _build_dummy_layer(
         "weight_packed",
         PackedvLLMParameter(
             data=w_ckpt_nk8,
-            weight_loader=weight_loader,
             input_dim=1,
             output_dim=0,
             packed_factor=8,
@@ -415,7 +412,6 @@ def _build_dummy_layer(
         "weight_scale",
         GroupQuantScaleParameter(
             data=scales_ckpt_nkg,
-            weight_loader=weight_loader,
             input_dim=1,
             output_dim=0,
         ),
@@ -425,7 +421,6 @@ def _build_dummy_layer(
             "weight_zero_point",
             PackedColumnParameter(
                 data=zeros_ckpt,
-                weight_loader=weight_loader,
                 output_dim=0,
                 packed_factor=8,
                 packed_dim=0,

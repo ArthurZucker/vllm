@@ -54,7 +54,7 @@ processing cache consistent (verified by `test_processing_correctness`).
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 from torch import nn
@@ -67,7 +67,6 @@ from vllm.model_executor.layers.dash_attention import DASHAttention
 from vllm.model_executor.layers.fused_moe import RoutedScaleMode
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2ForCausalLM,
@@ -384,21 +383,6 @@ class UnlimitedOCR2Model(DeepseekV2Model):
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.named_parameters())
-        loaded = set()
-
-        def backbone_weights():
-            for name, weight in weights:
-                if ".dash_router." in name:
-                    # Router projections are replicated, not main QKV shards.
-                    default_weight_loader(params[name], weight)
-                    loaded.add(name)
-                else:
-                    yield name, weight
-
-        loaded.update(super().load_weights(backbone_weights()))
-        return loaded
 
 
 class UnlimitedOCR2TextForCausalLM(DeepseekV2ForCausalLM):
@@ -424,16 +408,6 @@ class UnlimitedOCRForCausalLM(DeepseekOCRForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
-    def load_weights(self, weights):
-        if getattr(self.text_config, "unlimited_ocr2", False):
-            # Skip the unused warmup indexer and deterministic CLIP positions.
-            weights = (
-                (name, weight)
-                for name, weight in weights
-                if ".indexer." not in name
-                and name != "model.vision_model.embeddings.position_ids"
-            )
-        return super().load_weights(weights)
 
     def forward(
         self,

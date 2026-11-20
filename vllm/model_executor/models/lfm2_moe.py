@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -51,9 +50,7 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -391,22 +388,6 @@ class Lfm2MoeShortConvDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Lfm2MoeModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".conv.": ".short_conv.",
-            "expert_bias": "gate.e_score_correction_bias",
-        },
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            # Scoped (with trailing dots) to the dense MLP so routed experts.*.w1/w3
-            # (loaded by FusedMoE) are left untouched and .w1 does not match inside .w13
-            ".feed_forward.w1.": (".feed_forward.w13.", 0),
-            ".feed_forward.w3.": (".feed_forward.w13.", 1),
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -492,10 +473,6 @@ class Lfm2MoeModel(nn.Module):
         hidden_states, _ = self.embedding_norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias", "_bias"])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class Lfm2MoeForCausalLM(
     nn.Module,
@@ -522,9 +499,6 @@ class Lfm2MoeForCausalLM(
     # HF uses .conv. but vLLM uses .short_conv. to avoid LoRA regex collision
     # with the inner .conv.conv child (ShortConv has a child self.conv, so
     # naming the container .conv too makes _match_target_modules match both)
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={".conv.": ".short_conv."},
-    )
 
     # LoRA specific attributes
     embedding_modules = {
@@ -662,7 +636,3 @@ class Lfm2MoeForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

@@ -3,14 +3,13 @@
 """Inference-only Beam model for AMD GPUs."""
 
 import math
-from collections.abc import Iterable
 from typing import cast
 
 import torch
 from torch import nn
 
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -25,9 +24,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsQuant,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -37,7 +34,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.beam import BeamConfig
 
 from .activation import beam_softcap_logits
-from .attention import BeamAttention, use_merged_qkv_gate
+from .attention import BeamAttention
 from .layernorm import RMSNorm, beam_norm_residual_norm, beam_rms_norm
 from .moe import BeamMLP, BeamSparseMoeBlock
 
@@ -121,43 +118,9 @@ class BeamDecoderLayer(nn.Module):
 
 
 class BeamModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".self_attn.gate_proj": ".self_attn.output_gate_proj",
-        },
-        orig_to_new_stacked={
-            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
-            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
-            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
-            ".mlp.gate_proj": (".mlp.gate_up_proj", 0),
-            ".mlp.up_proj": (".mlp.gate_up_proj", 1),
-        },
-    )
-
-    @classmethod
-    def get_weights_mapper(cls, config: BeamConfig, tp_size: int) -> WeightsMapper:
-        mapper = cls.hf_to_vllm_mapper
-        if not use_merged_qkv_gate(config, tp_size):
-            return mapper
-        return WeightsMapper(
-            orig_to_new_substr=mapper.orig_to_new_substr,
-            orig_to_new_stacked={
-                **mapper.orig_to_new_stacked,
-                **{
-                    f".self_attn.{name}": (".self_attn.qkv_gate_proj", shard)
-                    for shard, name in enumerate(
-                        ("q_proj", "k_proj", "v_proj", "output_gate_proj")
-                    )
-                },
-            },
-        )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
-        self.hf_to_vllm_mapper = self.get_weights_mapper(
-            config, get_tensor_model_parallel_world_size()
-        )
         cache_config = vllm_config.cache_config
         if cache_config is not None:
             cache_config.sliding_window = None
@@ -244,10 +207,6 @@ class BeamModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class BeamForCausalLM(
     nn.Module,
@@ -258,7 +217,6 @@ class BeamForCausalLM(
 ):
     """Beam causal LM. LoRA support is deferred to a follow-up change."""
 
-    hf_to_vllm_mapper = BeamModel.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "qkv_gate_proj": ["q_proj", "k_proj", "v_proj", "output_gate_proj"],
@@ -365,7 +323,3 @@ class BeamForCausalLM(
         if logits is not None and self.final_logit_softcapping is not None:
             logits = beam_softcap_logits(logits, self.final_logit_softcapping)
         return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

@@ -1,25 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
 from torch import nn
-from torch.nn.parameter import Parameter
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
-from vllm.distributed import divide, get_tensor_model_parallel_rank
+from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    sharded_weight_loader,
-)
-from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -45,54 +38,6 @@ from ..ops.scatter_states import scatter_states
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
 
-def a_log_weight_loader(
-    shard_axis: int,
-) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Load KDA A_log stored as either old 4D or current 1D weights."""
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-        shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-
-        if loaded_weight.dim() == 4:
-            assert loaded_weight.shape[:2] == (1, 1), (
-                f"Expected old A_log shape (1, 1, H, 1), got {loaded_weight.shape}"
-            )
-            assert loaded_weight.shape[-1] == 1, (
-                f"Expected old A_log last dim to be 1, got {loaded_weight.shape}"
-            )
-            loaded_weight = loaded_weight.view(loaded_weight.shape[2])
-
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-        return default_weight_loader(param, loaded_weight)
-
-    return loader
-
-
-def _make_fused_conv1d_weight_loader(
-    dims: list[int],
-    tp_size: int,
-    tp_rank: int,
-) -> Callable[..., None]:
-    sharded_dims = [dim // tp_size for dim in dims]
-
-    def weight_loader(
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: int,
-    ) -> None:
-        if loaded_weight.dim() == 2:
-            loaded_weight = loaded_weight.unsqueeze(1)
-        shard_size = sharded_dims[loaded_shard_id]
-        source_start = tp_rank * shard_size
-        target_start = sum(sharded_dims[:loaded_shard_id])
-        loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
-
-    return weight_loader
-
-
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with one output replicated across TP ranks.
 
@@ -113,44 +58,8 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes = output_sizes.copy()
         output_sizes[replicated_shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
-
-    def weight_loader(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        if loaded_shard_id == self.replicated_shard_id:
-            self.tp_rank = 0
-            if param_tp_rank is not None:
-                param.tp_rank = 0
-        try:
-            super().weight_loader(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
-
-    def weight_loader_v2(
-        self,
-        param: BasevLLMParameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        if loaded_shard_id == self.replicated_shard_id:
-            self.tp_rank = 0
-            if param_tp_rank is not None:
-                param.tp_rank = 0
-        try:
-            super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
+        # every rank loads the replicated shard whole
+        self.shard_replicas = {replicated_shard_id: tp_size}
 
 
 @PluggableLayer.register("kimi_gated_delta_net_attention")
@@ -236,7 +145,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -248,22 +157,17 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        delattr(self.conv1d.weight, "weight_loader")
+        # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+        self.conv1d.shard_ids = (0, 1, 2)
         set_weight_attrs(
             self.conv1d.weight,
-            {
-                "weight_loader": _make_fused_conv1d_weight_loader(
-                    [self.projection_size] * 3,
-                    self.tp_size,
-                    self.tp_rank,
-                )
-            },
+            {"shard_dim": 0},
         )
 
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
 
         self.gate_lower_bound: float | None = kda_config.get("gate_lower_bound", None)
         if self.gate_lower_bound is not None:

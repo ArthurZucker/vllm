@@ -52,7 +52,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
-    VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.platforms import current_platform
@@ -149,9 +148,13 @@ def test_modelopt_mxfp8_preserves_per_row_checkpoint_scales(dist_init, monkeypat
         lambda **kwargs: kernel,
     )
     config = ModelOptMxFp8Config.from_config({"quant_method": "mxfp8"})
+    from vllm.model_executor.model_loader.ops_loader import load_with_ops
+
     linear = ReplicatedLinear(64, 64, bias=False, quant_config=config)
     scales = torch.arange(128, dtype=torch.uint8).reshape(64, 2)
-    linear.weight_scale.weight_loader(linear.weight_scale, scales)
+    model = torch.nn.Module()
+    model.linear = linear
+    load_with_ops(model, iter([("linear.weight_scale", scales)]), [])
     assert torch.equal(linear.weight_scale, scales)
 
 
@@ -665,6 +668,7 @@ def test_draft_weight_aliases_match_module_boundaries(prefix, source, target):
 
 
 def test_modelopt_mixed_precision_composes_gemma4_mappers():
+    from vllm.model_executor.model_loader.conversion_mapping import rename_mapper
     from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
     from vllm.model_executor.models.gemma4_mm import (
         Gemma4ForConditionalGeneration,
@@ -683,10 +687,8 @@ def test_modelopt_mixed_precision_composes_gemma4_mappers():
         }
     )
 
-    config.apply_vllm_mapper(
-        Gemma4ForConditionalGeneration.hf_to_vllm_mapper.get_rename_mapper()
-    )
-    config.apply_vllm_mapper(Gemma4ForCausalLM.hf_to_vllm_mapper.get_rename_mapper())
+    config.apply_vllm_mapper(rename_mapper(Gemma4ForConditionalGeneration))
+    config.apply_vllm_mapper(rename_mapper(Gemma4ForCausalLM))
 
     expected_prefix = "language_model.model.layers.0.experts"
     assert set(config.quantized_layers) == {
@@ -782,16 +784,6 @@ def test_modelopt_mixed_precision_does_not_infer_missing_sibling_linear(
     method = config.get_quant_method(fake_layer, missing_prefix)
 
     assert isinstance(method, UnquantizedLinearMethod)
-
-
-def test_vocab_parallel_embedding_weight_loader_accepts_scalar_scale():
-    holder = Mock()
-    scale = torch.nn.Parameter(torch.empty(1))
-    loaded_scale = torch.tensor(2.0)
-
-    VocabParallelEmbedding.weight_loader(holder, scale, loaded_scale)
-
-    assert torch.equal(scale, loaded_scale.reshape(1))
 
 
 @pytest.mark.skipif(
@@ -1858,100 +1850,3 @@ def test_modelopt_block_quant_dense_loading_preserves_whole_blocks(
     torch.testing.assert_close(layer.weight, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 0), (2, 1)])
-@pytest.mark.parametrize("gated", [True, False])
-@pytest.mark.parametrize(
-    "codec,block_size,block_bytes",
-    [("iq2_xs", 256, 74), ("iq2_xxs", 256, 66), ("q8_0", 32, 34)],
-)
-def test_modelopt_block_quant_loads_expert_blocks_with_aligned_tp_slices(
-    monkeypatch,
-    tp_size,
-    tp_rank,
-    gated,
-    codec,
-    block_size,
-    block_bytes,
-):
-    import vllm.model_executor.parameter as parameter_module
-    from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
-    from vllm.model_executor.layers.quantization.modelopt_block_quant import (
-        ModelOptBlockQuantMoEMethod,
-    )
-
-    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
-    monkeypatch.setattr(
-        parameter_module, "get_tensor_model_parallel_rank", lambda: tp_rank
-    )
-    monkeypatch.setattr(
-        parameter_module, "get_tensor_model_parallel_world_size", lambda: tp_size
-    )
-    config = _iq2_xs_moe_config(tp_size, tp_rank)
-    if not gated:
-        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-
-        config.activation = MoEActivation.RELU2_NO_MUL
-    method = ModelOptBlockQuantMoEMethod(config, codec=codec)
-    layer = torch.nn.Module()
-    layer.layer_name = "model.layers.0.mlp.experts"
-    layer.is_fused_checkpoint_transposed = False
-    layer.shared_expert_online_loader = None
-    layer._orient_fused_weight = RoutedExperts._orient_fused_weight
-    layer.get_expert_mapping = lambda **kwargs: (
-        RoutedExperts.build_expert_params_mapping(
-            "gate_proj",
-            "down_proj",
-            "up_proj",
-            num_experts=2,
-            routed_experts_prefix="",
-            **kwargs,
-        )
-    )
-    local_i = 512 // tp_size
-    method.create_weights(layer, 2, 256, local_i, torch.bfloat16)
-    assert layer.w13_weight.shape[1] == local_i * (2 if gated else 1)
-    layer.w13_weight.data.zero_()
-    layer.w2_weight.data.zero_()
-    for shard, name in (
-        ("w1", "w13_weight"),
-        ("w3", "w13_weight"),
-        ("w2", "w2_weight"),
-    ):
-        if shard == "w3" and not gated:
-            continue
-        shape = (
-            (256, 512 // block_size, block_bytes)
-            if shard == "w2"
-            else (512, 256 // block_size, block_bytes)
-        )
-        source = torch.randint(1, 256, shape, dtype=torch.uint8)
-        param = getattr(layer, name)
-        projection = {"w1": "gate", "w3": "up", "w2": "down"}[shard]
-        loaded = list(
-            RoutedExperts.load_weights(
-                layer,
-                [(f"1.{projection}_proj.weight", source)],
-            )
-        )
-        assert loaded == [name]
-        if shard == "w2":
-            expected = source[
-                :,
-                tp_rank * (local_i // block_size) : (tp_rank + 1)
-                * (local_i // block_size),
-            ]
-            actual = param[1]
-        else:
-            expected = source[tp_rank * local_i : (tp_rank + 1) * local_i]
-            offset = 0 if shard == "w1" else local_i
-            actual = param[1, offset : offset + local_i]
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        assert param[0].count_nonzero() == 0
-    with pytest.raises(ValueError, match="invalid packed tensor"):
-        layer.w2_weight.weight_loader(
-            layer.w2_weight,
-            torch.zeros(256, 512),
-            "w2_weight",
-            "w2",
-            0,
-        )

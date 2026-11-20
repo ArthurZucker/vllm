@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import math
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from functools import partial
 from typing import Annotated, Literal
 
@@ -79,9 +79,7 @@ from .ernie45 import Ernie4_5ForCausalLM
 from .interfaces import MultiModalEmbeddings, SupportsMRoPE, SupportsMultiModal
 from .siglip import SiglipMLP
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     maybe_prefix,
 )
 from .vision import get_vit_attn_backend
@@ -871,23 +869,6 @@ class SiglipVisionTransformer(nn.Module):
 
 
 class SiglipVisionModel(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-        },
-        # The SigLIP attention pooling head and packing pos embedding are
-        # present in the checkpoint but absent from this vision tower.
-        orig_to_new_substr={
-            "head.attention": None,
-            "head.layernorm": None,
-            "head.mlp": None,
-            "head.probe": None,
-            "packing_position_embedding": None,
-        },
-    )
-
     def __init__(
         self,
         config,
@@ -930,10 +911,6 @@ class SiglipVisionModel(nn.Module):
             cu_seqlens=cu_seqlens,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 @MULTIMODAL_REGISTRY.register_processor(
     PaddleOCRVLMultiModalProcessor,
@@ -941,13 +918,6 @@ class SiglipVisionModel(nn.Module):
     dummy_inputs=PaddleOCRVLDummyInputsBuilder,
 )
 class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsMRoPE):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.": "language_model.model.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -1161,8 +1131,3 @@ class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal, Support
         multimodal_embeddings += tuple(image_embeds)
 
         return multimodal_embeddings
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        autoloaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        return autoloaded_weights

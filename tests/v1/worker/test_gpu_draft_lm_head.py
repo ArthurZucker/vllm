@@ -13,12 +13,12 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     refresh_quantized_lm_heads,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader import ops_loader
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
     record_metadata_for_reloading,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -169,7 +169,7 @@ def test_draft_weight_update_loads_lm_head(
 
     def load(update_info):
         param = drafter.get_parameter("lm_head.weight")
-        getattr(param, "weight_loader", default_weight_loader)(param, new_weight)
+        ops_loader.current_load_into()("lm_head.weight", param, new_weight)
 
     worker = _draft_update_worker(
         default_vllm_config,

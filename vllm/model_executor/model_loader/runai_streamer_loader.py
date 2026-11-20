@@ -17,6 +17,9 @@ from vllm.config.load import LoadConfig
 from vllm.distributed import get_world_group, in_single_pp_stage
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.ops_loader import (
+    load_weights as load_model_weights,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -281,4 +284,4 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into a model."""
-        model.load_weights(self.get_all_weights(model_config, model))
+        load_model_weights(model, self.get_all_weights(model_config, model))

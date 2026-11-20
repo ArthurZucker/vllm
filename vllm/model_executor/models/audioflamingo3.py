@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable, Mapping, Sequence, Sized
+from collections.abc import Mapping, Sequence, Sized
 from typing import Annotated, Any, Literal, TypeAlias
 
 import torch
@@ -64,7 +64,6 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import (
-    AutoWeightsLoader,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -673,6 +672,3 @@ class AudioFlamingo3ForConditionalGeneration(
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

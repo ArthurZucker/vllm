@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from typing import Literal
 
 import torch
 from einops import rearrange
 from torch import nn
-from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
-from vllm.distributed import divide, get_tensor_model_parallel_rank
+from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -43,11 +41,6 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    sharded_weight_loader,
-)
-from vllm.model_executor.parameter import BasevLLMParameter, BlockQuantScaleParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
@@ -88,31 +81,6 @@ logger = init_logger(__name__)
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
 
-def a_log_weight_loader(
-    shard_axis: int,
-) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Load KDA A_log stored as either old 4D or current 1D weights."""
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-        shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-
-        if loaded_weight.dim() == 4:
-            assert loaded_weight.shape[:2] == (1, 1), (
-                f"Expected old A_log shape (1, 1, H, 1), got {loaded_weight.shape}"
-            )
-            assert loaded_weight.shape[-1] == 1, (
-                f"Expected old A_log last dim to be 1, got {loaded_weight.shape}"
-            )
-            loaded_weight = loaded_weight.view(loaded_weight.shape[2])
-
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-        return default_weight_loader(param, loaded_weight)
-
-    return loader
-
-
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with one output replicated across TP ranks."""
 
@@ -128,52 +96,8 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes = output_sizes.copy()
         output_sizes[replicated_shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
-
-    def weight_loader(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        replicate_block_scale = (
-            isinstance(param, BlockQuantScaleParameter)
-            and loaded_weight.shape[param.output_dim] < self.tp_size
-        )
-        if loaded_shard_id == self.replicated_shard_id or replicate_block_scale:
-            self.tp_rank = 0
-            if param_tp_rank is not None:
-                param.tp_rank = 0
-        try:
-            super().weight_loader(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
-
-    def weight_loader_v2(
-        self,
-        param: BasevLLMParameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None = None,
-    ) -> None:
-        tp_rank = self.tp_rank
-        param_tp_rank = getattr(param, "tp_rank", None)
-        replicate_block_scale = (
-            isinstance(param, BlockQuantScaleParameter)
-            and loaded_weight.shape[param.output_dim] < self.tp_size
-        )
-        if loaded_shard_id == self.replicated_shard_id or replicate_block_scale:
-            self.tp_rank = 0
-            if param_tp_rank is not None:
-                param.tp_rank = 0
-        try:
-            super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
-        finally:
-            self.tp_rank = tp_rank
-            if param_tp_rank is not None:
-                param.tp_rank = param_tp_rank
+        # every rank loads the replicated shard whole
+        self.shard_replicas = {replicated_shard_id: tp_size}
 
 
 def is_fused_kda_decode_supported(
@@ -520,45 +444,6 @@ def resolve_kda_prefill_backend(
     return "triton"
 
 
-def _make_decode_conv1d_weight_loader(
-    dims: list[int],
-    tp_size: int,
-    tp_rank: int,
-    decode_conv1d_weight: torch.Tensor | None,
-) -> Callable[..., None]:
-    sharded_dims = [dim // tp_size for dim in dims]
-
-    def weight_loader(
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: int,
-    ) -> None:
-        if loaded_weight.dim() == 2:
-            loaded_weight = loaded_weight.unsqueeze(1)
-        shard_size = sharded_dims[loaded_shard_id]
-        source_start = tp_rank * shard_size
-        target_start = sum(sharded_dims[:loaded_shard_id])
-        loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
-        if decode_conv1d_weight is not None and not param.is_meta:
-            decode_conv1d_weight[loaded_shard_id].copy_(
-                loaded_shard.squeeze(1).transpose(0, 1)
-            )
-
-    return weight_loader
-
-
-def _make_decode_norm_weight_loader(
-    decode_norm_weight: torch.Tensor,
-) -> Callable[..., None]:
-    def weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        default_weight_loader(param, loaded_weight)
-        if not param.is_meta:
-            decode_norm_weight.copy_(param.data)
-
-    return weight_loader
-
-
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3KDAAttentionBackend
@@ -664,7 +549,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.dt_bias = nn.Parameter(
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"shard_dim": 0})
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -791,23 +676,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.register_buffer(
             "decode_conv1d_weight", decode_conv1d_weight, persistent=False
         )
-        delattr(self.conv1d.weight, "weight_loader")
-        set_weight_attrs(
-            self.conv1d.weight,
-            {
-                "weight_loader": _make_decode_conv1d_weight_loader(
-                    [self.projection_size] * 3,
-                    self.tp_size,
-                    self.tp_rank,
-                    decode_conv1d_weight,
-                )
-            },
-        )
+        # q, k and v's convs, each sharded over the TP ranks (`conversion_mapping`)
+        self.conv1d.shard_ids = (0, 1, 2)
 
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        set_weight_attrs(self.A_log, {"shard_dim": 0})
 
         backend = (
             additional_config.get("kda_prefill_backend", "auto")
@@ -882,15 +757,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 device=self.o_norm.weight.device,
             )
         self.register_buffer("decode_norm_weight", decode_norm_weight, persistent=False)
-        if decode_norm_weight is not None:
-            # Upcast once while loading; direct BF16 norm weights slow the
-            # fully fused decode kernel.
-            if hasattr(self.o_norm.weight, "weight_loader"):
-                delattr(self.o_norm.weight, "weight_loader")
-            set_weight_attrs(
-                self.o_norm.weight,
-                {"weight_loader": _make_decode_norm_weight_loader(decode_norm_weight)},
-            )
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
@@ -913,6 +779,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    @torch.no_grad()
+    def process_weights_after_loading(self) -> None:
+        """The fused decode kernel's copies, rewritten in place (captured graphs
+        read them): the q/k/v convs width-major, the output norm in FP32 (direct
+        BF16 norm weights slow it)"""
+        if self.decode_conv1d_weight is not None:
+            self.decode_conv1d_weight.copy_(
+                self.conv1d.weight.view(
+                    3, self.local_projection_size, self.conv_size
+                ).transpose(1, 2)
+            )
+        if self.decode_norm_weight is not None:
+            self.decode_norm_weight.copy_(self.o_norm.weight)
 
     def get_kv_cache_checkpoint_alignment(self, vllm_config: VllmConfig) -> int | None:
         return kda_prefill_checkpoint_alignment(self.kda_prefill_backend)

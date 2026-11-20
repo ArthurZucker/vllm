@@ -8,10 +8,10 @@
   per-channel or MX scales), `weights_proj` in BF16, fused into one BF16
   weight after loading.
 
-Each checkpoint tensor loads on its own (any order, one per `load_weights`
-call), and an update may send the weight whole in BF16 instead, without its
-scale. Direct and layerwise reloads end with the bytes of a cold start, at the
-cold-start addresses."""
+Checkpoint tensors load in any order through `load_with_ops` (the indexer's
+one per call), and an update may send the weight whole in BF16 instead,
+without its scale. Direct and layerwise reloads end with the bytes of a cold
+start, at the cold-start addresses."""
 
 import pytest
 import torch
@@ -25,6 +25,8 @@ from vllm.model_executor.layers.quantization.dequant_linear import (
     DequantLinearMethod,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.model_loader.conversion_mapping import fused, rename
+from vllm.model_executor.model_loader.ops_loader import load_with_ops
 from vllm.model_executor.model_loader.reload.layerwise import (
     record_metadata_for_reloading,
 )
@@ -80,13 +82,12 @@ def _ptrs(model: torch.nn.Module) -> dict[str, int]:
 
 
 def _reload(model, ckpt, mode, model_config, monkeypatch, reverse=False):
-    """Send every tensor in its own `load_weights` call, as RL updates do
-    (`reverse`: weights before their scales)."""
+    """Send the update in one `load_weights` call (`reverse`: weights before
+    their scales)."""
     monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
     start_reload(model)
     items = list(ckpt.items())
-    for item in reversed(items) if reverse else items:
-        model.load_weights([item])
+    model.load_weights(reversed(items) if reverse else items)
     finish_reload(model, model_config, _DEVICE)
 
 
@@ -109,11 +110,11 @@ class _MlaModel(torch.nn.Module):
         assert DequantLinearMethod.wrap(self.o)
 
     def load_weights(self, weights) -> None:
-        for name, tensor in weights:
-            layer, shard, param_name = name.split(".")
-            param = getattr(getattr(self, layer), param_name)
-            shard_ids = () if shard == "-" else (int(shard),)
-            param.weight_loader(param, tensor, *shard_ids)
+        conversions = [
+            fused("qkv_a.", *(f"qkv_a.{i}." for i in range(len(_OUT)))),
+            rename("^o.-.", "o."),
+        ]
+        load_with_ops(self, iter(weights), conversions)
 
 
 def _mla_checkpoint(seed: int, scheme: str) -> dict[str, torch.Tensor]:
@@ -159,8 +160,7 @@ def _mla_cold_start(ckpt, scheme, model_config, scales_first=True) -> _MlaModel:
     ptrs = _ptrs(model)
     record_metadata_for_reloading(model)
     items = list(ckpt.items())
-    for item in items if scales_first else reversed(items):
-        model.load_weights([item])
+    model.load_weights(items if scales_first else reversed(items))
     process_weights_after_loading(model, model_config, _DEVICE)
     # dequantized in the loaded (BF16-sized) storage: no second allocation
     assert _ptrs(model) == ptrs
@@ -264,10 +264,8 @@ class _IndexerModel(torch.nn.Module):
             )
 
     def load_weights(self, weights) -> None:
-        params = dict(self.named_parameters())
-        for name, tensor in weights:
-            param = params[f"indexer.{name}"]
-            param.weight_loader(param, tensor)
+        weights = ((f"indexer.{name}", tensor) for name, tensor in weights)
+        load_with_ops(self, weights, [])
 
 
 def _wk_checkpoint(layout: str, gen: torch.Generator):
@@ -378,72 +376,6 @@ def test_indexer_reload_fp8_or_bf16(monkeypatch, model_config, layout, cold, mod
         assert fused.data_ptr() == fused_ptr
         assert _ptrs(model) == ptrs
         _assert_parts_in_fused(model.indexer)
-
-
-def _glm5_mla_params() -> dict:
-    """Params of a GLM5-next MLA layer whose projections load a block-FP8
-    checkpoint (see `bf16_linear`): only the names matter here."""
-    prefix = "layers.3.self_attn"
-    return {
-        f"{prefix}.{target}.weight_scale_inv": None
-        for target in ("fused_qkv_a_proj", "q_b_proj", "o_proj")
-    }
-
-
-def test_glm5next_attn_loader_renames_weight_scale():
-    # Some exporters name the block scale ``weight_scale``; under Fp8Config
-    # the projection's scale parameter is ``weight_scale_inv``.
-    from transformers import Glm5NextTextConfig
-
-    from vllm.models.glm5next.common.model import _mla_proj_checkpoint_tensor
-
-    config = Glm5NextTextConfig(kv_lora_rank=512)
-    scale = torch.rand(4, 2)
-    name, tensor = _mla_proj_checkpoint_tensor(
-        "layers.3.self_attn.kv_a_proj_with_mqa.weight_scale",
-        scale,
-        _glm5_mla_params(),
-        config,
-        0,
-    )
-    assert name == "layers.3.self_attn.kv_a_proj_with_mqa.weight_scale_inv"
-    assert tensor is scale
-    # a projection the model does not load from block-FP8 keeps its name
-    name, _ = _mla_proj_checkpoint_tensor(
-        "layers.0.self_attn.o_proj.weight_scale", scale, {}, config, 0
-    )
-    assert name == "layers.0.self_attn.o_proj.weight_scale"
-
-
-def test_glm5next_nope_kv_a_padding_block_scale():
-    # NoPE checkpoints omit kv_a's RoPE rows: the weight gets zero rows and the
-    # scale its extra blocks, each on its own (no weight/scale pairing).
-    from transformers import Glm5NextTextConfig
-
-    from vllm.models.glm5next.common.model import _mla_proj_checkpoint_tensor
-
-    config = Glm5NextTextConfig(kv_lora_rank=512)
-    prefix = "layers.3.self_attn.kv_a_proj_with_mqa"
-    weight = torch.randn(512, 256).to(torch.float8_e4m3fn)
-    _, padded = _mla_proj_checkpoint_tensor(
-        f"{prefix}.weight", weight, _glm5_mla_params(), config, 64
-    )
-    assert padded.shape == (576, 256) and padded.dtype == torch.float8_e4m3fn
-    assert torch.equal(padded[:512].view(torch.uint8), weight.view(torch.uint8))
-    assert not padded[512:].float().any()
-    scale = torch.rand(4, 2)
-    # Fp8Config's `weight_scale_inv`, and Quark's `weight_scale` for a layer
-    # built by QuarkConfig (its scale parameter keeps that name)
-    for scale_name, params in (
-        ("weight_scale_inv", _glm5_mla_params()),
-        ("weight_scale", {}),
-    ):
-        name, padded = _mla_proj_checkpoint_tensor(
-            f"{prefix}.{scale_name}", scale, params, config, 64
-        )
-        assert name == f"{prefix}.{scale_name}"
-        assert padded.shape == (5, 2)  # ceil(576 / 128) blocks
-        assert torch.equal(padded[:4], scale)
 
 
 def test_indexer_wk_stays_bf16_under_online_quantization(model_config):

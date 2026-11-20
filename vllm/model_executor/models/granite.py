@@ -30,7 +30,6 @@ learnable per-head attention sink (`self_attn.sinks`), and a per-layer RoPE base
 (`layer_rope_theta`, with 0 for NoPE).
 """
 
-from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -56,7 +55,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 
@@ -68,9 +66,7 @@ from .interfaces import (
     SupportsQuant,
 )
 from .utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     extract_layer_index,
     make_layers,
     maybe_prefix,
@@ -218,7 +214,7 @@ class GraniteAttention(nn.Module):
         # Per-head sink, applied in backend as extra logit in the softmax denom
         if has_sink:
             self.sinks = nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
-            set_weight_attrs(self.sinks, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(self.sinks, {"shard_dim": 0})
         else:
             self.sinks = None
 
@@ -314,17 +310,6 @@ class GraniteDecoderLayer(nn.Module):
 
 @support_torch_compile
 class GraniteModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            # weight_name: (param_name, shard_id)
-            ".q_proj": (".qkv_proj", "q"),
-            ".k_proj": (".qkv_proj", "k"),
-            ".v_proj": (".qkv_proj", "v"),
-            ".gate_proj": (".gate_up_proj", 0),
-            ".up_proj": (".gate_up_proj", 1),
-        }
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -403,15 +388,10 @@ class GraniteModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
 
 class GraniteForCausalLM(
     nn.Module, SupportsLoRA, SupportsPP, SupportsQuant, SupportsEagle3
 ):
-    hf_to_vllm_mapper = GraniteModel.hf_to_vllm_mapper
     # LoRA specific attributes
     packed_modules_mapping: dict[str, list[str]] = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -483,7 +463,3 @@ class GraniteForCausalLM(
                 ),
             }
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

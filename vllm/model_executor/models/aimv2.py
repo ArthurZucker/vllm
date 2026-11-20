@@ -3,7 +3,6 @@
 
 # A modified implementation of the AIMv2 Transformer
 # inserted here also the image tokenizer used by Ovis2
-from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -21,7 +20,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 
 class AIMv2SwiGLUFFN(nn.Module):
@@ -205,13 +203,6 @@ class AIMv2Transformer(nn.Module):
 
 
 class AIMv2Model(torch.nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".fc1": (".fc13", 0),
-            ".fc3": (".fc13", 1),
-        }
-    )
-
     def __init__(
         self,
         config: Aimv2VisionConfig,
@@ -228,18 +219,9 @@ class AIMv2Model(torch.nn.Module):
             require_post_norm=require_post_norm,
             prefix=f"{prefix}.trunk",
         )
-        # post_trunk_norm is optional (absent for clip-skip backbones).
-        if self.trunk.post_trunk_norm is None:
-            self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
-                orig_to_new_prefix={"trunk.post_trunk_norm.": None}
-            )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         x = self.preprocessor(pixel_values)
         x = self.trunk(x)
 
         return x
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
