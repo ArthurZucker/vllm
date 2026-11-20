@@ -642,17 +642,13 @@ class MergedColumnParallelLinear(StackedColumnParallelLinear):
             for param in (self.weight, self.bias):
                 if param is None:
                     continue
-                self._zero_output_padding(param)
+                param.data[-padding_size:].zero_()
                 set_weight_attrs(
                     param, {"weight_loader_numel": param[:-padding_size].numel()}
                 )
                 # The loader zeroes the padding too, but a load plan skips loader
                 # fills: direct reload zero-fills it at begin instead.
                 param.fill_on_reload = True
-
-    def _zero_output_padding(self, param: torch.Tensor) -> None:
-        if self.padding_size and (param is self.weight or param is self.bias):
-            param.data[-self.padding_size :].zero_()
 
     def _get_shard_size_mapping(self, loaded_shard_id: int) -> int:
         return self.output_sizes[loaded_shard_id] // self.tp_size
@@ -741,16 +737,6 @@ class QKVParallelLinear(StackedColumnParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
-
-    def _get_shard_offset_mapping(self, loaded_shard_id: str):
-        shard_offset_mapping = {
-            "q": 0,
-            "k": self.num_heads * self.head_size,
-            "v": (self.num_heads + self.num_kv_heads) * self.head_size,
-            "total": (self.num_heads + self.num_kv_heads) * self.head_size
-            + self.num_kv_heads * self.v_head_size,
-        }
-        return shard_offset_mapping.get(loaded_shard_id)
 
     def _get_shard_size_mapping(self, loaded_shard_id: str):
         shard_size_mapping = {
@@ -856,17 +842,6 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
-
-    def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
-        h = self.head_size
-        nq, nkv, nidx = self.num_heads, self.num_kv_heads, self.num_index_heads
-        return {
-            "q": 0,
-            "k": nq * h,
-            "v": (nq + nkv) * h,
-            "index_q": (nq + 2 * nkv) * h,
-            "index_k": (nq + 2 * nkv + nidx) * h,
-        }.get(loaded_shard_id)
 
     def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
         h = self.head_size

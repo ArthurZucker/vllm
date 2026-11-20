@@ -202,37 +202,3 @@ class KimiK3MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
-
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """Rewrite a checkpoint weight name to this module's parameter path.
-
-        Top-level MTP submodules (enorm/hnorm/eh_proj/shared_head) stay under
-        `model.layers.{spec_layer}.*`; the shared `embed_tokens` is hoisted
-        to `model.*`; everything else is a transformer-block weight and gets
-        `.mtp_block` inserted.
-        """
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "eh_proj",
-            "shared_head",
-        ]
-        shared_weight_names = ["embed_tokens"]
-        spec_layer_weight = False
-        shared_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                if weight_name in shared_weight_names:
-                    shared_weight = True
-                break
-        if not spec_layer_weight:
-            name = name.replace(
-                f"model.layers.{spec_layer}.",
-                f"model.layers.{spec_layer}.mtp_block.",
-            )
-        elif shared_weight:
-            name = name.replace(f"model.layers.{spec_layer}.", "model.")
-        return name

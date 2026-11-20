@@ -189,27 +189,6 @@ STEP5_PACKED_MODULES_MAPPING = {
 }
 
 
-# (packed parameter, checkpoint parameter, shard ID), in loading order.
-_STEP5_WEIGHT_SHARDS: tuple[tuple[str, str, str | int], ...] = (
-    ("qkvg_proj", "q_proj", 0),
-    ("qkvg_proj", "k_proj", 1),
-    ("qkvg_proj", "v_proj", 2),
-    ("qkvg_proj", "g_proj", 3),
-    ("qkv_proj", "q_proj", "q"),
-    ("qkv_proj", "k_proj", "k"),
-    ("qkv_proj", "v_proj", "v"),
-    ("qkv_indexer_proj", "q_proj", "q"),
-    ("qkv_indexer_proj", "k_proj", "k"),
-    ("qkv_indexer_proj", "v_proj", "v"),
-    ("qkv_indexer_proj", "sparse_indexer_q", "index_q"),
-    ("qkv_indexer_proj", "sparse_indexer_k", "index_k"),
-    ("qkv_indexer_proj", "sparse_indexer_z", "index_z"),
-    ("qkv_indexer_proj", "g_proj", "index_g"),
-    ("gate_up_proj", "gate_proj", 0),
-    ("gate_up_proj", "up_proj", 1),
-)
-
-
 def _get_step5_layer_types(config: Any) -> list[str]:
     """Per-layer attention types spanning the dense stack and the MTP layers.
 
@@ -586,21 +565,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             return shard_index * self.local_index_k_size, self.local_index_k_size
         if shard_id == "index_g":
             return self.tp_rank * self.local_gate_size, self.local_gate_size
-        raise ValueError(f"Unsupported sparse indexer shard: {shard_id}.")
-
-    def _indexer_dest_offset(self, shard_id: str) -> int:
-        offset = self.qkv_size
-        if shard_id == "index_q":
-            return offset
-        offset += self.local_index_q_size
-        if shard_id == "index_k":
-            return offset
-        offset += self.local_index_k_size
-        if shard_id == "index_z":
-            return offset
-        offset += self.local_index_z_size
-        if shard_id == "index_g":
-            return offset
         raise ValueError(f"Unsupported sparse indexer shard: {shard_id}.")
 
     def forward(  # type: ignore[override]

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -466,22 +465,6 @@ class GteNewModel(BertWithRope):
         for layer in self.encoder.layers:
             layer.mlp.gate_up_proj.bias = None
             layer.mlp.gate_up_proj.skip_bias_add = True
-
-    def split_up_gate_proj(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        n = "mlp.up_gate_proj"
-        for name, weight in weights:
-            if n in name:
-                up, gate = weight.chunk(2, dim=0)
-                yield name.replace(n, "mlp.up_proj"), up
-                yield name.replace(n, "mlp.gate_proj"), gate
-            else:
-                yield name, weight
-
-    def ignore_unnecessary_layers(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        for name, weight in weights:
-            if name.startswith("classifier"):
-                continue
-            yield name, weight
 
 
 class SnowflakeGteNewModel(GteNewModel):

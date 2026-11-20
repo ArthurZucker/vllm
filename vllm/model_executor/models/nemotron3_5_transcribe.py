@@ -357,14 +357,6 @@ def _unpack_experts(
     yield name, tensor
 
 
-def _pad_vocab_rows(tensor: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    if tensor.shape[0] >= vocab_size:
-        return tensor
-    return torch.cat(
-        [tensor, tensor.new_zeros(vocab_size - tensor.shape[0], tensor.shape[1])], dim=0
-    )
-
-
 def _mtp_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:

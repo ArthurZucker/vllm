@@ -205,9 +205,6 @@ class CompressedTensorsWNA8O8Int(CompressedTensorsScheme):
         replace_parameter(layer, "weight_packed", packed.contiguous())
         weight.packed_dim, weight.packed_factor = 1, self.pack_factor
 
-        def _noop_loader(*_, **__):
-            return None
-
         layer.register_parameter(
             "weight_shape",
             BasevLLMParameter(

@@ -60,15 +60,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
-    def uses_weight_scale_2_pattern(self) -> bool:
-        """Returns True if this quantization method uses 'weight_scale_2' pattern
-        for per-tensor weight scales (e.g., FP4 variants), False otherwise.
-
-        This method should be overridden by subclasses that use the
-        'weight_scale_2' pattern instead of the standard 'weight_scale' pattern.
-        """
-        return False
-
     def maybe_roundup_sizes(
         self,
         hidden_size: int,

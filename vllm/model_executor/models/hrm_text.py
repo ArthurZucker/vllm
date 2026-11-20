@@ -253,11 +253,7 @@ class HrmTextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Attribute name `self_attn` matches HF's model class. The on-disk
-        # `attn.{gqkv_proj,o_proj}.weight` keys are renamed to
-        # `self_attn.{gqkv_proj,o_proj}.weight` by the `WeightsMapper` in
-        # `HrmTextForCausalLM` so vLLM's standard `AutoWeightsLoader`
-        # handles the rest.
+        # Attribute name `self_attn` matches HF's model class.
         self.self_attn = HrmTextAttention(
             config=config,
             layer_idx_in_stack=layer_idx_in_stack,

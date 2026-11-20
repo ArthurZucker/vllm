@@ -242,12 +242,6 @@ class RankChunk(ConversionOps):
         return _each(input_dict, chunk)
 
 
-def _list(input_dict: dict) -> list[torch.Tensor]:
-    """The tensors of a single-source op, as a list (Transformers passes lists)"""
-    tensor = next(iter(input_dict.values()))
-    return tensor if isinstance(tensor, list) else [tensor]
-
-
 def _target(kwargs: dict) -> torch.Tensor:
     return kwargs["model"].get_parameter(kwargs["full_layer_name"])
 
@@ -294,7 +288,9 @@ class Narrow(ConversionOps):
                 return t
             return t.narrow(self.dim, self.start, self.length)
 
-        return {target_patterns[0]: [narrow(t) for t in _list(input_dict)]}
+        value = next(iter(input_dict.values()))
+        tensors = value if isinstance(value, list) else [value]
+        return {target_patterns[0]: [narrow(t) for t in tensors]}
 
 
 class Refuse(ConversionOps):
@@ -404,16 +400,11 @@ class ExpertScalars(ConversionOps):
                 return t.expand(rows)
             return t if t.numel() == rows else t.narrow(0, ep_rank * rows, rows)
 
-        columns = [
-            local(_one(input_dict[p])) for p in source_patterns if p in input_dict
-        ]
+        columns = {
+            p: local(_one(input_dict[p])) for p in source_patterns if p in input_dict
+        }
         if param.dim() == 2:
-            return {target_patterns[0]: torch.stack(columns, dim=1)}
-        first, *others = columns
-        for other in others:
-            if not torch.allclose(other, first, rtol=1e-5):
-                raise ValueError(
-                    f"{kwargs.get('full_layer_name')}: {source_patterns} differ; "
-                    "the param holds one value per expert"
-                )
-        return {target_patterns[0]: first}
+            return {target_patterns[0]: torch.stack(list(columns.values()), dim=1)}
+        return EqualSources().convert(
+            columns, source_patterns, target_patterns, **kwargs
+        )

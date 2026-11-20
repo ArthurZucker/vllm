@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only GLM-4.7-Flash MTP model compatible with HuggingFace weights."""
 
-
 import torch
 import torch.nn as nn
 from transformers import PreTrainedConfig
@@ -265,35 +264,3 @@ class Glm4MoeLiteMTP(nn.Module, SupportsPP, Glm4MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
-
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """Rewrite the weight name to match the format of the original model.
-        Add .mtp_block for modules in transformer layer block for spec layer
-        and rename shared layer weights to be top level.
-        """
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "eh_proj",
-            "shared_head",
-        ]
-        shared_weight_names = ["embed_tokens"]
-        spec_layer_weight = False
-        shared_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                if weight_name in shared_weight_names:
-                    shared_weight = True
-                break
-        if not spec_layer_weight:
-            # treat rest weights as weights for transformer layer block
-            name = name.replace(
-                f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
-            )
-        elif shared_weight:
-            # treat shared weights as top level weights
-            name = name.replace(f"model.layers.{spec_layer}.", "model.")
-        return name

@@ -657,23 +657,6 @@ class Dots3NoteModel(DeepseekV32Model):
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
 
-    def _adapt_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        for name, weight in weights:
-            if name.startswith("mtp."):
-                continue
-            if ".indexer." in name:
-                parts = name.split(".")
-                if "layers" in parts:
-                    layer_idx = int(parts[parts.index("layers") + 1])
-                    if (
-                        layer_idx < self.config.num_hidden_layers
-                        and self.config.layer_types[layer_idx] == "sliding_attention"
-                    ):
-                        continue
-            yield name, _pad_dense_mlp_weight(name, weight, self._weight_block_size)
-
 
 class Dots3NoteLanguageModelForCausalLM(DeepseekV32ForCausalLM):
     model_cls = Dots3NoteModel

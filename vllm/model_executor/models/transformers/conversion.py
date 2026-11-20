@@ -39,6 +39,7 @@ from transformers.utils.quantization_config import QuantizationConfigMixin
 
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.model_executor.layers.quantization.modelopt import LINEAR_ALGOS
+from vllm.model_executor.model_loader.weight_ops import _first
 
 
 class VllmFormatConfig(QuantizationConfigMixin):
@@ -98,9 +99,8 @@ class QuantizeOnLoad(ConversionOps):
         prefix, _, name = key.rpartition(".")
         quantize, scale_names, stacked = self.quantizer.targets[name]
         layer = kwargs["model"].get_submodule(prefix)
-        value = next(iter(input_dict.values()))
-        tensor = value[0] if isinstance(value, list) else value
-        tensor = tensor.to(getattr(layer, name).device, layer.params_dtype).contiguous()
+        tensor = _first(input_dict).to(getattr(layer, name).device, layer.params_dtype)
+        tensor = tensor.contiguous()
         if tensor.dim() == 3 and not stacked:  # experts, one at a time
             values, *scales = (torch.stack(o) for o in zip(*map(quantize, tensor)))
         elif isinstance(quantized := quantize(tensor), dict):
@@ -110,9 +110,7 @@ class QuantizeOnLoad(ConversionOps):
         out = {key: values}
         for scale_name, scale in zip(scale_names, scales):
             param = getattr(layer, scale_name)
-            if (
-                scale.numel() != param.numel()
-            ):  # one a row, in each of the param's slots
+            if scale.numel() != param.numel():  # one a row, in each of its slots
                 scale = scale.reshape(len(scale), *[1] * (param.dim() - 1))
                 scale = scale.expand(param.shape).contiguous()
             out[f"{prefix}.{scale_name}"] = scale

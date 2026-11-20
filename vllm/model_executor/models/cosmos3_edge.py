@@ -437,10 +437,6 @@ class Cosmos3EdgeAttentionDecoderLayer(nn.Module):
 class Cosmos3EdgeTextModel(NemotronHModel):
     """Nemotron-H backbone with Cosmos-owned checkpoint name mapping."""
 
-    # The enclosing Cosmos model maps and packs checkpoint weights. Disabling
-    # Nemotron-H's checkpoint-specific hook prevents those names from being
-    # remapped a second time when AutoWeightsLoader descends into this module.
-
 
 def _to_nemotron_h_config(text_config: Cosmos3EdgeTextConfig) -> NemotronHConfig:
     """Express the dense text model as Nemotron-H attention and MLP layers."""

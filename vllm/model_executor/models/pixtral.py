@@ -91,7 +91,7 @@ from .interfaces import (
     supports_eagle3,
 )
 from .module_mapping import MultiModelKeys
-from .utils import StageMissingLayer, init_vllm_registered_model, maybe_prefix
+from .utils import init_vllm_registered_model, maybe_prefix
 from .vision import (
     VisionEncoderInfo,
     VisionFeatureSelectStrategy,
@@ -208,10 +208,6 @@ def _merge_patches_by_index(
     # (N, D) -> (N / m^2, D * m^2), channel-major like F.unfold.
     merged = features[merge_indices]
     return merged.transpose(1, 2).reshape(merge_indices.shape[0], -1)
-
-
-def _is_layer_none_or_staged(layer: nn.Module) -> bool:
-    return layer is None or isinstance(layer, StageMissingLayer)
 
 
 class PixtralImagePixelInputs(TensorSchema):

@@ -225,9 +225,8 @@ class QuantizationConfig(ABC):
     def get_cache_scale_mapper() -> "WeightsMapper":
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
 
-        Returning a mapper here causes `AutoWeightsLoader` to apply it to the
-        weight stream automatically; individual model `load_weights` methods
-        do not need to know about KV-cache scales.
+        The loader applies it to the weight stream, so models need not know
+        about KV-cache scales.
         """
         from vllm.model_executor.models.utils import WeightsMapper
 

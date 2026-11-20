@@ -665,39 +665,6 @@ def make_layers(
     return start_layer, end_layer, modules
 
 
-# NOTE: don't use lru_cache here because it can prevent garbage collection
-_model_to_pp_missing_layer_names: dict[int, list[str]] = {}
-
-
-def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
-    """Get the names of the missing layers in a pipeline parallel model."""
-    model_id = id(model)
-    if model_id in _model_to_pp_missing_layer_names:
-        return _model_to_pp_missing_layer_names[model_id]
-
-    missing_layer_names = []
-    for name, module in model.named_modules():
-        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
-            # NOTE: the trailing dot is used to match the prefix of the layer.
-            # without the dot, we could match a layer that is not missing,
-            # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
-            missing_layer_names.append(name + ".")
-    _model_to_pp_missing_layer_names[model_id] = missing_layer_names
-
-    return missing_layer_names
-
-
-def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
-    """Check if a parameter is missing in a pipeline parallel model."""
-    if isinstance(model, (StageMissingLayer, PPMissingLayer)):
-        return True
-
-    return any(
-        name.startswith(missing_layer_name)
-        for missing_layer_name in get_pp_missing_layer_names(model)
-    )
-
-
 def compute_skip_topk_layers(config: "PreTrainedConfig") -> set[int]:
     """Backbone layers that reuse the top-k of the closest preceding indexer
     layer instead of building their own indexer."""

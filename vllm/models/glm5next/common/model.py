@@ -159,11 +159,6 @@ def _is_kda_layer(config: Glm5NextTextConfig, layer_idx: int) -> bool:
     )
 
 
-def _is_linear_attn(config: Glm5NextTextConfig) -> bool:
-    layer_types = config.layer_types
-    return layer_types is not None and "linear_attention" in layer_types
-
-
 def _validate_supported_config(config: Glm5NextTextConfig) -> None:
     """Reject checkpoints using config options this implementation lacks.
 
@@ -1315,21 +1310,6 @@ class Glm5NextForConditionalGeneration(
         config = super().get_encoder_cudagraph_config()
         config.buffer_keys = [k for k in config.buffer_keys if k != "pos_embeds"]
         return config
-
-
-def get_spec_layer_idx_from_weight_name(
-    config: Glm5NextTextConfig, weight_name: str
-) -> int | None:
-    if hasattr(config, "num_nextn_predict_layers") and (
-        config.num_nextn_predict_layers > 0
-    ):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(
-                f"model.layers.{layer_idx + i}."
-            ) or weight_name.startswith(f"layers.{layer_idx + i}."):
-                return layer_idx + i
-    return None
 
 
 def _fused_shared_experts_tuned(parallel_config: ParallelConfig) -> bool:

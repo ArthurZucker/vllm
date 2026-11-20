@@ -63,15 +63,6 @@ from vllm.transformers_utils.configs.radio import RadioConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backend import AttentionType
 
-_PARSE_MTP_WEIGHT_NAMES = frozenset(
-    {
-        "decoder.extra_heads.0.weight",
-        "decoder.extra_heads.0.bias",
-        "decoder.extra_proj.0.weight",
-        "decoder.extra_proj.0.bias",
-    }
-)
-
 
 def _content_normalized_positions(
     patches: torch.Tensor,
@@ -352,7 +343,6 @@ class MBartDecoderNoPos(nn.Module, EagleModelMixin):
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
-
 
 
 class NemotronParsePackedPixelInputs(TensorSchema):
@@ -770,4 +760,3 @@ class RadioMBartPrefixForCausalLM(nn.Module, SupportsMultiModal, SupportsEagle3)
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
-

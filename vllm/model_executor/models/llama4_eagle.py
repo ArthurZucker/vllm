@@ -55,9 +55,6 @@ if TYPE_CHECKING:
     class _EagleLlama4ForCausalLMBase(nn.Module):
         def set_moe_parameters(self) -> None: ...
 
-        def permute_qk_weight_for_rotary(
-            self, name: str, loaded_weight: torch.Tensor
-        ) -> tuple[str, torch.Tensor]: ...
 
 else:
     _EagleLlama4ForCausalLMBase = Llama4ForCausalLM

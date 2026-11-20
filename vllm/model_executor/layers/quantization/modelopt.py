@@ -946,10 +946,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         if self.csf_scales:
             logger.info_once("Keeping CSF-compressed NVFP4 MoE scales on the GPU.")
 
-    def uses_weight_scale_2_pattern(self) -> bool:
-        """FP4 variants use 'weight_scale_2' pattern for per-tensor weight scales."""
-        return True
-
     def dequantize_op(self, layer: torch.nn.Module):
         """Each NVFP4 checkpoint expert as it loads, for requantization: its
         `weight_scale_2` the decode multiplier"""

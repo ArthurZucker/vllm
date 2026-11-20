@@ -13,7 +13,6 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pcp_group,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import (
@@ -30,7 +29,6 @@ from vllm.model_executor.layers.mhc import (
     MHCPostOp,
     MHCPreDelayedOp,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -77,7 +75,6 @@ from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.platforms.rocm import on_gfx942
 from vllm.sequence import IntermediateTensors
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -1115,33 +1112,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return True
         logger.warning_once("Decoder SWA bounded replay is off: %s.", reason)
         return False
-
-    @staticmethod
-    def _pad_shared_expert_weight(
-        quant_config: QuantizationConfig | None,
-        name: str,
-        loaded_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
-        axis so the standard TP loaders split it into even, block-aligned shards
-        (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
-        down (w2 -> down_proj) [H, I] pads dim 1.
-        """
-        block_size = getattr(quant_config, "weight_block_size", None)
-        assert block_size is not None
-        # Round the intermediate axis up to a whole number of TP shards. The axis
-        # is in elements for weights (step = block) and in blocks for scales.
-        step = (
-            1 if name.endswith(("weight_scale_inv", "weight_scale")) else block_size[0]
-        )
-        dim = 1 if ".down_proj." in name else 0
-        mult = get_tensor_model_parallel_world_size() * step
-        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
-        if pad == 0:
-            return loaded_weight
-        pad_shape = list(loaded_weight.shape)
-        pad_shape[dim] = pad
-        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:

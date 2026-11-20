@@ -346,38 +346,3 @@ class DeepSeekV4MTP(nn.Module):
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         name = self._to_spec_layer_name(name)
         return get_spec_layer_idx_from_weight_name(self.config, name) is None
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """Rewrite the weight name to match the format of the original model.
-        Add .mtp_block for modules in transformer layer block for spec layer
-        and rename shared layer weights to be top level.
-        """
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "h_proj",
-            "e_proj",
-            "shared_head",
-            "hc_head_fn",
-            "hc_head_base",
-            "hc_head_scale",
-        ]
-        shared_weight_names = ["embed_tokens"]
-        spec_layer_weight = False
-        shared_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                if weight_name in shared_weight_names:
-                    shared_weight = True
-                break
-        if not spec_layer_weight:
-            # treat rest weights as weights for transformer layer block
-            name = name.replace(
-                f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
-            )
-        elif shared_weight:
-            # treat shared weights as top level weights
-            name = name.replace(f"model.layers.{spec_layer}.", "model.")
-        return name

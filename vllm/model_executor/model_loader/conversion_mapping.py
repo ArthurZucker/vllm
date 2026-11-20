@@ -1245,6 +1245,7 @@ NEMO_EXPERTS = [
 
 # A class's entry: its transforms, or a function of one of its modules returning them
 # (when they depend on the config, e.g. an MTP layer's index)
+VISION_QKV = [fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v.")]
 _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "K2HorizonAttention": _k2_horizon,
     "KimiGatedDeltaNetAttention": _kimi_kda,
@@ -1366,7 +1367,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "AIMv2Model": [
         fused(".fc13", ".fc1", ".fc3"),
     ],
-    # TODO: old loader: stacked_unparsed
     "AXK1Model": [
         MLA_QKV_A,
     ],
@@ -1385,7 +1385,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^vlm.model.language_model.", "language_model.model."),
         drop("^expert."),
     ],
-    # TODO: old loader: tensor_ops
     "BagelForConditionalGeneration": [
         drop("^vit_pos_embed.pos_embed"),
     ],
@@ -1402,8 +1401,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     "BailingMoeV25MLAAttention": [
         rename("^dense.", "o_proj."),
     ],
-    # TODO: old loader: stacked_unparsed
-    # TODO: old loader: tensor_ops
     "BailingMoeV3MTPModel": [
         rename(".attention.", ".self_attn."),
         rename("^attention.", "self_attn."),
@@ -1421,13 +1418,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "BeamForCausalLM": [
         rename(".self_attn.gate_proj", ".self_attn.output_gate_proj"),
-    ],
-    "BeeForConditionalGeneration": [
-        rename("^model.language_model.", "language_model.model."),
-        rename("^model.vision_tower.", "vision_tower."),
-        rename("^model.multi_modal_projector.", "multi_modal_projector."),
-        rename("^model.image_newline", "image_newline"),
-        rename("^lm_head.", "language_model.lm_head."),
     ],
     "BertEmbeddingModel": [
         rename("^bert.", "model."),
@@ -1465,10 +1455,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "BertWithRope": [
         rename("^model.", ""),
-    ],
-    # TODO: old loader: tensor_ops
-    "BlipVisionModel": [
-        fused(".qkv", ".q_proj", ".k_proj", ".v_proj"),
     ],
     "CLIPEmbeddingModel": [
         drop(".position_ids"),
@@ -1524,7 +1510,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.vision_model.vision_model.", "vision_model.vision_model."),
         rename("^model.", ""),
     ],
-    # TODO: old loader: tensor_ops
     "ColPaliModel": [
         rename("^embedding_proj_layer.", "custom_text_proj."),
         rename("^vlm.vision_tower.", "vision_tower."),
@@ -1535,7 +1520,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.multi_modal_projector.", "multi_modal_projector."),
         rename("^lm_head.", "language_model.lm_head."),
     ],
-    # TODO: old loader: tensor_ops
     "ColQwen3Model": [
         # the projection: ColPali's / TomoroAI's name, under any prefix
         rename(
@@ -1550,7 +1534,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.language_model.model.", "language_model.model."),
         rename("^model.language_model.", "language_model.model."),
     ],
-    # TODO: old loader: tensor_ops
     "ColQwen3_5Model": [
         rename(
             r"^(?:.*\.)?(?:custom_text_proj|embedding_proj_layer)\.",
@@ -1598,12 +1581,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
     ],
     "DSparkDeepseekV4ForCausalLM": _deepseek_v4_dspark,
     "DeepSeekV4MTP": _deepseek_v4_mtp,
-    "DSpineQwen3Model": [
-        rename(r"(?<![A-Za-z0-9_])midlayer(?=.|\*|$)", "layers.0"),
-        rename(r"(?<![A-Za-z0-9_])encoder.output_norm_enc(?=.|\*|$)", "hidden_norm"),
-        rename(r"(?<![A-Za-z0-9_])encoder.fc(?=.|\*|$)", "fc"),
-        rename("transfer_embeddings", "transfer_codebook"),
-    ],
     "DeepseekOCR2ForCausalLM": [
         rename("^model.embed_tokens.", "language_model.model.embed_tokens."),
         rename("^model.layers.", "language_model.model.layers."),
@@ -1615,13 +1592,9 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("midlayer.", "layers.0."),
         MLA_QKV_A,
     ],
-    # TODO: old loader: stacked_unparsed
     "DeepseekV2Model": [
         MLA_QKV_A,
     ],
-    # TODO: old loader: stacked_unparsed
-    "DeepseekV32MTP": lambda m: [*_spec_layers(m), *_mla_qkv_a(m)],
-    # TODO: old loader: stacked_unparsed
     "DeepseekV32Model": [
         MLA_QKV_A,
     ],
@@ -1710,7 +1683,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("net.4", "linear_project"),
         drop("^model.encoder.audio_encoder.positional_encoding.pe"),
     ],
-    # TODO: old loader: stacked_unparsed
     "FlashModel": [
         MLA_QKV_A,
     ],
@@ -1812,7 +1784,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^lm_head.", "language_model.lm_head."),
         rename("^model", "language_model.model"),
     ],
-    # TODO: old loader: stacked_unparsed
     "Glm4MoeLiteModel": [
         MLA_QKV_A,
     ],
@@ -1821,10 +1792,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.language_model.", "language_model.model."),
         rename("^model.visual.", "visual."),
     ],
-    "Glm4vVisionTransformer": [
-        fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
-    ],
-    # TODO: old loader: stacked_unparsed
+    "Glm4vVisionTransformer": VISION_QKV,
     "Glm5NextModel": [
         MLA_QKV_A,
         fused(
@@ -1838,9 +1806,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         ),
         fused(".conv1d", ".q_conv1d", ".k_conv1d", ".v_conv1d"),
     ],
-    "Glm5NextVisionTransformer": [
-        fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
-    ],
+    "Glm5NextVisionTransformer": VISION_QKV,
     "GlmAsrEncoder": [
         WHISPER_QKV_BIAS,
     ],
@@ -2033,6 +1999,13 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             "vision_model.vision_model.post_layernorm.",
         ),
     ],
+    "LlavaOnevisionForConditionalGeneration": [
+        rename("^model.language_model.", "language_model.model."),
+        rename("^model.vision_tower.", "vision_tower."),
+        rename("^model.multi_modal_projector.", "multi_modal_projector."),
+        rename("^model.image_newline", "image_newline"),
+        rename("^lm_head.", "language_model.lm_head."),
+    ],
     "LlavaOnevision2ForConditionalGeneration": [
         rename("^model.language_model.", "language_model.model."),
         rename("^model.visual.", "visual."),
@@ -2055,9 +2028,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         fused(".encoder_attn.kv_proj", ".encoder_attn.k_proj", ".encoder_attn.v_proj"),
     ],
     "Mamba2ForCausalLM": [
-        rename(".A_log", ".A"),
-    ],
-    "MambaForCausalLM": [
         rename(".A_log", ".A"),
     ],
     "MiMoForCausalLM": [
@@ -2220,11 +2190,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.multi_modal_projector.norm.", "vq_adaptor.layers.3."),
         drop("^model."),
     ],
-    "MossTranscribeDiarizeWhisperEncoder": [
-        rename(".fc1.", ".mlp.fc1."),
-        rename(".fc2.", ".mlp.fc2."),
-        WHISPER_QKV_BIAS,  # its k_proj has no bias
-    ],
     "MuseGlimmerForCausalLM": [
         rename(
             "model.vision_tower.patch_embedder.position_embedding_table.weight",
@@ -2285,14 +2250,12 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^backbone", "model"),
         drop("^mtp"),
     ],
-    # TODO: old loader: stacked_unparsed
     "NemotronHMTP": [
         rename("^language_model.", ""),
         drop(r"^(?!mtp\.)"),  # the target's
         drop("rotary_emb.inv_freq"),
         rename("^mtp.layers.", "model.layers."),
     ],
-    # TODO: old loader: tensor_ops
     "NemotronH_Nano_VL_V2": [
         rename("^language_model.backbone", "language_model.model"),
         rename("^vision_projector.vision_final_layernorm.", "vision_final_layernorm."),
@@ -2351,8 +2314,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^lm_head.", "language_model.lm_head."),
         rename("^model.", "language_model.model."),
     ],
-    # TODO: old loader: stacked_unparsed
-    "OpenPanguMTP": lambda m: [*_spec_layers(m), *_mla_qkv_a(m)],
     "PaddleOCRVLForConditionalGeneration": [
         rename("^model.", "language_model.model."),
         rename("^lm_head.", "language_model.lm_head."),
@@ -2400,7 +2361,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         rename("^model.embed_tokens_extend.audio_embed.", "embed_tokens_extend."),
         rename("^model.embed_tokens_extend.image_embed.", "vision_encoder."),
     ],
-    # TODO: old loader: tensor_ops
     "PixtralForConditionalGeneration": [
         # Mistral's consolidated names: the vision tower's and the adapter's
         rename("^vision_tower.", "vision_encoder."),
@@ -2491,9 +2451,7 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
             ".self_attn.v_proj.",
         ),
     ],
-    "Qwen3Omni_VisionTransformer": [
-        fused(".attn.qkv.", ".attn.q.", ".attn.k.", ".attn.v."),
-    ],
+    "Qwen3Omni_VisionTransformer": VISION_QKV,
     "Qwen3_5ForCausalLMBase": [
         rename("^model.language_model.", "model."),
         drop("^mtp."),
@@ -2643,6 +2601,11 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
         drop("^audio_tower.model."),
         drop("^audio_tower.proj_out."),
     ],
+    "WhisperEncoder": [
+        rename(".fc1.", ".mlp.fc1."),
+        rename(".fc2.", ".mlp.fc2."),
+        WHISPER_QKV_BIAS,  # its k_proj has no bias
+    ],
     "WhisperForConditionalGeneration": [
         drop("^proj_out."),
     ],
@@ -2655,7 +2618,6 @@ _CONVERSION_MAPPING: dict[str, "list[WeightTransform] | Callable"] = {
 }
 
 _CONVERSION_MAPPING["ColBERTModernBertModel"] = _CONVERSION_MAPPING["ColBERTLfm2Model"]
-# TODO: old loader: tensor_ops
 _CONVERSION_MAPPING["BailingMoeV3ForCausalLM"] = _CONVERSION_MAPPING[
     "BailingMoeV3MTPModel"
 ] + [
@@ -2677,7 +2639,7 @@ _CONVERSION_MAPPING["CohereAsrForConditionalGeneration"] = (
         rename("^log_softmax.mlp.layer0.", "proj_out."),
         rename("^(?!proj_out.)", "model."),
     ]
-    + _CONVERSION_MAPPING["MossTranscribeDiarizeWhisperEncoder"]
+    + _CONVERSION_MAPPING["WhisperEncoder"]
     + [
         drop("model.conv.batch_norm.num_batches_tracked"),
         drop("^model.preprocessor.featurizer.fb"),
@@ -2690,7 +2652,6 @@ _CONVERSION_MAPPING["D3ForSequenceClassification"] = _CONVERSION_MAPPING[
 _CONVERSION_MAPPING["DeepseekOCRForCausalLM"] = _CONVERSION_MAPPING[
     "DeepseekOCR2ForCausalLM"
 ]
-# TODO: old loader: tensor_ops
 _CONVERSION_MAPPING["DeepseekV4Model"] = [
     fused("compressor.fused_wkv_wgate", "compressor.wkv", "compressor.wgate"),
     *DEEPSEEK_V4_LAYER,
@@ -2704,7 +2665,7 @@ _CONVERSION_MAPPING["GLM4VModel"] = _CONVERSION_MAPPING["GLM4VForCausalLM"]
 _CONVERSION_MAPPING["GraniteMoeSharedModel"] = _CONVERSION_MAPPING["GraniteMoeModel"]
 _CONVERSION_MAPPING["InternS1ProForConditionalGeneration"] = _interns1_pro
 _CONVERSION_MAPPING["KimiAudioForConditionalGeneration"] = _CONVERSION_MAPPING[
-    "MossTranscribeDiarizeWhisperEncoder"
+    "WhisperEncoder"
 ] + [
     rename("^model.encoder.", "audio_tower."),
     rename(
@@ -2771,7 +2732,7 @@ _CONVERSION_MAPPING["LlavaForConditionalGeneration"] = _CONVERSION_MAPPING[
     "Gemma3ForConditionalGeneration"
 ]
 _CONVERSION_MAPPING["LlavaNextForConditionalGeneration"] = _CONVERSION_MAPPING[
-    "BeeForConditionalGeneration"
+    "LlavaOnevisionForConditionalGeneration"
 ]
 # its text layers saved as `encoder.layers.` (Transformers reverses its vision
 # tower's unanchored rename on save, and undoes it on load)
@@ -2782,11 +2743,8 @@ _CONVERSION_MAPPING["QianfanOCRForConditionalGeneration"] = [
 ]
 # its vision tower saved bare (`vision_tower.encoder.`), as vLLM's CLIP's `vision_model`
 _CONVERSION_MAPPING["LlavaNextVideoForConditionalGeneration"] = [
-    *_CONVERSION_MAPPING["BeeForConditionalGeneration"],
+    *_CONVERSION_MAPPING["LlavaOnevisionForConditionalGeneration"],
     rename(r"^vision_tower\.(?!vision_model\.)", "vision_tower.vision_model."),
-]
-_CONVERSION_MAPPING["LlavaOnevisionForConditionalGeneration"] = _CONVERSION_MAPPING[
-    "BeeForConditionalGeneration"
 ]
 _CONVERSION_MAPPING["MiMoV2OmniForCausalLM"] = (
     [
@@ -2813,6 +2771,8 @@ _CONVERSION_MAPPING["Mistral3ForConditionalGeneration"] = _CONVERSION_MAPPING[
     rename(".weight_scale_inv$", ".weight_scale"),
 ]
 _CONVERSION_MAPPING["MixtralModel"] = _CONVERSION_MAPPING["MixtralForCausalLM"]
+_CONVERSION_MAPPING["MambaForCausalLM"] = _CONVERSION_MAPPING["Mamba2ForCausalLM"]
+_CONVERSION_MAPPING["BlipVisionModel"] = _CONVERSION_MAPPING["Qwen2VisionTransformer"]
 _CONVERSION_MAPPING["OpenAIPrivacyFilterForTokenClassification"] = _CONVERSION_MAPPING[
     "GptOssForCausalLM"
 ] + [
@@ -2860,9 +2820,6 @@ _CONVERSION_MAPPING["Qwen3_5ForConditionalGeneration"] = _CONVERSION_MAPPING[
 _CONVERSION_MAPPING["Qwen3_5Model"] = _CONVERSION_MAPPING["InternS2MobiusModel"]
 _CONVERSION_MAPPING["Qwen3_5MultiTokenPredictor"] = _CONVERSION_MAPPING[
     "InternS2MobiusModel"
-]
-_CONVERSION_MAPPING["RForConditionalGeneration"] = _CONVERSION_MAPPING[
-    "BeeForConditionalGeneration"
 ]
 _CONVERSION_MAPPING["Step3VLForConditionalGeneration"] = _CONVERSION_MAPPING[
     "PaddleOCRVLForConditionalGeneration"
@@ -2916,11 +2873,6 @@ _CONVERSION_MAPPING["StepVLForConditionalGeneration"] = [
     rename(".mlp.c_fc", ".mlp.fc1"),
     rename(".mlp.c_proj", ".mlp.fc2"),
 ] + _CONVERSION_MAPPING["PaddleOCRVLForConditionalGeneration"]
-_CONVERSION_MAPPING["WhisperEncoder"] = _CONVERSION_MAPPING[
-    "MossTranscribeDiarizeWhisperEncoder"
-] + [
-    WHISPER_QKV_BIAS,
-]
 _CONVERSION_MAPPING["InternS2PreviewForConditionalGeneration"] = _CONVERSION_MAPPING[
     "Qwen3_5ForConditionalGeneration"
 ] + [
@@ -3049,6 +3001,8 @@ def _jina_roberta(module: nn.Module) -> list[WeightTransform]:
 # MTP drafts: the target's checkpoint, their layers renamed
 _CONVERSION_MAPPING["DeepSeekMTP"] = lambda m: [*_spec_layers(m), *_mla_qkv_a(m)]
 _CONVERSION_MAPPING["Glm4MoeLiteMTP"] = _CONVERSION_MAPPING["DeepSeekMTP"]
+_CONVERSION_MAPPING["DeepseekV32MTP"] = _CONVERSION_MAPPING["DeepSeekMTP"]
+_CONVERSION_MAPPING["OpenPanguMTP"] = _CONVERSION_MAPPING["DeepSeekMTP"]
 _CONVERSION_MAPPING["Glm4MoeMTP"] = lambda m: [
     rename(
         r"^lm_head\.weight$",
@@ -3092,6 +3046,10 @@ _CONVERSION_MAPPING["BailingMoeV3MultiTokenPredictor"] = [
 _CONVERSION_MAPPING["Eagle3LlamaForCausalLM"] = [
     rename(r"^(?:model\.)?midlayer\.", "model.layers.0."),
     drop("mask_hidden"),  # P-EAGLE's, parallel drafting is unsupported
+]
+_CONVERSION_MAPPING["DSpineQwen3Model"] = [
+    *_CONVERSION_MAPPING["DFlashQwen3Model"],
+    rename("transfer_embeddings", "transfer_codebook"),
 ]
 _CONVERSION_MAPPING["Eagle3Qwen3ForCausalLM"] = _CONVERSION_MAPPING[
     "Eagle3LlamaForCausalLM"
@@ -3230,7 +3188,7 @@ def from_mapper(mapper: "WeightsMapper") -> list[WeightTransform]:
             drop(pattern.pattern) if new is None else rename(pattern.pattern, new)
         )
     for kind, wrap in (
-        ("orig_to_new_substr", lambda k: re.escape(k)),
+        ("orig_to_new_substr", re.escape),
         ("orig_to_new_prefix", lambda k: "^" + re.escape(k)),
         ("orig_to_new_suffix", lambda k: re.escape(k) + "$"),
     ):

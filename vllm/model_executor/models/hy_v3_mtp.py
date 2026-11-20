@@ -44,22 +44,6 @@ from .utils import (
 )
 
 
-def _is_moe(config: PreTrainedConfig) -> bool:
-    return bool(
-        getattr(config, "num_experts", None)
-        and (
-            (isinstance(config.num_experts, int) and config.num_experts > 1)
-            or (isinstance(config.num_experts, list) and max(config.num_experts) > 1)
-        )
-    )
-
-
-def _get_cla_factor(config: PreTrainedConfig) -> int:
-    if not getattr(config, "use_cla", False):
-        return 1
-    return getattr(config, "cla_share_factor", 1)
-
-
 class HYV3SharedHead(nn.Module):
     def __init__(
         self,
@@ -219,25 +203,3 @@ class HYV3MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """Rewrite spec layer weight names to match vLLM module structure."""
-        # Skip embed_tokens (doesn't exist in V3 MTP checkpoint under spec
-        # layer) and shared_head (we use main model's lm_head instead)
-        if f"model.layers.{spec_layer}.embed_tokens" in name:
-            return "__skip__"
-        if f"model.layers.{spec_layer}.shared_head" in name:
-            return "__skip__"
-
-        spec_layer_weight_names = ["enorm", "hnorm", "eh_proj", "final_layernorm"]
-        spec_layer_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                break
-        if not spec_layer_weight:
-            # Transformer block weights go under .mtp_block
-            name = name.replace(
-                f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
-            )
-        return name

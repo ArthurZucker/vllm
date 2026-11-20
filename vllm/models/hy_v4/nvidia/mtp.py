@@ -28,64 +28,12 @@ from .model import HYV4DecoderLayer, _normalize_hyv4_config
 
 logger = init_logger(__name__)
 
-_MTP_SCALE_ONLY_PARAM_SUBSTRINGS = (
-    "_scale",
-    "_weight_scale",
-    "_weight_scale_inv",
-    "_input_scale",
-)
-
 # Names of the quant-config attribute that stores the unquantized-module
 # prefix list, in the order we look them up. Different QuantizationConfig
 # subclasses expose the list under different names:
 #   * ``ignored_layers`` -- Fp8Config, GPTQ / AWQ configs.
 #   * ``exclude_modules`` -- ModelOpt* configs (Fp8, NvFp4, MxFp8, Mixed).
 _MTP_QUANT_EXCLUSION_ATTRS = ("ignored_layers", "exclude_modules")
-
-
-def _should_skip_missing_mtp_scale_param(
-    quant_config: QuantizationConfig | None,
-    name: str,
-) -> bool:
-    """Whether an unmatched scale parameter can be silently ignored."""
-    return quant_config is None and any(
-        scale_name in name for scale_name in _MTP_SCALE_ONLY_PARAM_SUBSTRINGS
-    )
-
-
-def _resolve_fused_expert_param(
-    param_base: str,
-    ckpt_suffix: str,
-    params_dict: dict,
-) -> str | None:
-    """Map a fused expert checkpoint suffix onto a draft parameter name.
-
-    Fused checkpoints pack every expert into one tensor and name the companion
-    scales by suffixing the projection (`experts.gate_up_proj_scale_inv`),
-    while the draft model owns `experts.routed_experts.w13_weight` plus a
-    separate `..._scale_inv` parameter. Dropping the suffix would push the
-    scale into the weight parameter and leave the scale at its sentinel init.
-
-    Args:
-        param_base: Draft parameter holding the packed weight.
-        ckpt_suffix: Checkpoint text following the projection name.
-        params_dict: The draft model's named parameters.
-
-    Returns:
-        The matching draft parameter name, or None when there is none.
-
-    """
-    if not ckpt_suffix:
-        return param_base if param_base in params_dict else None
-    tail = ckpt_suffix.lstrip(".").removeprefix("weight_")
-    for candidate in (
-        f"{param_base}_{tail}",
-        f"{param_base}_scale_inv",
-        f"{param_base}_scale",
-    ):
-        if candidate in params_dict:
-            return candidate
-    return None
 
 
 def _prepare_mtp_fp8_expert_scale(
@@ -576,20 +524,3 @@ class HYV4MTP(nn.Module):
     ) -> torch.Tensor | None:
         self.model.spec_step_idx = spec_step_idx
         return self.model.compute_logits(hidden_states)
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        if f"model.layers.{spec_layer}.embed_tokens" in name:
-            return "__skip__"
-        if f"model.layers.{spec_layer}.shared_head" in name:
-            return "__skip__"
-
-        spec_layer_weight_names = ["enorm", "hnorm", "eh_proj", "final_layernorm"]
-        spec_layer_weight = any(
-            weight_name in name for weight_name in spec_layer_weight_names
-        )
-        if not spec_layer_weight:
-            name = name.replace(
-                f"model.layers.{spec_layer}.",
-                f"model.layers.{spec_layer}.mtp_block.",
-            )
-        return name

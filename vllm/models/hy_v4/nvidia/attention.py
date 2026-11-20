@@ -15,7 +15,6 @@ subclasses the platform's sparse MLA backend to forward `attn_sink`.
 
 from typing import cast
 
-import regex as re
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PreTrainedConfig
@@ -60,7 +59,6 @@ _SPARSE_LAYER_TYPES = (
     # TODO: Delete below once Transformers 5.18.0 is the minimum required version.
     "deepseek_sparse_attention",
 )
-_WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
 def sparse_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -298,8 +296,7 @@ class HYV4MLAAttention(nn.Module):
         if self.q_lora_rank is not None:
             # ``q_a_proj`` and ``kv_a_proj_with_mqa`` read the same
             # ``hidden_states`` and are both TP-replicated, so they run as one
-            # GEMM. The checkpoint keeps them separate; `load_weights` merges
-            # them through ``stacked_params_mapping``.
+            # GEMM. The checkpoint keeps them separate; loading merges them.
             self.fused_qkv_a_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],

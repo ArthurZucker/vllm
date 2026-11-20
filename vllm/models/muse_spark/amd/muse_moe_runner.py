@@ -765,13 +765,6 @@ def _online_mxfp4_applies(prefix: str) -> bool:
     return extract_layer_index(prefix) not in (0, num_layers - 1)
 
 
-_QUARK_EXPERT_PROJECTIONS = {
-    "gate_proj": ("w13_weight", "w1"),
-    "up_proj": ("w13_weight", "w3"),
-    "down_proj": ("w2_weight", "w2"),
-}
-
-
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
     """MuseSpark routed experts using ROCm BF16, FP8, or MXFP4 methods."""
 

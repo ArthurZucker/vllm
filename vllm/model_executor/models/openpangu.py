@@ -21,7 +21,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -1017,19 +1016,6 @@ class OpenPanguModel(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
-    def _filter_spec_layers(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        # Skip the MTP (spec-decode) layers that follow the main model's layers.
-        num_mtp = getattr(self.config, "num_nextn_predict_layers", 0)
-        for name, loaded_weight in weights:
-            if "layers" in name and num_mtp > 0:
-                layer_idx = int(name.split("layers.")[-1].split(".")[0])
-                mtp_idx = layer_idx - self.config.num_hidden_layers
-                if 0 <= mtp_idx < num_mtp:
-                    continue
-            yield name, loaded_weight
 
     def post_weight_load(self) -> None:
         for _, module in self.named_modules():

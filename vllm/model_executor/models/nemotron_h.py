@@ -661,34 +661,6 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def _get_max_n_routed_experts(self) -> int:
-        """Get max n_routed_experts from config or block_configs for puzzle models.
-
-        For heterogeneous models with varying expert counts per layer,
-        returns the MAX to ensure all expert weights can be loaded.
-        """
-        # First try top-level attribute
-        n_routed_experts = getattr(self.config, "n_routed_experts", None)
-        if n_routed_experts is not None:
-            return n_routed_experts
-
-        # For puzzle models, get MAX from all MoE blocks in block_configs
-        # (different layers may have different expert counts)
-        max_experts = 0
-        block_configs = getattr(self.config, "block_configs", None)
-        if block_configs:
-            for block in block_configs:
-                if isinstance(block, dict):
-                    if block.get("block_type") == "moe":
-                        max_experts = max(max_experts, block.get("n_routed_experts", 0))
-                else:
-                    # HF converts dicts to objects with attributes
-                    if getattr(block, "block_type", "") == "moe":
-                        max_experts = max(
-                            max_experts, getattr(block, "n_routed_experts", 0)
-                        )
-        return max_experts
-
 
 class NemotronHForCausalLM(
     nn.Module,

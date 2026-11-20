@@ -690,7 +690,7 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
         """An expert's scales of its `[rows, cols]` weight"""
         raise NotImplementedError
 
-    def _process_quantized(self, layer: Module) -> None:
+    def process_weights_after_loading(self, layer: Module) -> None:
         """The loaded (or requantized) fp8 experts into the kernel's format"""
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -711,9 +711,6 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
         )
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        self._process_quantized(layer)
 
     def _setup_kernel(
         self,

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVIDIA multi-token predictor for Dots3Note."""
 
-from collections.abc import Iterable, Iterator
 from functools import partial
 
 import torch
@@ -29,7 +28,7 @@ from vllm.models.deepseek_v32.nvidia.mtp import (
     DeepseekV32MultiTokenPredictor,
 )
 
-from .model import Dots3NoteDecoderLayer, _pad_dense_mlp_weight, pad_dense_mlp_weights
+from .model import Dots3NoteDecoderLayer, pad_dense_mlp_weights
 
 
 class Dots3NoteMultiTokenPredictorLayer(nn.Module):
@@ -173,23 +172,3 @@ class Dots3NoteMTP(DeepseekV32MTP):
                 getattr(self.quant_config, "weight_block_size", None),
             )
         ]
-
-    def _adapt_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        mtp_layer = self.config.num_hidden_layers
-        for name, weight in weights:
-            if name.startswith("model.mtp.embed_tokens."):
-                name = name.replace(
-                    "model.mtp.embed_tokens.",
-                    f"model.layers.{mtp_layer}.embed_tokens.",
-                    1,
-                )
-            yield (
-                name,
-                _pad_dense_mlp_weight(
-                    name,
-                    weight,
-                    getattr(self.quant_config, "weight_block_size", None),
-                ),
-            )

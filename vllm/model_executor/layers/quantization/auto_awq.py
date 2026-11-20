@@ -128,9 +128,6 @@ def _convert_awq_to_standard_format(
         dim=1, dtype=torch.int32
     )
 
-    def _noop_loader(*args, **kwargs):
-        pass
-
     new_param = PackedvLLMParameter(
         data=new_qw.contiguous(),
         input_dim=0,

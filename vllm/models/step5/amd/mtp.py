@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Step5 MTP on ROCm."""
 
-
 import torch
 from torch import nn
 
@@ -30,9 +29,6 @@ from .model import (
     Step5ForCausalLM,
     use_fp32_norm_weights,
 )
-
-# Per-MTP-layer weights; everything else in the layer is its decoder block.
-_MTP_LAYER_WEIGHTS = ("embed_tokens", "enorm", "hnorm", "eh_proj", "shared_head")
 
 
 class Step5MTPSharedHead(nn.Module):
@@ -190,4 +186,3 @@ class Step5MTP(nn.Module, SupportsMultiModal):
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor:
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
-

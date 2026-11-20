@@ -204,29 +204,3 @@ class MiniMaxM3MTP(nn.Module):
         elif not weight_update_active():
             # A complete checkpoint without embeddings borrows the target's.
             self.has_own_embed_tokens = False
-
-    def _map_checkpoint_name(self, name: str) -> str | None:
-        """Map a full checkpoint key to this MTP module's parameter name.
-
-        The MTP module only owns the *.mtp.layers.* weights plus the token
-        embedding and LM head, which the checkpoint shares with the main model.
-        Everything else belongs to other modules and is ignored here by returning
-        None.
-        """
-        # In the bundled checkpoint, the MTP weights are prefixed with
-        # "language_model". The standalone MTP checkpoint has no such prefix.
-        # Strip it if present.
-        name = name.removeprefix("language_model.")
-
-        if name == "model.embed_tokens.weight":
-            return "model.embed_tokens.weight"
-        if name == "lm_head.weight":
-            return "lm_head.weight"
-        if "model.mtp.layers" in name:
-            if "weight_scale_inv" in name:
-                # The checkpoint stores block scales as "weight_scale_inv".
-                # The ModelOpt MXFP8 layers expose them as "weight_scale".
-                name = name.replace("weight_scale_inv", "weight_scale")
-            # Strip "mtp" from prefix.
-            return name.replace(".mtp.", ".")
-        return None

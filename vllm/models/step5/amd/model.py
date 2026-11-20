@@ -559,25 +559,6 @@ class Step5DecoderLayer(nn.Module):
         return residual + ffn.float()
 
 
-_STACKED_PARAMS: tuple[tuple[str, str, str | int], ...] = (
-    ("qkv_proj", "q_proj", "q"),
-    ("qkv_proj", "k_proj", "k"),
-    ("qkv_proj", "v_proj", "v"),
-    ("gate_up_proj", "gate_proj", 0),
-    ("gate_up_proj", "up_proj", 1),
-)
-# The checkpoint packs each MoE projection as one [experts, out, in] tensor.
-_EXPERT_PARAMS = tuple(
-    (f"moe.experts.routed_experts.{param}{suffix}", f"moe.{proj}.{suffix}", shard)
-    for proj, param, shard in (
-        ("gate_proj", "w13_", "w1"),
-        ("up_proj", "w13_", "w3"),
-        ("down_proj", "w2_", "w2"),
-    )
-    for suffix in ("weight_scale_inv", "weight")
-)
-
-
 @support_torch_compile
 class Step5Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

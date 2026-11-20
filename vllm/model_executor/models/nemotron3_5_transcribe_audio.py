@@ -36,15 +36,6 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from .utils import maybe_prefix
 from .vision import get_multimodal_config
 
-# Checkpoint tensors that the inference path does not use. The speaker
-# encoder's own preprocessor is unused because both encoders read the mel
-# features of the perception preprocessor; ``hidden_to_spks`` is a frozen
-# legacy head.
-_UNUSED_CHECKPOINT_PREFIXES = (
-    "encoder.diarization_model.preprocessor.",
-    "encoder.diarization_model.sortformer_modules.hidden_to_spks.",
-)
-
 
 class _TowerLinear(ReplicatedLinear):
     """A replicated linear layer over the last dimension of any input shape.
@@ -1074,4 +1065,3 @@ class Nemotron3_5TranscribeAudioTower(nn.Module):
         return [
             emb[:length] for emb, length in zip(embeddings, encoded_lengths.tolist())
         ]
-

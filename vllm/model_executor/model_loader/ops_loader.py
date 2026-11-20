@@ -50,7 +50,7 @@ from vllm.model_executor.model_loader.conversion_mapping import (
     from_mapper,
     get_conversion_mapping,
 )
-from vllm.model_executor.model_loader.weight_ops import PadToParam
+from vllm.model_executor.model_loader.weight_ops import PadToParam, _first, _one
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import storage_view
 from vllm.platforms import current_platform
@@ -89,17 +89,13 @@ def _placement(layer: nn.Module, param: nn.Parameter) -> tuple[int | None, int, 
                 size,
             )
         return dim, getattr(layer, "tp_rank", 0), size
+    dim = getattr(param, "shard_dim", None)
     if hasattr(layer, "moe_config"):  # the experts
         config = layer.moe_config.moe_parallel_config
-        return getattr(param, "shard_dim", None), config.tp_rank, config.tp_size
+        return dim, config.tp_rank, config.tp_size
     if not model_parallel_is_initialized():  # a model built alone (e.g. a test)
-        return getattr(param, "shard_dim", None), 0, 1
-    rank = get_tensor_model_parallel_rank()
-    return (
-        getattr(param, "shard_dim", None),
-        rank,
-        get_tensor_model_parallel_world_size(),
-    )
+        return dim, 0, 1
+    return dim, get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
 
 
 def _replicas(layer: nn.Module, shard) -> int:
@@ -128,12 +124,8 @@ class VllmShard:
         shards=None,
         read_along: bool = False,
     ):
-        self.param, self.sources, self.index, self.expert = (
-            param,
-            sources,
-            index,
-            expert,
-        )
+        self.param, self.sources, self.index = param, sources, index
+        self.expert = expert
         self.covers = shards  # shards each source fills (`conversion_mapping.Fused`)
         # a requantized checkpoint's tensor (`conversion.ReadAlong`): its layout is
         # not the param's, sharded in proportion
@@ -189,8 +181,7 @@ class VllmShard:
             dtype = torch.float32  # an fp32 param (a router bias) is not rounded first
         tensor = tensor.to(device=device)
         for op in getattr(param, "load_ops", ()):  # e.g. A_log's `-exp`, as saved
-            out = next(iter(op.convert({"t": [tensor]}, ["t"], ["t"]).values()))
-            tensor = out[0] if isinstance(out, list) else out
+            tensor = _first(op.convert({"t": [tensor]}, ["t"], ["t"]))
         return tensor.to(dtype=dtype)
 
     def _slice(self, source, shape, dim, rank, size, target):
@@ -282,7 +273,7 @@ class ShardOutputs(ConversionOps):
         layer_name = kwargs["full_layer_name"]  # the first target's full name
         output = {}
         for pattern, tensor in input_dict.items():
-            tensor = tensor[0] if isinstance(tensor, list) else tensor
+            tensor = _one(tensor)
             name = layer_name.replace(target_patterns[0], pattern)
             try:
                 param = self.model.get_parameter(name)

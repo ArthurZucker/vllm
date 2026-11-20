@@ -40,11 +40,6 @@ class BasevLLMParameter(Parameter):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    def _is_1d_and_scalar(self, loaded_weight: torch.Tensor):
-        cond1 = self.data.ndim == 1 and self.data.numel() == 1
-        cond2 = loaded_weight.ndim == 0 and loaded_weight.numel() == 1
-        return cond1 and cond2
-
 
 class _ColumnvLLMParameter(BasevLLMParameter):
     """Parameter of a column parallel linear layer (QKV and MLP layers included):

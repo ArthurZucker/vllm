@@ -203,7 +203,3 @@ class ColQwen3_5Model(
         "custom_text_proj",  # ColPali naming
         "embedding_proj_layer",  # Alternative naming
     }
-
-    def _is_proj_weight(self, name: str) -> bool:
-        """Check if a weight name belongs to the projection layer."""
-        return any(proj_name in name for proj_name in self._PROJ_LAYER_NAMES)

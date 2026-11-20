@@ -923,12 +923,6 @@ class KimiDecoderLayer(nn.Module):
         return hidden_states, prefix_sum, residual
 
 
-# (param_name, shard_name, shard_id) for the merged DSA wkv_index.
-_DSA_STACKED_PARAMS_MAPPING = [
-    (".self_attn.dsa_indexer.wkv_index.", ".self_attn.indexer.wk.", 0),
-    (".self_attn.dsa_indexer.wkv_index.", ".self_attn.indexer.weights_proj.", 1),
-]
-
 # DSA indexer weight rename mapping. Specific rules must come before the
 # generic ".self_attn.indexer." rule: the loop breaks on the first match.
 _DSA_RENAME_PARAMS_MAPPING = [
@@ -1441,23 +1435,6 @@ class KimiLinearForCausalLM(
                     module.pack_projections()
         if self.specialized_decode is not None:
             self.specialized_decode.process_weights_after_loading()
-
-
-def get_spec_layer_idx_from_weight_name(
-    config: KimiLinearConfig, weight_name: str
-) -> int | None:
-    if hasattr(config, "num_nextn_predict_layers") and (
-        config.num_nextn_predict_layers > 0
-    ):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            # Match regardless of the surrounding prefix. The name may arrive as
-            # ``model.layers.{i}.``, a bare ``layers.{i}.`` (after AutoWeightsLoader
-            # has stripped the ``model.`` prefix in the main model), or with the
-            # multimodal ``language_model.model.layers.{i}.`` prefix.
-            if f"layers.{layer_idx + i}." in weight_name:
-                return layer_idx + i
-    return None
 
 
 @MULTIMODAL_REGISTRY.register_processor(

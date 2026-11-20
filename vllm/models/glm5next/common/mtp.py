@@ -295,28 +295,3 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         # Greedy-draft path used when use_local_argmax_reduction is enabled:
         # vocab-parallel argmax, no full-vocab logits.
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "eh_proj",
-            "shared_head",
-        ]
-        shared_weight_names = ["embed_tokens"]
-        spec_layer_weight = False
-        shared_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                if weight_name in shared_weight_names:
-                    shared_weight = True
-                break
-        if not spec_layer_weight:
-            name = name.replace(
-                f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
-            )
-        elif shared_weight:
-            name = name.replace(f"model.layers.{spec_layer}.", "model.")
-        return name

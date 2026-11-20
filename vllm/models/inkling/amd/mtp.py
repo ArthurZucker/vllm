@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from functools import partial
 
-import regex as re
 import torch
 from torch import nn
 
@@ -53,11 +52,6 @@ _ATTENTION_PARAMS_MAPPING = [
     ("qkvr", "wv_dv", 2),
     ("qkvr", "wr_du", 3),
 ]
-
-
-def _mtp_depth_from_name(name: str) -> int | None:
-    m = re.search(r"\.mtp\.layers\.(\d+)\.", name)
-    return int(m.group(1)) if m else None
 
 
 def _select_mtp_depth_count(n_predict: int, num_spec: int | None) -> int:
