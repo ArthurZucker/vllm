@@ -210,6 +210,8 @@ def _add_vllm_audio_metadata(
     processed: BatchFeature,
     num_audios: int,
 ) -> BatchFeature:
+    if "audio_feature_lengths" not in processed:  # Transformers' processor: masks
+        processed["audio_feature_lengths"] = processed["input_features_mask"].sum(-1)
     audio_feature_lengths = processed["audio_feature_lengths"]
     if not isinstance(audio_feature_lengths, torch.Tensor):
         audio_feature_lengths = torch.tensor(audio_feature_lengths, dtype=torch.long)
