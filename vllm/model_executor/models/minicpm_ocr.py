@@ -49,6 +49,7 @@ from .minicpmv4_6 import (
 # transformers videos go through `MiniCPMOcrVideoProcessor`, which has no
 # small-image upsize logic at all.
 _OCR_IMAGE_UPSIZE_KWARGS = (
+    "small_image_upsize",  # Transformers': "always", "never" or "adaptive"
     "disable_small_image_upsize",
     "adaptive_small_image_upsize",
     "adaptive_upsize_font_px",
@@ -61,11 +62,7 @@ _OCR_IMAGE_UPSIZE_KWARGS = (
 # Pinned for video frames: `_compute_visual_tokens` counts an unsliced frame as
 # upscaled to `scale_resolution` with uniform tiles, but `process_videos` runs
 # the image processor, whose own defaults are not visible to that count.
-_VIDEO_PINNED_UPSIZE_KWARGS = {
-    "disable_small_image_upsize": False,
-    "adaptive_small_image_upsize": False,
-    "adaptive_tile_upsize": False,
-}
+_VIDEO_PINNED_UPSIZE_KWARGS = {"small_image_upsize": "always"}
 
 
 class MiniCPMOcrProcessingInfo(MiniCPMV4_6ProcessingInfo):

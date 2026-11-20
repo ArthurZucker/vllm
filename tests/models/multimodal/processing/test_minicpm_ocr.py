@@ -382,9 +382,8 @@ def test_video_path_pins_the_upsize_defaults(monkeypatch):
     )
 
     assert captured["downsample_mode"] == "4x"
-    assert captured["adaptive_small_image_upsize"] is False
-    assert captured["disable_small_image_upsize"] is False
-    assert captured["adaptive_tile_upsize"] is False
+    assert captured["small_image_upsize"] == "always"
+    assert "adaptive_small_image_upsize" not in captured
 
 
 def test_placeholder_falls_back_when_target_sizes_disagree_with_the_grid():
