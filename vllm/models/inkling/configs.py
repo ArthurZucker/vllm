@@ -245,6 +245,8 @@ class InklingAudioConfig(PreTrainedConfig):
                 "Enabled Inkling audio tower is missing config fields: "
                 + ", ".join(missing)
             )
+        if decoder_dmodel is not None:  # Transformers' (the text model's): it wins
+            decoder_dmodel = kwargs.get("text_hidden_size", decoder_dmodel)
         self.decoder_dmodel = decoder_dmodel
         self.n_mel_bins = cast(int, n_mel_bins)
         self.mel_vocab_size = cast(int, mel_vocab_size)
@@ -286,6 +288,8 @@ class InklingVisionConfig(PreTrainedConfig):
                 + ", ".join(missing)
             )
         self.vision_encoder_type = cast(Literal["linear", "hmlp"], vision_encoder_type)
+        if decoder_dmodel is not None:  # Transformers' (the text model's): it wins
+            decoder_dmodel = kwargs.get("text_hidden_size", decoder_dmodel)
         self.decoder_dmodel = decoder_dmodel
         self.patch_size = cast(int, patch_size)
         self.temporal_patch_size = cast(int, temporal_patch_size)
