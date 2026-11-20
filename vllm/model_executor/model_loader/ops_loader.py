@@ -315,7 +315,10 @@ def copy_into(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
         for v, p in zip(value.chunk(segments, dim), param.data.chunk(segments, dim)):
             p[tuple(slice(0, n) for n in v.shape)].copy_(v)
         return
-    default_weight_loader(param, value)
+    try:
+        default_weight_loader(param, value)
+    except AssertionError as error:  # a shape mismatch: say which param
+        raise AssertionError(f"{name}: {error}") from None
 
 
 # `load_into(name, param, value)`: writes one final value into its param
