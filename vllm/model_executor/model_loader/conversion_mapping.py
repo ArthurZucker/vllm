@@ -480,6 +480,11 @@ def _deepseek_v4(
         out.append(rename("^" + prefix, f"{root}model.{prefix}"))
     if not image:
         out += [drop("^" + name) for name in image_tensors]
+    # as Transformers saves it (`save_pretrained`): `model.hc_head.hc_*`, `attn.norm`
+    out += [
+        rename(r"^model\.hc_head\.hc_(base|fn|scale)$", rf"{root}model.hc_head_\1"),
+        rename(r"\.attn\.norm\.", ".attn.kv_norm."),
+    ]
     out += [
         rename("head.weight$", f"{root}lm_head.weight"),
         rename("embed.weight$", "embed_tokens.weight"),
