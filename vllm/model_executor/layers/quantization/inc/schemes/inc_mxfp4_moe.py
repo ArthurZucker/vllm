@@ -53,7 +53,7 @@ class INCMxfp4MoEMethod(FusedMoEMethodBase):
     when requested; otherwise it uses CUTLASS W4A4, XPU W4A4, or Marlin W4A16.
     The per-expert `gate_proj` / `up_proj` / `down_proj` tensors are
     folded into the stacked `w13` / `w2` parameters by
-    `make_expert_params_mapping`.
+    the expert params mapping.
     """
 
     def __init__(self, moe) -> None:

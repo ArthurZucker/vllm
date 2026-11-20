@@ -3,6 +3,11 @@
 from collections.abc import Callable
 
 import torch
+from transformers.core_model_loading import (
+    Concatenate,
+    MergeModulelist,
+    WeightConverter,
+)
 
 import vllm._custom_ops as ops
 from tests.kernels.quant_utils import per_block_cast_to_int8
@@ -96,6 +101,26 @@ def make_dummy_moe_config(
         routing_method=RoutingMethodType.TopK,
         max_num_tokens=max_num_tokens,
     )
+
+
+def expert_conversions(
+    src: str,
+    dst: str,
+    suffixes=("weight",),
+    names=("gate_proj", "up_proj", "down_proj"),
+) -> list[WeightConverter]:
+    """Per-expert `src.format(name, suffix)` merged into `dst.format(w13|w2, suffix)`"""
+    conversions = []
+    for suffix in suffixes:
+        gate, up, down = (src.format(name, suffix) for name in names)
+        merge = MergeModulelist(dim=0)
+        conversions += [
+            WeightConverter(
+                [gate, up], dst.format("w13", suffix), [merge, Concatenate(dim=1)]
+            ),
+            WeightConverter(down, dst.format("w2", suffix), [merge]),
+        ]
+    return conversions
 
 
 def triton_moe(

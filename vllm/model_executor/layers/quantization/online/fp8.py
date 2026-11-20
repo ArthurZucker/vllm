@@ -128,16 +128,8 @@ def _is_tp_sharded(layer: Module, *, reduces_output_dim: bool = True) -> bool:
 
 
 class OnlineLinearBase(OnlineQuantMixin, LinearMethodBase):
-    """Base for online linear methods quantizing a full-precision weight as it
-    loads.
-
-    `create_quantized_weights` registers the quantized params, which the plan's
-    quantize op (`checkpoint_quantizer`) fills with `quantize_weight` after the
-    model's converter ops (e.g. the merged `qkv`); a requantization source's
-    dequantize op runs on each checkpoint weight before them. An lm_head (a padded
-    vocab, tied to the embeddings, or a drafter's copy) keeps its full-precision
-    weight, quantized after loading.
-    """
+    """Quantizes a full-precision weight as it loads, except an lm_head's (padded,
+    tied or a drafter's copy), quantized after loading."""
 
     activation_quant_key: QuantKey | None
     scale_names: tuple[str, ...] = ("weight_scale",)
@@ -205,15 +197,10 @@ class OnlineLinearBase(OnlineQuantMixin, LinearMethodBase):
         (and a requantization source's dequantize op before them)"""
         if not getattr(layer, "quantizes_on_load", False):
             return None  # an lm_head, quantized after loading
-        from vllm.model_executor.models.transformers.conversion import (
-            VllmQuantizeQuantizer,
-        )
-
         quantize = partial(self.quantize_weight, layer)
-        targets = {"weight": (quantize, list(self.scale_names), True)}
-        if self.requantization_source is not None:
-            return self.requantizing(layer, targets)
-        return VllmQuantizeQuantizer(targets)
+        return self.quantizer(
+            layer, {"weight": (quantize, list(self.scale_names), True)}
+        )
 
     def quantized_weight(self, layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
         """`(weight, *scales)`: as loaded, else quantized now (an lm_head's)."""
@@ -667,24 +654,12 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
     def expert_scale_names(self, prefix: str) -> list[str]:
         return [f"{prefix}{self.weight_scale_name}"]
 
-    def quantized_params(
-        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
-    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-        fp8 = current_platform.fp8_dtype()
-        params = []
-        for prefix, rows, cols in (
-            ("w13_", w13_rows, hidden),
-            ("w2_", hidden, intermediate),
-        ):
-            params.append((f"{prefix}weight", (num_experts, rows, cols), fp8))
-            params.append(
-                (
-                    f"{prefix}{self.weight_scale_name}",
-                    (num_experts, *self._scale_shape(rows, cols)),
-                    torch.float32,
-                )
-            )
-        return params
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
+        scale_shape = self._scale_shape(rows, cols)
+        return [
+            ("weight", (rows, cols), current_platform.fp8_dtype()),
+            (self.weight_scale_name, scale_shape, torch.float32),
+        ]
 
     def _scale_shape(self, rows: int, cols: int) -> tuple[int, ...]:
         """An expert's scales of its `[rows, cols]` weight"""

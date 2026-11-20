@@ -4,7 +4,6 @@
 import os
 
 import torch
-from transformers.core_model_loading import ConversionOps
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -44,6 +43,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     is_layer_skipped,
 )
+from vllm.model_executor.model_loader.weight_ops import WholeOp
 from vllm.model_executor.utils import (
     is_weights_pre_processed,
     replace_parameter,
@@ -1125,15 +1125,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
-class Mxfp4ScaleToUint8(ConversionOps):
+class Mxfp4ScaleToUint8(WholeOp):
     """`Mxfp4MoEMethod`'s e8m0 scales as uint8: an e8m0 tensor viewed, a float one
     rounded to e8m0 first. Elementwise; whole, so the read does not cast it to the
     param's uint8 by value: sharded after"""
-
-    needs_full = True
-
-    def __init__(self, quantizer=None):
-        self.quantizer = quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):

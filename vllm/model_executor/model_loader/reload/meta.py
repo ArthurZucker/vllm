@@ -178,15 +178,9 @@ class CopyCounter(TorchDispatchMode):
 
 
 def get_numel_loaded(param: torch.Tensor, write: Callable[[], object]) -> int:
-    """How many elements of `param` `write()` loads, counted by its `copy_`s.
-
-    A write fills a single destination parameter, so the count is capped at that
-    parameter's size: some layers' loaders copy into the parameter more than once
-    -- e.g. ``composed_weight_loader`` runs an in-place post-load transform
-    (``param.copy_(fn(param))``) on top of the initial copy. Over-counting would
-    finalize the layer before every parameter is loaded, silently dropping the
-    trailing parameter(s) (e.g. Mamba ``mixer.D``).
-    """
+    """Elements of `param` that `write()` loads, counted by its `copy_`s. Capped at
+    the param's size: a write may copy twice (an in-place post-load transform), and
+    over-counting would finalize the layer early, dropping e.g. Mamba's `mixer.D`."""
     with CopyCounter() as counter:
         write()
     return min(counter.copied_numel, get_tensor_load_numel(param))

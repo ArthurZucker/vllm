@@ -224,9 +224,7 @@ class _Model(torch.nn.Module):
 
 @pytest.mark.parametrize("mode", ["layerwise", "direct"])
 def test_reload_requantizes_into_the_kernel_tensors(monkeypatch, mode):
-    """A reload writes the block-FP8 experts in the checkpoint layout and finishes
-    with the model's process_weights_after_loading; the kernel tensors keep their
-    storage."""
+    """A reload requantizes into the same kernel tensors (storage kept)."""
     monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
     model_config = SimpleNamespace(
         word_embeddings_untied_by_checkpoint=False, quantization=None

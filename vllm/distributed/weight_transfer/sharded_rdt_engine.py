@@ -1236,15 +1236,9 @@ class ShardedRDTWeightTransferEngine(
         """Bake the replay plan once, as a self-driven meta dry run, into
         `state` (the engine itself when omitted).
 
-        Puts the params on meta, then drives `model.load_weights` over
-        `init_info.names` through a recording `load_into` that writes with
-        `copy_into` directly (bypassing the layerwise reload's buffering, so
-        `_layerwise_process` is never in the path). Nothing materializes or
-        pulls; the fake's `copy_` records the source op chain and the meta
-        destination's geometry. Afterwards one scatter list per fully-loaded leaf
-        module (copied numel == loadable size) is indexed by source name; a
-        partial or unrecordable module fails the plan build. The model is
-        restored.
+        Loads fake weights onto meta through a recording `load_into` (bypassing
+        the reload's buffering); the fake's `copy_` records each op chain. One
+        scatter list per fully-loaded leaf module is indexed by source name.
         """
         from vllm.model_executor.model_loader.reload.layerwise import (
             initialize_layerwise_reload,
@@ -1268,12 +1262,7 @@ class ShardedRDTWeightTransferEngine(
 
         _t0 = time.perf_counter()
         with torch.device(self.device):
-            # Meta-restore params + save kernel tensors (we bypass the buffering
-            # write it installs, below).
             initialize_layerwise_reload(model)
-            # Write through a recording `load_into` on top of the reload's, so
-            # the single load pass copies on meta and records via the fake's
-            # copy_ — with no inline _layerwise_process, no deferral.
             from vllm.model_executor.model_loader.ops_loader import (
                 load_weights as load_model_weights,
             )
@@ -1322,9 +1311,8 @@ class ShardedRDTWeightTransferEngine(
     def _recording_load_into(
         self, model: torch.nn.Module, recorder: "BakeSink"
     ) -> Callable[[str, torch.Tensor, torch.Tensor], None]:
-        """A `load_into` that stamps `recorder.current = (leaf_module,
-        param_name)` around a plain `copy_into`, so the fake's `copy_` can
-        attribute each recorded copy."""
+        """`copy_into`, with `recorder.current` set so the fake's `copy_` knows
+        its module"""
         from vllm.model_executor.model_loader.ops_loader import copy_into
         from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 

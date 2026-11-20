@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers.core_model_loading import WeightConverter, rename_source_key
 
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.model_loader.conversion_mapping import (
@@ -20,6 +19,8 @@ from vllm.model_executor.models.alice_ai import (
     _AttentionResidualFinal,
 )
 from vllm.model_executor.offloader import PrefetchOffloader, UVAOffloader
+
+from .utils import map_checkpoint_name
 
 
 @pytest.mark.parametrize(
@@ -59,16 +60,8 @@ def test_unsupported_offloading_is_rejected(monkeypatch, backend, error):
 )
 def test_weight_mapping_preserves_shard_ids(source, target, shard_id):
     transforms = [*_CONVERSION_MAPPING["AliceAIModel"], QKV]
-    converters = [t for t in transforms if isinstance(t, WeightConverter)]
-    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
-    mapped, pattern = rename_source_key(
-        f"model.layers.0.{source}", renamings, converters
-    )
+    mapped, shard = map_checkpoint_name(transforms, f"model.layers.0.{source}")
     assert mapped == f"model.layers.0.{target}"
-    shard = None
-    if pattern is not None:
-        [converter] = [c for c in converters if pattern in c.source_patterns]
-        shard = converter.source_patterns.index(pattern)
     assert shard == shard_id
 
 

@@ -19,11 +19,6 @@ from typing import get_args
 
 import pytest
 import torch
-from transformers.core_model_loading import (
-    Concatenate,
-    MergeModulelist,
-    WeightConverter,
-)
 
 import vllm.model_executor.layers.quantization.utils.w8a8_utils
 from tests.kernels.moe.modular_kernel_tools.parallel_utils import (
@@ -31,7 +26,12 @@ from tests.kernels.moe.modular_kernel_tools.parallel_utils import (
     _set_vllm_config,
     parallel_launch_with_config,
 )
-from tests.kernels.moe.utils import TestMLP, make_test_weights, moe_quantize_weights
+from tests.kernels.moe.utils import (
+    TestMLP,
+    expert_conversions,
+    make_test_weights,
+    moe_quantize_weights,
+)
 from tests.kernels.utils import torch_moe
 from vllm.config import (
     CompilationConfig,
@@ -2366,22 +2366,9 @@ def _biased_moe_tp_worker(rank: int, tp_size: int, port: int, result_path: str):
                 (f"experts.{e}.up_proj.bias", up_bias),
                 (f"experts.{e}.down_proj.bias", b2[e]),
             ]
-        merge = MergeModulelist(dim=0)
-        conversions = []
-        for suffix in ("weight", "bias"):
-            gate_up = [f"experts.*.{p}.{suffix}" for p in ("gate_proj", "up_proj")]
-            conversions += [
-                WeightConverter(
-                    gate_up,
-                    f"experts.routed_experts.w13_{suffix}",
-                    [merge, Concatenate(dim=1)],
-                ),
-                WeightConverter(
-                    f"experts.*.down_proj.{suffix}",
-                    f"experts.routed_experts.w2_{suffix}",
-                    [merge],
-                ),
-            ]
+        conversions = expert_conversions(
+            "experts.*.{}.{}", "experts.routed_experts.{}_{}", ("weight", "bias")
+        )
         loaded = load_with_ops(model, iter(weights), conversions)
         assert {
             f"experts.routed_experts.{w}_{s}"

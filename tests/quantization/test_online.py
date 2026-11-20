@@ -13,11 +13,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch.distributed import ProcessGroup
-from transformers.core_model_loading import (
-    Concatenate,
-    MergeModulelist,
-    WeightConverter,
-)
 
 import vllm.model_executor.layers.quantization.online.nvfp4 as online_nvfp4
 from tests.quantization.utils import (
@@ -1044,21 +1039,16 @@ def _nvfp4_moe_checkpoint_tensors(
 
 
 def _per_expert_checkpoint(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Merged `w13_*` / `w2_*` expert tensors as the checkpoint stores them, one
-    per expert and projection: `{expert}.{gate,up,down}_proj.{tensor}`"""
+    """Merged `w13_*` / `w2_*` expert tensors as stored on disk:
+    `{expert}.{gate,up,down}_proj.{tensor}`"""
     checkpoint = {}
     for name, tensor in tensors.items():
         stem, suffix = name.split("_", 1)
         projections = ("gate_proj", "up_proj") if stem == "w13" else ("down_proj",)
-        for expert in range(tensor.shape[0]):
-            if stem == "w13":
-                parts = (
-                    tensor[expert].unbind(0)
-                    if tensor.dim() == 2
-                    else tensor[expert].chunk(2, dim=0)
-                )
-            else:
-                parts = (tensor[expert],)
+        for expert, t in enumerate(tensor):
+            parts = (
+                (t,) if stem != "w13" else t.unbind(0) if t.dim() == 1 else t.chunk(2)
+            )
             for projection, part in zip(projections, parts, strict=True):
                 checkpoint[f"{expert}.{projection}.{suffix}"] = part
     return checkpoint
@@ -1210,7 +1200,7 @@ def test_weight_loading_requantization_moe(
     source_format: str, default_vllm_config, monkeypatch
 ) -> None:
     """Online re-quantization dequantizes each checkpoint expert as it loads."""
-    from tests.kernels.moe.utils import make_dummy_moe_config
+    from tests.kernels.moe.utils import expert_conversions, make_dummy_moe_config
 
     # Loading local experts needs parameter TP metadata, not a process group.
     monkeypatch.setattr(
@@ -1281,19 +1271,7 @@ def test_weight_loading_requantization_moe(
 
     monkeypatch.setattr(target, "quantize_experts", quantize_experts)
     checkpoint = _per_expert_checkpoint(tensors)
-    conversions = [
-        WeightConverter(
-            ["layer.*.gate_proj.weight", "layer.*.up_proj.weight"],
-            "layer.w13_weight",
-            operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
-        ),
-        WeightConverter(
-            "layer.*.down_proj.weight",
-            "layer.w2_weight",
-            operations=[MergeModulelist(dim=0)],
-        ),
-    ]
-    _load_on_plan(layer, checkpoint, conversions)
+    _load_on_plan(layer, checkpoint, expert_conversions("layer.*.{}.{}", "layer.{}_{}"))
 
     # Gate/up ordering and distinct global scales must survive the plan.
     torch.testing.assert_close(seen["w13_weight"].cpu(), expected_w13, rtol=0, atol=0)

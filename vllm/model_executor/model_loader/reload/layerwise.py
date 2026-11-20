@@ -154,16 +154,12 @@ def _untrack(layers: Iterable[torch.nn.Module]) -> None:
 
 
 def reloading() -> bool:
-    """Whether writes are buffered (a layerwise reload in progress): `load_with_ops`
-    then writes through `reload_load_into`"""
+    """Whether a layerwise reload is buffering writes"""
     return bool(_TRACKED)
 
 
 def reload_load_into(name: str, param: torch.Tensor, value: torch.Tensor) -> None:
-    """The write `load_with_ops` uses during a layerwise reload: a write into a
-    tracked (checkpoint-layout, on meta) tensor is buffered and counted; once its
-    layer's loaded numel reaches the layer's size, the layer is materialized, the
-    buffered writes replayed and the layer processed. Others are written as is."""
+    """Buffer writes into a tracked layer; process it once all its numel is loaded"""
     from vllm.model_executor.model_loader.ops_loader import copy_into
 
     tracked = _TRACKED.get(id(param))

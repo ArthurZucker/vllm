@@ -72,13 +72,14 @@ class OnlineQuantMixin:
     def set_requantization_source(self, source_method: QuantizeMethodBase) -> None:
         self.requantization_source = source_method
 
-    def requantizing(self, layer: torch.nn.Module, targets: dict[str, tuple]):
-        """The plan's quantizer of `targets` (this method's quantize ops), the
-        source's dequantize op before them"""
+    def quantizer(self, layer: torch.nn.Module, targets: dict[str, tuple]):
+        """The plan's quantizer of `targets`, after the source's dequantize op"""
         from vllm.model_executor.models.transformers.conversion import (
+            VllmQuantizeQuantizer,
             VllmRequantizeQuantizer,
         )
 
-        assert self.requantization_source is not None
+        if self.requantization_source is None:
+            return VllmQuantizeQuantizer(targets)
         dequantize, names, dropped = self.requantization_source.dequantize_op(layer)
         return VllmRequantizeQuantizer(targets, dequantize, names, dropped)

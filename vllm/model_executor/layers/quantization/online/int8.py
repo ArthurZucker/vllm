@@ -48,15 +48,8 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
             activation_key=kInt8DynamicTokenSym,
         )
 
-    def quantized_params(
-        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
-    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-        return [
-            ("w13_weight", (num_experts, w13_rows, hidden), torch.int8),
-            ("w13_scale", (num_experts, w13_rows), torch.float32),
-            ("w2_weight", (num_experts, hidden, intermediate), torch.int8),
-            ("w2_scale", (num_experts, hidden), torch.float32),
-        ]
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
+        return [("weight", (rows, cols), torch.int8), ("scale", (rows,), torch.float32)]
 
     def expert_scale_names(self, prefix: str) -> list[str]:
         return [f"{prefix}scale"]

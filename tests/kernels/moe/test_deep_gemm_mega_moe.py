@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepGEMM MegaMoE experts: checkpoint loading and kernel layout, shared-expert fusion,
-input staging, and numerics against a dequantized reference for every routed
-format, activation and shared-expert fusion in the feature matrix."""
+"""DeepGEMM MegaMoE experts: loading, kernel layout, staging and numerics."""
 
 from types import SimpleNamespace
 

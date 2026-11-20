@@ -1229,16 +1229,15 @@ def _m2n_worker_receive(
             self.received: list[tuple[str, torch.Tensor]] = []
             self.received_by_name: dict[str, torch.Tensor] = {}
             if not mixed_layout and world_size > 2:
-                weight = torch.nn.Parameter(
-                    torch.zeros(
-                        SHAPE[0] // (world_size - 1),
-                        SHAPE[1],
-                        dtype=torch.float32,
-                        device=device,
-                    )
+                weight = torch.zeros(
+                    SHAPE[0] // (world_size - 1),
+                    SHAPE[1],
+                    dtype=torch.float32,
+                    device=device,
                 )
-                weight.output_dim = 0
-                self.proj = _tp_linear(ColumnParallelLinear, weight, world_size - 1)
+                self.proj = _tp_linear(
+                    ColumnParallelLinear, weight, world_size - 1, output_dim=0
+                )
 
         def load_weights(self, weights):
             for name, tensor in weights:
@@ -1447,12 +1446,14 @@ def test_m2n_transfer_with_per_parameter_source_meshes():
         }
 
 
-def _tp_linear(cls, weight: torch.nn.Parameter, tp_size: int = 2) -> torch.nn.Module:
-    """A `cls` layer owning `weight`, as built at `tp_size` (no TP group needed)"""
+def _tp_linear(cls, weight: torch.Tensor, tp_size: int = 2, **attrs) -> torch.nn.Module:
+    """A `cls` layer at `tp_size` owning `weight` (with `attrs`), no TP group"""
     layer = cls.__new__(cls)
     torch.nn.Module.__init__(layer)
     layer.tp_size = tp_size
-    layer.weight = weight
+    layer.weight = torch.nn.Parameter(weight)
+    for name, value in attrs.items():
+        setattr(layer.weight, name, value)
     return layer
 
 
@@ -1466,13 +1467,9 @@ class _Model(torch.nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        column = torch.nn.Parameter(torch.zeros(8, 16))
-        column.output_dim = 0
-        self.column = _tp_linear(ColumnParallelLinear, column)
-        row = torch.nn.Parameter(torch.zeros(16, 8))
-        row.input_dim = 1
-        self.row = _tp_linear(RowParallelLinear, row)
-        self.norm = _tp_linear(ReplicatedLinear, torch.nn.Parameter(torch.zeros(16)))
+        self.column = _tp_linear(ColumnParallelLinear, torch.zeros(8, 16), output_dim=0)
+        self.row = _tp_linear(RowParallelLinear, torch.zeros(16, 8), input_dim=1)
+        self.norm = _tp_linear(ReplicatedLinear, torch.zeros(16))
         self.fused = torch.nn.Module()
         self.fused.weight = torch.nn.Parameter(torch.zeros(24, 16))
 
@@ -1480,9 +1477,7 @@ class _Model(torch.nn.Module):
 class _MixedModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        weight = torch.nn.Parameter(torch.zeros(16, 8))
-        weight.input_dim = 1
-        self.proj = _tp_linear(RowParallelLinear, weight)
+        self.proj = _tp_linear(RowParallelLinear, torch.zeros(16, 8), input_dim=1)
         self.proj.bias = torch.nn.Parameter(torch.zeros(16))
 
 

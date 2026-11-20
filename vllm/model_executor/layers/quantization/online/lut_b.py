@@ -91,20 +91,12 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
     def _native(self) -> bool:
         return self.experts_cls is LutBSm107Experts
 
-    def quantized_params(
-        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
-    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-        params = []
-        for name, rows, cols in (
-            ("w13_weight", w13_rows, hidden),
-            ("w2_weight", hidden, intermediate),
-        ):
-            if self._native:  # SM107 tiles, viewed as rows of their bytes
-                shape = (num_experts, rows, cols * LUT_B_SM107_TILE_BYTES // _TILE)
-                params.append((name, shape, torch.uint8))
-            else:  # emulation: the dequantized weights
-                params.append((name, (num_experts, rows, cols), self.moe.in_dtype))
-        return params
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
+        if self._native:  # SM107 tiles, viewed as rows of their bytes
+            return [
+                ("weight", (rows, cols * LUT_B_SM107_TILE_BYTES // _TILE), torch.uint8)
+            ]
+        return [("weight", (rows, cols), self.moe.in_dtype)]  # emulation: dequantized
 
     def expert_scale_names(self, prefix: str) -> list[str]:
         return []  # the native tiles carry their codebooks and scales inline

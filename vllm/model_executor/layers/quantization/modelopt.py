@@ -9,7 +9,6 @@ from functools import partial
 from typing import Any, cast
 
 import torch
-from transformers.core_model_loading import ConversionOps
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
@@ -118,6 +117,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_ops import WholeOp
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
@@ -2797,15 +2797,10 @@ class KInt8Static(QuantKeyScheme):
             )
 
 
-class Mxfp8ScaleExpand(ConversionOps):
+class Mxfp8ScaleExpand(WholeOp):
     """MXFP8 scales stored one per `(rows, 32)` block, as one uint8 per `(1, 32)`:
     each stored row repeated. Whole: sharded after, by the param's rows (the
     checkpoint's are fewer)"""
-
-    needs_full = True
-
-    def __init__(self, quantizer=None):
-        self.quantizer = quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -2820,15 +2815,10 @@ class Mxfp8ScaleExpand(ConversionOps):
         return {p: [expand(t) for t in v] for p, v in input_dict.items()}
 
 
-class Int8PbWoRepack(ConversionOps):
+class Int8PbWoRepack(WholeOp):
     """INT8_PB_WO's int8 `[out, in]` weight as uint8b128 (`q + 128`), four per
     int32 along the input dim. Whole: sharded after, by the packed param (a row
     parallel layer's input dim is packed)"""
-
-    needs_full = True
-
-    def __init__(self, quantizer=None):
-        self.quantizer = quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):

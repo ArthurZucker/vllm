@@ -158,9 +158,7 @@ def test_humming_fp8_matches_checkpoint_forward(
 def test_deepseek_v41_linear_scale_param_name(
     weight_block_size, expert_dtype, scale_name
 ):
-    """`.scale` keys map to the parameter the linear quant method registers.
-    A hardcoded `weight_scale_inv` raised KeyError for native MXFP8
-    checkpoints."""
+    """`.scale` maps to the registered scale param, not a fixed `weight_scale_inv`."""
     from vllm.models.deepseek_v41.nvidia import model as model_module
 
     vllm_config = SimpleNamespace(

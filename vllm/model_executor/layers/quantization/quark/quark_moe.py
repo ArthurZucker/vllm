@@ -5,7 +5,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
-from transformers.core_model_loading import ConversionOps
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
@@ -69,6 +68,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
 )
+from vllm.model_executor.layers.quantization.moe_wna16 import unpack_int4
 from vllm.model_executor.layers.quantization.quark.utils import (
     QuarkQTensorHint,
     parse_w4a16_int4_weight_config,
@@ -128,6 +128,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
 )
+from vllm.model_executor.model_loader.weight_ops import WholeOp
 from vllm.model_executor.utils import (
     replace_parameter,
     retire_parameter,
@@ -2396,15 +2397,10 @@ class QuarkNvfp4MoEMethod(QuarkMoEMethod):
         )
 
 
-class QuarkInt4Unpack(ConversionOps):
+class QuarkInt4Unpack(WholeOp):
     """One expert's Quark int4 tensor in `QuarkW4A16Int4MoEMethod`'s layout: rows
     the output channels, int4 two to a byte (sign-flipped when symmetric), scales
     and zero points repeated to the layer's group size. Whole: sharded after"""
-
-    needs_full = True
-
-    def __init__(self, quantizer=None):
-        self.quantizer = quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -2421,25 +2417,11 @@ class QuarkInt4Unpack(ConversionOps):
             if kind == "weight_scale":
                 tensor = tensor.T
             else:
-                tensor = _unpack_quark_int4(tensor, kind, method)
+                tensor = unpack_int4(
+                    tensor, kind == "weight", method.pack_reorder, method.is_symmetric
+                )
             if layer.group_size_div_factor > 1 and kind != "weight":
                 tensor = tensor.repeat_interleave(layer.group_size_div_factor, 1)
             return tensor
 
         return {p: [unpack(t) for t in v] for p, v in input_dict.items()}
-
-
-def _unpack_quark_int4(tensor: torch.Tensor, kind: str, method) -> torch.Tensor:
-    size0 = tensor.size(0)
-    tensor = tensor.view(torch.uint8)
-    shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
-    tensor = (tensor[:, :, None] >> shifter) & 0xF
-    tensor = tensor.view(-1, 8)
-    if method.pack_reorder:  # AWQ's pack order
-        tensor = tensor[:, [0, 4, 1, 5, 2, 6, 3, 7]]
-    if method.is_symmetric:
-        tensor = tensor ^ 0x8
-    tensor = tensor.view(size0, -1).T.contiguous()
-    if kind == "weight":
-        return tensor[:, 1::2] * 16 + tensor[:, ::2]
-    return tensor[1::2, :] * 16 + tensor[::2, :]

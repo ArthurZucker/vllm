@@ -34,13 +34,7 @@ def _zero_padded(
 
 
 class OnlineMoEMethodBase(OnlineQuantMixin, FusedMoEMethodBase):
-    """Base for MoE methods quantizing full-precision experts as they load.
-
-    `create_quantized_weights` registers the quantized params, which the plan's
-    quantize op (`checkpoint_quantizer`) fills from the merged `[E, N, K]` experts
-    with `quantize_experts`, after the model's converter ops; a requantization
-    source's dequantize op runs on each checkpoint expert before them.
-    """
+    """Quantizes full-precision experts as they load, once merged to `[E, N, K]`."""
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -59,14 +53,17 @@ class OnlineMoEMethodBase(OnlineQuantMixin, FusedMoEMethodBase):
         layer.weight_block_size = None
 
         w13_rows = self.moe.w13_num_shards * intermediate_size_per_partition
-        for name, shape, dtype in self.quantized_params(
-            num_experts, w13_rows, intermediate_size_per_partition, hidden_size
+        for prefix, rows, cols in (
+            ("w13_", w13_rows, hidden_size),
+            ("w2_", hidden_size, intermediate_size_per_partition),
         ):
-            param = torch.nn.Parameter(
-                torch.empty(shape, dtype=dtype), requires_grad=False
-            )
-            layer.register_parameter(name, param)
-            set_weight_attrs(param, extra_weight_attrs)
+            for name, shape, dtype in self.expert_params(rows, cols):
+                param = torch.nn.Parameter(
+                    torch.empty((num_experts, *shape), dtype=dtype),
+                    requires_grad=False,
+                )
+                layer.register_parameter(f"{prefix}{name}", param)
+                set_weight_attrs(param, extra_weight_attrs)
         if layer.w2_weight.shape[-1] != intermediate_size_per_partition:
             # packed along its TP-sharded dim: the loader shards the checkpoint's
             # full-precision w2 evenly, not by the param's (packed) width
@@ -88,12 +85,9 @@ class OnlineMoEMethodBase(OnlineQuantMixin, FusedMoEMethodBase):
         layer.w2_input_scale = None
         layer.quantizes_on_load = True
 
-    def quantized_params(
-        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
-    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-        """`(name, shape, dtype)` of each quantized param: `w13_weight` holds
-        `[num_experts, w13_rows, hidden]` experts, `w2_weight`
-        `[num_experts, hidden, intermediate]`, then their scales."""
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
+        """`(name, shape, dtype)` of an expert's `[rows, cols]` weight, then of
+        its scales."""
         raise NotImplementedError
 
     def expert_scale_names(self, prefix: str) -> list[str]:
@@ -108,12 +102,6 @@ class OnlineMoEMethodBase(OnlineQuantMixin, FusedMoEMethodBase):
         raise NotImplementedError
 
     def checkpoint_quantizer(self, layer: torch.nn.Module):
-        """The plan's quantize op of each expert weight, after the experts merge
-        (and a requantization source's dequantize op on each expert before it)"""
-        from vllm.model_executor.models.transformers.conversion import (
-            VllmQuantizeQuantizer,
-        )
-
         targets = {
             f"{prefix}weight": (
                 partial(self._quantize_on_load, layer, f"{prefix}weight"),
@@ -122,9 +110,7 @@ class OnlineMoEMethodBase(OnlineQuantMixin, FusedMoEMethodBase):
             )
             for prefix in ("w13_", "w2_")
         }
-        if self.requantization_source is not None:
-            return self.requantizing(layer, targets)
-        return VllmQuantizeQuantizer(targets)
+        return self.quantizer(layer, targets)
 
     def _quantize_on_load(
         self, layer: torch.nn.Module, name: str, weight: torch.Tensor
@@ -139,13 +125,16 @@ class OnlineMoEMethodBase(OnlineQuantMixin, FusedMoEMethodBase):
             shape, segments = (num_experts, hidden, rows), 1
         return self.quantize_experts(layer, name, _zero_padded(weight, shape, segments))
 
-    def quantized_weights(self, layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
-        """`(w13, *w13 scales, w2, *w2 scales)`, as loaded."""
-        return tuple(
-            getattr(layer, name)
+    def quantized_names(self) -> list[str]:
+        """`[w13_weight, *w13 scales, w2_weight, *w2 scales]`"""
+        return [
+            name
             for prefix in ("w13_", "w2_")
             for name in (f"{prefix}weight", *self.expert_scale_names(prefix))
-        )
+        ]
+
+    def quantized_weights(self, layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
+        return tuple(getattr(layer, name) for name in self.quantized_names())
 
     def quantize_shared_experts(
         self, layer: torch.nn.Module, w13: torch.Tensor, w2: torch.Tensor

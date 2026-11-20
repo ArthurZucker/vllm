@@ -246,9 +246,7 @@ def test_experts_load_checkpoint_into_kernel_layout(
 
 
 def test_layerwise_reload_replaces_routed_experts(any_device_mega_moe):
-    """reload_weights / weight transfer put the experts on meta in the checkpoint
-    layout; the new experts, requantized, must land in the original kernel
-    tensors."""
+    """Reloaded experts, requantized, land in the original kernel tensors."""
     checkpoint_format, fmt = "fp8_block", MEGA_MOE_MXFP4
     generator = torch.Generator().manual_seed(5)
     old = _checkpoint(checkpoint_format, 2, generator)

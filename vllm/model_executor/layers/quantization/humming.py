@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
-from transformers.core_model_loading import ConversionOps
 
 import vllm.utils.humming as _hm
 from vllm import envs
@@ -47,6 +46,7 @@ from vllm.model_executor.layers.quantization.utils.humming.linear import (
     kernel_parameters,
     replace_layer_parameters,
 )
+from vllm.model_executor.model_loader.weight_ops import WholeOp
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -153,16 +153,11 @@ def compressed_tensors_get_config(config: dict[str, Any], key: str):
     return target_group_config
 
 
-class HummingLoadedWeight(ConversionOps):
+class HummingLoadedWeight(WholeOp):
     """A checkpoint tensor in its Humming schema's layout
     (`process_loaded_weight`, e.g. BitNet's 2-bit repack). Whole, on each
     source (one expert, one of q / k / v): sharded after. A full precision `weight`
     stays as it is"""
-
-    needs_full = True
-
-    def __init__(self, quantizer=None):
-        self.quantizer = quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):

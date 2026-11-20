@@ -23,6 +23,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.model_loader.weight_utils import tensor_shape
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -421,11 +422,7 @@ class BagelForConditionalGeneration(
         channels = self.config.vit_config.num_channels
         for name, tensor in weights:
             if "patch_embedding.weight" in name:
-                shape = (
-                    tensor.shape
-                    if isinstance(tensor, torch.Tensor)
-                    else tensor.get_shape()
-                )
+                shape = tensor_shape(tensor)
                 if len(shape) == 2 and shape[1] == channels * patch * patch:
                     tensor = (
                         tensor[...]

@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from transformers.core_model_loading import WeightConverter, rename_source_key
 
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
@@ -27,21 +26,15 @@ from vllm.models.kimi_k3.nvidia.dspark_mla import (
     context_kv_sources,
 )
 
+from .utils import map_checkpoint_name
+
 
 def _k3_map(name: str) -> tuple[str, int | None]:
-    """`name` through K3 DSpark's conversion_mapping entry: (param, shard)"""
     draft = SimpleNamespace(
         config=SimpleNamespace(enable_confidence_head=False),
         model=SimpleNamespace(config=SimpleNamespace(num_hidden_layers=1)),
     )
-    transforms = _k3_dspark(draft)
-    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
-    converters = [t for t in transforms if isinstance(t, WeightConverter)]
-    mapped, pattern = rename_source_key(name, renamings, converters)
-    if pattern is None:
-        return mapped, None
-    [converter] = [c for c in converters if pattern in c.source_patterns]
-    return mapped, converter.source_patterns.index(pattern)
+    return map_checkpoint_name(_k3_dspark(draft), name)
 
 
 def test_dspark_mla_uses_compile_free_model_entrypoint():
@@ -227,19 +220,11 @@ def test_context_kv_weights_are_loaded_as_merged_linear_shards(dist_init):
 
 
 def _dsv4_dspark_map(draft, name: str) -> tuple[str | None, int | None]:
-    """`name` through DeepSeek V4 DSpark's conversion_mapping entry: (param, shard),
-    a dropped name as None"""
+    """A dropped name maps to (None, None)"""
     entry = _CONVERSION_MAPPING["DSparkDeepseekV4ForCausalLM"]
     transforms = entry(draft) if callable(entry) else entry
-    renamings = [t for t in transforms if not isinstance(t, WeightConverter)]
-    converters = [t for t in transforms if isinstance(t, WeightConverter)]
-    mapped, pattern = rename_source_key(name, renamings, converters)
-    if "_dropped_" in mapped:
-        return None, None
-    if pattern is None:
-        return mapped, None
-    [converter] = [c for c in converters if pattern in c.source_patterns]
-    return mapped, converter.source_patterns.index(pattern)
+    mapped, shard = map_checkpoint_name(transforms, name)
+    return (None, None) if "_dropped_" in mapped else (mapped, shard)
 
 
 @pytest.mark.cpu_test
@@ -265,10 +250,7 @@ def _dsv4_dspark_map(draft, name: str) -> tuple[str | None, int | None]:
 def test_v41_dspark_maps_linear_scales(
     scale_name, checkpoint_name, runtime_module, shard_id
 ):
-    """Checkpoint `.scale` maps to the linear quant method's scale parameter
-    (`linear_scale_name`: `weight_scale` for MXFP8). Its bytes load as sent:
-    MXFP8 block-scale expansion lives in the KMxfp8Static quant method (see
-    tests/quantization/test_modelopt.py)."""
+    """`.scale` maps to the linear quant method's scale param (`linear_scale_name`)."""
     draft = SimpleNamespace(
         config=SimpleNamespace(expert_dtype="fp4"),
         linear_scale_name=scale_name,

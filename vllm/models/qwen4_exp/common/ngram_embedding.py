@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
+from vllm.model_executor.model_loader.weight_utils import tensor_shape
 from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
@@ -905,13 +906,6 @@ class Qwen4ExpPLESharedHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         return weight
 
 
-def _rows(tensor) -> int:
-    """Rows of a tensor or of a lazy safetensors slice"""
-    return (
-        tensor.shape[0] if isinstance(tensor, torch.Tensor) else tensor.get_shape()[0]
-    )
-
-
 class PLEShardedTable:
     """A PLE table stored in row shards, read as one tensor: indexing its rows (as
     the loader shards it on read) reads only the overlapping rows of each shard"""
@@ -920,9 +914,8 @@ class PLEShardedTable:
         self.shards = shards  # tensors or lazy slices, in row order
 
     def get_shape(self) -> list[int]:
-        first = self.shards[0]
-        shape = first.shape if isinstance(first, torch.Tensor) else first.get_shape()
-        return [sum(_rows(s) for s in self.shards), *shape[1:]]
+        shape = tensor_shape(self.shards[0])
+        return [sum(tensor_shape(s)[0] for s in self.shards), *shape[1:]]
 
     def get_dtype(self):
         first = self.shards[0]
@@ -936,7 +929,7 @@ class PLEShardedTable:
         start, stop, _ = rows.indices(self.get_shape()[0])
         pieces, offset = [], 0
         for shard in self.shards:
-            count = _rows(shard)
+            count = tensor_shape(shard)[0]
             lo, hi = max(start - offset, 0), min(stop - offset, count)
             if lo < hi:
                 pieces.append(shard[lo:hi])

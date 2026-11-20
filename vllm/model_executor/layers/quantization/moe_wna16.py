@@ -4,7 +4,6 @@
 from typing import Any
 
 import torch
-from transformers.core_model_loading import ConversionOps
 
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -43,6 +42,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt4StaticGroupScale,
     kInt8StaticGroupScale,
 )
+from vllm.model_executor.model_loader.weight_ops import WholeOp
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 
@@ -524,15 +524,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
         return VllmLayoutQuantizer(MoeWNA16Unpack, names)
 
 
-class MoeWNA16Unpack(ConversionOps):
+class MoeWNA16Unpack(WholeOp):
     """One expert's GPTQ / AWQ tensor in the layout `MoeWNA16Method` computes with:
     rows the output channels, int4 packed two to a byte, qzeros / scales repeated
     to the layer's (reduced) group size. Whole: sharded after, by the experts param"""
-
-    needs_full = True
-
-    def __init__(self, quantizer=None):
-        self.quantizer = quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -549,7 +544,9 @@ def _unpack(layer: torch.nn.Module, tensor: torch.Tensor, kind: str) -> torch.Te
     config = layer.quant_config
     if config.linear_quant_method in ("awq", "awq_marlin"):
         assert config.weight_bits == 4
-        tensor = _convert_awq_tensor(tensor, kind) if kind != "scales" else tensor.T
+        tensor = (
+            unpack_int4(tensor, kind == "qweight") if kind != "scales" else tensor.T
+        )
     elif config.linear_quant_method == "gptq":
         assert config.weight_bits in (4, 8)
         if kind == "qweight":
@@ -565,17 +562,22 @@ def _unpack(layer: torch.nn.Module, tensor: torch.Tensor, kind: str) -> torch.Te
     return tensor
 
 
-def _convert_awq_tensor(tensor: torch.Tensor, kind: str) -> torch.Tensor:
-    """AWQ's int4 qweight `(k, n // 8) int32 -> (n, k // 2) uint8`, qzeros
+def unpack_int4(
+    tensor: torch.Tensor, is_weight: bool, reorder: bool = True, sign_flip: bool = False
+) -> torch.Tensor:
+    """int4 weight `(k, n // 8) int32 -> (n, k // 2) uint8`, zeros
     `(k // group, n // 8) -> (n // 2, k // group)`"""
     size0 = tensor.size(0)
     tensor = tensor.view(torch.uint8)
     shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
     tensor = (tensor[:, :, None] >> shifter) & 0xF
-    # AutoAWQ's pack order (awq/utils/quant_utils.py)
-    tensor = tensor.view(-1, 8)[:, [0, 4, 1, 5, 2, 6, 3, 7]].view(size0, -1)
-    tensor = tensor.T.contiguous()
-    if kind == "qweight":
+    tensor = tensor.view(-1, 8)
+    if reorder:  # AutoAWQ's pack order (awq/utils/quant_utils.py)
+        tensor = tensor[:, [0, 4, 1, 5, 2, 6, 3, 7]]
+    if sign_flip:
+        tensor = tensor ^ 0x8
+    tensor = tensor.view(size0, -1).T.contiguous()
+    if is_weight:
         return tensor[:, 1::2] * 16 + tensor[:, ::2]
     return tensor[1::2, :] * 16 + tensor[::2, :]
 

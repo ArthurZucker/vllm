@@ -6,13 +6,12 @@ import pytest
 import torch
 from transformers.core_model_loading import (
     Concatenate,
-    MergeModulelist,
     WeightConverter,
     WeightRenaming,
 )
 
 import vllm.distributed as distributed
-from tests.kernels.moe.utils import make_dummy_moe_config
+from tests.kernels.moe.utils import expert_conversions, make_dummy_moe_config
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe import (
@@ -88,35 +87,27 @@ def _make_fp8_tp_experts(
 
 
 def _load_experts(model, tensors, batched=True) -> set[str]:
-    """`tensors`, `{(w1|w3|w2, suffix): [E, ...] checkpoint tensor}`, into
-    `model.experts` with `load_with_ops`: stacked on disk, or one tensor per expert"""
-    weights = []
-    for (name, suffix), tensor in tensors.items():
-        if batched:
-            weights.append((f"experts.{name}.{suffix}", tensor))
-        else:
-            weights += [
-                (f"experts.{e}.{name}.{suffix}", t) for e, t in enumerate(tensor)
-            ]
+    """`{(w1|w3|w2, suffix): [E, ...] tensor}` into `model.experts`: stacked on
+    disk, or one tensor per expert"""
+    suffixes = {suffix for _, suffix in tensors}
+    if not batched:
+        weights = [
+            (f"experts.{e}.{name}.{suffix}", t)
+            for (name, suffix), tensor in tensors.items()
+            for e, t in enumerate(tensor)
+        ]
+        conversions = expert_conversions(
+            "experts.*.{}.{}$", "experts.{}_{}", suffixes, ("w1", "w3", "w2")
+        )
+        return load_with_ops(model, iter(weights), conversions)
+    weights = [(f"experts.{name}.{suffix}", t) for (name, suffix), t in tensors.items()]
     conversions = []
-    for suffix in {suffix for _, suffix in tensors}:
-        if batched:
-            gate_up = [f"experts.{w}.{suffix}$" for w in ("w1", "w3")]
-            conversions += [
-                WeightConverter(gate_up, f"experts.w13_{suffix}", [Concatenate(dim=1)]),
-                WeightRenaming(f"experts.w2.{suffix}$", f"experts.w2_{suffix}"),
-            ]
-        else:
-            gate_up = [f"experts.*.{w}.{suffix}$" for w in ("w1", "w3")]
-            merge = MergeModulelist(dim=0)
-            conversions += [
-                WeightConverter(
-                    gate_up, f"experts.w13_{suffix}", [merge, Concatenate(dim=1)]
-                ),
-                WeightConverter(
-                    f"experts.*.w2.{suffix}$", f"experts.w2_{suffix}", [merge]
-                ),
-            ]
+    for suffix in suffixes:
+        gate_up = [f"experts.{w}.{suffix}$" for w in ("w1", "w3")]
+        conversions += [
+            WeightConverter(gate_up, f"experts.w13_{suffix}", [Concatenate(dim=1)]),
+            WeightRenaming(f"experts.w2.{suffix}$", f"experts.w2_{suffix}"),
+        ]
     return load_with_ops(model, iter(weights), conversions)
 
 

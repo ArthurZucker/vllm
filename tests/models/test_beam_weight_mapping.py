@@ -16,7 +16,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from transformers.core_model_loading import WeightConverter, rename_source_key
 
 from vllm.model_executor.model_loader.conversion_mapping import _beam
 from vllm.model_executor.model_loader.ops_loader import load_weights
@@ -25,6 +24,8 @@ from vllm.models.beam import model as beam
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.beam import BeamConfig
 
+from .utils import map_checkpoint_name
+
 BeamModel = beam.BeamModel
 # Beam's own entry, unmerged (fewer KV heads than ranks: no `merged_qkv_gate`)
 TRANSFORMS = _beam(nn.Module())
@@ -32,14 +33,10 @@ SHARD_IDS = {"qkv_proj": ("q", "k", "v"), "gate_up_proj": (0, 1)}
 
 
 def _map(name: str) -> tuple[str, int | str | None]:
-    renamings = [t for t in TRANSFORMS if not isinstance(t, WeightConverter)]
-    converters = [t for t in TRANSFORMS if isinstance(t, WeightConverter)]
-    mapped, pattern = rename_source_key(name, renamings, converters)
-    if pattern is None:
+    mapped, index = map_checkpoint_name(TRANSFORMS, name)
+    if index is None:
         return mapped, None
-    [converter] = [c for c in converters if pattern in c.source_patterns]
-    fused = mapped.rsplit(".", 2)[-2]
-    return mapped, SHARD_IDS[fused][converter.source_patterns.index(pattern)]
+    return mapped, SHARD_IDS[mapped.rsplit(".", 2)[-2]][index]
 
 
 @pytest.mark.parametrize(

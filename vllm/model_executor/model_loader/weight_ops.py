@@ -9,7 +9,7 @@ from transformers.core_model_loading import Concatenate, ConversionOps
 
 
 def _each(input_dict: dict, fn) -> dict:
-    """`fn` over every tensor, Transformers' lists of them as well"""
+    """`fn` over every tensor, in lists too"""
     return {
         k: [fn(t) for t in v] if isinstance(v, list) else fn(v)
         for k, v in input_dict.items()
@@ -27,8 +27,7 @@ def _first(input_dict: dict) -> torch.Tensor:
 
 
 class OutputConcatenate(Concatenate):
-    """`Concatenate` along the target param's `output_dim` (an AWQ `qweight` packs its
-    output along dim 1); 0-dim tensors (per-tensor scales) are stacked"""
+    """`Concatenate` along the param's `output_dim` (AWQ `qweight` packs along dim 1)"""
 
     def __init__(self):
         super().__init__(dim=0)
@@ -44,9 +43,18 @@ class OutputConcatenate(Concatenate):
         return super().convert(input_dict, source_patterns, target_patterns, **kwargs)
 
 
+class WholeOp(ConversionOps):
+    """An op on the whole checkpoint tensor, sharded after; Transformers passes it
+    the quantizer"""
+
+    needs_full = True
+
+    def __init__(self, quantizer=None):
+        pass
+
+
 class PadToParam(ConversionOps):
-    """The tensor padded to its target param's shape with the param's `pad_value`
-    (default 0): a vocab padded to a multiple of the ranks, sink heads (-inf)"""
+    """Padded to the param's shape with its `pad_value` (default 0; sinks: -inf)"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -60,8 +68,7 @@ class PadToParam(ConversionOps):
 
 
 class RepeatLastSource(ConversionOps):
-    """The last source taken twice: a checkpoint shipping `k_proj` only, loaded into
-    both the K and V shards of a fused `qkv_proj` (Gemma 4's `attention_k_eq_v`)"""
+    """The last source twice: `k_proj` into K and V (Gemma 4's `attention_k_eq_v`)"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -73,8 +80,7 @@ class RepeatLastSource(ConversionOps):
 
 
 class ZeroMissingSource(ConversionOps):
-    """A source the checkpoint does not ship, as zeros shaped like a present one:
-    Whisper's `k_proj` has no bias, the fused `qkv_proj.bias` has a K slot"""
+    """Missing sources as zeros (Whisper's `k_proj` has no bias, `qkv_proj` does)"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -94,8 +100,7 @@ class NegExp(ConversionOps):
 
 
 class Affine(ConversionOps):
-    """`x * scale + offset`, for norms stored shifted or scaled (PLaMo 3's `1 + w`,
-    LongCat's MLA LoRA scaling)"""
+    """`x * scale + offset` (PLaMo 3's `1 + w` norms, LongCat's MLA LoRA scaling)"""
 
     def __init__(self, scale: float = 1.0, offset: float = 0.0):
         self.scale, self.offset = scale, offset
@@ -106,8 +111,7 @@ class Affine(ConversionOps):
 
 
 class Gather(ConversionOps):
-    """This rank's shard reordered by `index` along `dim` (DeepSeek V4.1's fused
-    layouts); 1-byte dtypes (fp8, ue8m0) are gathered as bytes"""
+    """`index_select` along `dim`; 1-byte dtypes (fp8, ue8m0) gathered as bytes"""
 
     def __init__(self, index: torch.Tensor, dim: int):
         self.index, self.dim = index, dim
@@ -122,8 +126,7 @@ class Gather(ConversionOps):
 
 
 class SwapHalves(ConversionOps):
-    """The two halves of `dim` swapped: a fused projection stored `[up, gate]` where
-    the param is `[gate, up]` (GTE's `up_gate_proj`)"""
+    """`[up, gate]` -> `[gate, up]` along `dim` (GTE's `up_gate_proj`)"""
 
     needs_full = True  # the halves are the whole tensor's
 
@@ -138,8 +141,7 @@ class SwapHalves(ConversionOps):
 
 
 class Deinterleave(ConversionOps):
-    """A fused projection stored per head (`[heads, parts, head_dim]`, Bloom's
-    `query_key_value`) as its parts one after the other (`[parts, heads, head_dim]`)"""
+    """`[heads, parts, head_dim]` -> `[parts, heads, head_dim]` (Bloom's qkv)"""
 
     needs_full = True  # the heads are the whole tensor's
 
@@ -156,9 +158,7 @@ class Deinterleave(ConversionOps):
 
 
 class GroupedQKV(ConversionOps):
-    """A fused `qkv` stored per kv head (`[kv_heads, heads / kv_heads + 2, head_dim]`:
-    each group's queries, its key, its value; Falcon's `query_key_value`) as all the
-    queries, then the keys, then the values"""
+    """A qkv grouped per kv head (Falcon's) as all q, then all k, then all v"""
 
     needs_full = True  # the groups are kv heads before they are a rank's
 
@@ -176,8 +176,7 @@ class GroupedQKV(ConversionOps):
 
 
 class ExpertRows(ConversionOps):
-    """Experts stacked along the rows (`[experts * rows, cols]`, Nomic MoE, DBRX) as
-    `[experts, rows, cols]`, `experts` read from the config (a dotted path)"""
+    """`[experts * rows, cols]` -> `[experts, rows, cols]` (Nomic MoE, DBRX)"""
 
     needs_full = True  # the rows are experts' before they are a rank's
 
@@ -192,10 +191,8 @@ class ExpertRows(ConversionOps):
 
 
 class HeadPermute(ConversionOps):
-    """Each head's channels gathered by `index` (`head_dim` channels a head), on the
-    sources at `positions` (all by default): K2-Horizon's partial-RoPE channels
-    reordered for NeoX rope. Per head: sharded heads permute alone; a per-tensor
-    scale stays as is"""
+    """Each head's channels permuted by `index` on the sources at `positions` (default
+    all); per head, so it commutes with sharding (K2-Horizon's partial RoPE)"""
 
     def __init__(self, index: torch.Tensor, head_dim: int, positions=None):
         self.index, self.head_dim, self.positions = index, head_dim, positions
@@ -223,9 +220,7 @@ class HeadPermute(ConversionOps):
 
 
 class RankChunk(ConversionOps):
-    """Rank `rank`'s chunk of `dim` out of `ranks`, for a tensor whose row count is
-    known only on read: with fewer rows than ranks (kv heads replicated), consecutive
-    ranks take the same row (FoPE's per-kv-head coefficients)"""
+    """`rank`'s chunk of `dim`; fewer rows than ranks: replicated (FoPE's kv heads)"""
 
     def __init__(self, rank: int, ranks: int, dim: int = 0):
         self.rank, self.ranks, self.dim = rank, ranks, dim
@@ -247,9 +242,7 @@ def _target(kwargs: dict) -> torch.Tensor:
 
 
 class ViewAsParam(ConversionOps):
-    """The tensors' bytes as their target param's dtype, of the same width: ue8m0
-    scales (`float8_e8m0fnu`) or packed FP4 into a `uint8` param, which a cast would
-    convert by value. The param keeps the sent dtype (`keeps_sent_dtype`)"""
+    """Bytes viewed as the param's same-width dtype (ue8m0, FP4), not cast"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -263,8 +256,7 @@ class ViewAsParam(ConversionOps):
 
 
 class ParamRows(ConversionOps):
-    """The target param's rows of the tensor, from its `row_start` (default 0):
-    DeepSeek V4.1's engram heads, unevenly sized, each rank a contiguous range"""
+    """The param's rows from its `row_start` (DeepSeek V4.1's uneven engram heads)"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -274,9 +266,7 @@ class ParamRows(ConversionOps):
 
 
 class Narrow(ConversionOps):
-    """`[start, start + length)` of `dim`: a layer's own experts of the experts
-    stacked on disk (mega-MoE layers). With `full`, only a tensor that long on `dim`;
-    another is taken as narrowed already"""
+    """`[start, start + length)` of `dim`; with `full`, only tensors that long"""
 
     def __init__(self, dim: int, start: int, length: int, full: int | None = None):
         self.dim, self.start, self.length, self.full = dim, start, length, full
@@ -294,8 +284,7 @@ class Narrow(ConversionOps):
 
 
 class Refuse(ConversionOps):
-    """Raises instead of loading: a layer whose weights were transformed in place
-    for its kernel (Step5's mega-MoE), which a reload would corrupt"""
+    """Raises: weights transformed in place for a kernel; a reload would corrupt them"""
 
     def __init__(self, message: str):
         self.message = message
@@ -305,8 +294,7 @@ class Refuse(ConversionOps):
 
 
 class Reciprocal(ConversionOps):
-    """`1 / x`, in float32: compressed-tensors' global scales (quantization scales)
-    as the dequantization scales a param holds"""
+    """`1 / x` in float32: compressed-tensors' global scales as dequantization scales"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -314,8 +302,7 @@ class Reciprocal(ConversionOps):
 
 
 class EqualSources(ConversionOps):
-    """The first source, which the others must equal (to `rtol`): NVFP4 experts'
-    `w1` and `w3` `weight_scale_2`, one L1 scale per expert"""
+    """The first source; the others must equal it (NVFP4 `w1`/`w3` `weight_scale_2`)"""
 
     def __init__(self, rtol: float = 1e-5):
         self.rtol = rtol
@@ -334,9 +321,7 @@ class EqualSources(ConversionOps):
 
 
 class RepeatToParam(ConversionOps):
-    """Each dim repeated (`repeat_interleave`) to its target param's size: block
-    scales coarser than the param's (an FP8 shared expert's 128x128 UE8M0 scales
-    into MegaMoE's 1x32); a scalar into every element (one scale for all experts)"""
+    """Each dim `repeat_interleave`d to the param's size (coarse block scales)"""
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -356,9 +341,8 @@ class RepeatToParam(ConversionOps):
 
 
 class MergeLora(ConversionOps):
-    """A LoRA-parametrized weight merged, `W + (B @ A) * scaling` with one adapter
-    (`index`) of the stacked ones: jina-embeddings-v3's `parametrizations`
-    (`original`, `0.lora_A`, `0.lora_B`); an embedding's A and B are swapped"""
+    """`W + (B @ A) * scaling` with adapter `index` (jina-embeddings-v3's
+    `parametrizations`); an embedding's A and B are swapped"""
 
     needs_full = True  # sharded after the merge
 
@@ -379,10 +363,8 @@ class MergeLora(ConversionOps):
 
 
 class ExpertScalars(ConversionOps):
-    """Per-expert scalars stacked on disk (`[experts]`, or one for all: `[1]`, `[]`;
-    Step 3.5 / Step 5's `moe.gate_proj.input_scale`), one source per shard (gate,
-    up), as the target param: `[local experts, shards]`, or `[local experts]` where
-    the shards share one value (which they must equal). This rank's experts (EP)"""
+    """Per-expert scalars (`[experts]`, `[1]` or `[]`), one source per shard, as this
+    rank's `[experts, shards]`, or `[experts]` when the shards must be equal (Step 5)"""
 
     needs_full = True  # a scalar for all experts is not the experts' rows yet
 

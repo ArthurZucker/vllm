@@ -11,7 +11,6 @@ from compressed_tensors.quantization import (
     QuantizationType,
 )
 from compressed_tensors.transform import TransformConfig
-from transformers.core_model_loading import ConversionOps
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
@@ -73,7 +72,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_ops import _each
+from vllm.model_executor.model_loader.weight_ops import WholeOp, _each
 from vllm.model_executor.utils import is_weights_pre_processed
 from vllm.platforms import current_platform
 
@@ -1247,17 +1246,12 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         layer._v_scale_cpu.fill_(layer._v_scale_float)
 
 
-class AttnHeadScales(ConversionOps):
+class AttnHeadScales(WholeOp):
     """LLM-Compressor's ATTN_HEAD KV-cache scales (`[num_heads, 1, 1]`) as one per
     kv head: q's reduced by the max over each kv head's group (FlashAttention reads
     `[num_kv_heads]`). Zero points load as zeros: only symmetric quantization is
     supported. Whole: each rank's kv heads are sharded after (`shard_dim`,
     `shard_replicas`)"""
-
-    needs_full = True
-
-    def __init__(self, quantizer=None):
-        self.quantizer = quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):

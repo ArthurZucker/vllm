@@ -560,14 +560,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
     @torch.no_grad()
     def prepare_weights(self) -> None:
-        """Lay the weights, loaded in the checkpoint layout, out for the kernel
-        in place; set the NVFP4 L2 input scale.
-
-        The routed and shared-expert weights get gate and up rows interleaved
-        and their scales packed four per int32 in UTCCP row order, MN-major
-        (`_kernel_rows`). SM90 FP4 experts are relaid out first, a fused FP8
-        shared expert is requantized to SM90 scales after.
-        """
+        """Lay the checkpoint-layout weights out for the kernel in place
+        (`_kernel_rows`); set the NVFP4 L2 input scale."""
         if self.weight_format.routed.has_global_scale:
             self._set_l2_activation_scale()
         if is_weights_pre_processed():

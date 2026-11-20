@@ -249,26 +249,13 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
 
         layer.weight_block_size = [1, MXFP4_BLOCK_SIZE]
 
-    def quantized_params(
-        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
-    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-        shapes = (("w13_", w13_rows, hidden), ("w2_", hidden, intermediate))
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:  # kept in full precision
-            dtype = self.moe.in_dtype
-            return [(f"{p}weight", (num_experts, r, c), dtype) for p, r, c in shapes]
-        params = []
-        for prefix, rows, cols in shapes:
-            params.append(
-                (f"{prefix}weight", (num_experts, rows, cols // 2), torch.uint8)
-            )
-            params.append(
-                (
-                    f"{prefix}weight_scale",
-                    (num_experts, rows, cols // MXFP4_BLOCK_SIZE),
-                    torch.uint8,
-                )
-            )
-        return params
+            return [("weight", (rows, cols), self.moe.in_dtype)]
+        return [
+            ("weight", (rows, cols // 2), torch.uint8),
+            ("weight_scale", (rows, cols // MXFP4_BLOCK_SIZE), torch.uint8),
+        ]
 
     def expert_scale_names(self, prefix: str) -> list[str]:
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:

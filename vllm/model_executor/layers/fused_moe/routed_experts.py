@@ -390,46 +390,6 @@ class RoutedExperts(PluggableLayer):
         )
 
     @staticmethod
-    def make_expert_params_mapping(
-        model: torch.nn.Module,
-        ckpt_gate_proj_name: str,
-        ckpt_down_proj_name: str,
-        ckpt_up_proj_name: str | None,
-        num_experts: int,
-        num_redundant_experts: int = 0,
-        routed_experts_prefix: str = "routed_experts",
-    ) -> list[tuple[str, str, int, str]]:
-        """Build the expert mapping, detecting the LoRA `base_layer.` prefix by
-        scanning `model`'s parameters.
-
-        Legacy entry point for models that still hand-roll `load_weights`; the
-        `RoutedExperts` weight loader uses `get_expert_mapping` /
-        `build_expert_params_mapping` instead (which take the prefix directly).
-        See `build_expert_params_mapping` for the returned tuple format.
-        """
-        has_base_layer = any(".base_layer." in n for n, _ in model.named_parameters())
-        prefix = "base_layer." if has_base_layer else ""
-        # These loaders index ``params_dict[full_name]``, so both sides get it.
-        mapping = RoutedExperts.build_expert_params_mapping(
-            ckpt_gate_proj_name,
-            ckpt_down_proj_name,
-            ckpt_up_proj_name,
-            num_experts,
-            num_redundant_experts,
-            routed_experts_prefix,
-            lora_base_layer_prefix=prefix,
-            lora_base_layer_prefix_on_param_name=prefix,
-        )
-
-        # All MoE layers of a model share the same FSE and quantization setup.
-        routed_experts = next(
-            (m for m in model.modules() if isinstance(m, RoutedExperts)), None
-        )
-        if routed_experts is None or routed_experts.shared_expert_online_loader is None:
-            return mapping
-        return routed_experts.shared_expert_online_loader.redirect_mapping(mapping)
-
-    @staticmethod
     def build_expert_params_mapping(
         ckpt_gate_proj_name: str,
         ckpt_down_proj_name: str,
@@ -438,7 +398,6 @@ class RoutedExperts(PluggableLayer):
         num_redundant_experts: int = 0,
         routed_experts_prefix: str = "routed_experts",
         lora_base_layer_prefix: str = "",
-        lora_base_layer_prefix_on_param_name: str = "",
         include_fused: bool = False,
         is_gated: bool = True,
     ) -> list[tuple[str, str, int, str]]:
@@ -455,12 +414,6 @@ class RoutedExperts(PluggableLayer):
             num_redundant_experts: Number of redundant experts
             lora_base_layer_prefix: LoRA `base_layer.` prefix for the
                 `weight_name` (checkpoint) side
-            lora_base_layer_prefix_on_param_name: same, for the `param_name`
-                side. Independent because `get_expert_mapping` resolves
-                `param_name` via `getattr` against this layer's bare
-                `w13_weight`/`w2_weight` (no prefix), while
-                `make_expert_params_mapping` indexes the model-wide
-                `params_dict` (prefix included).
             include_fused: Prepend the fused pre-fused-checkpoint entries
             is_gated: Whether w13 holds gate and up (gated activation) or a
                 single up projection. Selects the fused checkpoint layout.
@@ -490,10 +443,8 @@ class RoutedExperts(PluggableLayer):
         if routed_experts_prefix != "":
             routed_experts_prefix = f"{routed_experts_prefix}."
 
-        w13 = (
-            f"experts.{lora_base_layer_prefix_on_param_name}{routed_experts_prefix}w13_"
-        )
-        w2 = f"experts.{lora_base_layer_prefix_on_param_name}{routed_experts_prefix}w2_"
+        w13 = f"experts.{routed_experts_prefix}w13_"
+        w2 = f"experts.{routed_experts_prefix}w2_"
 
         fused_mapping = []
         if include_fused:

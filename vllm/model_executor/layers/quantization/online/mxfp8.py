@@ -167,25 +167,11 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
 
         layer.weight_block_size = [1, MXFP8_BLOCK_SIZE]
 
-    def quantized_params(
-        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
-    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-        params = []
-        for prefix, rows, cols in (
-            ("w13_", w13_rows, hidden),
-            ("w2_", hidden, intermediate),
-        ):
-            params.append(
-                (f"{prefix}weight", (num_experts, rows, cols), MXFP8_VALUE_DTYPE)
-            )
-            params.append(
-                (
-                    f"{prefix}weight_scale",
-                    (num_experts, rows, cols // MXFP8_BLOCK_SIZE),
-                    MXFP8_SCALE_DTYPE,
-                )
-            )
-        return params
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
+        return [
+            ("weight", (rows, cols), MXFP8_VALUE_DTYPE),
+            ("weight_scale", (rows, cols // MXFP8_BLOCK_SIZE), MXFP8_SCALE_DTYPE),
+        ]
 
     def quantize_experts(
         self, layer: Module, name: str, weight: torch.Tensor

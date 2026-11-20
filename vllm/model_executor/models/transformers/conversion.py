@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Load checkpoints with Transformers' loader: its conversions and quantization plan.
-
-```
-checkpoint key ─▶ plan: the layer's quantizer
-                   ├─ vLLM has the kernels: tensors kept serialized (`load_serialized`)
-                   └─ only Transformers reads it: dequantized by its ops
-               ─▶ model converters (qkv split, gate_up concat, ...), scales alongside
-               ─▶ `ops_loader.load_with_ops`: sharded on read, copied into vLLM's params
-```
-"""
+"""Transformers' quantizers for vLLM's formats: a per-layer plan of which tensors
+vLLM's kernels take as stored, and which Transformers' ops (de)quantize on load."""
 
 import re
 from functools import partial
@@ -69,9 +61,8 @@ class VllmFormatQuantizer(HfQuantizer):
 
 
 class VllmLayoutQuantizer(VllmFormatQuantizer):
-    """A format vLLM loads into its own layout: `op` (a `ConversionOps` taking the
-    quantizer) on each of the tensors `names`, whole, before the model's ops (e.g.
-    GPTQ / AWQ experts repacked before they merge)"""
+    """`op` on the tensors `names`, whole, before the model's ops (e.g. GPTQ / AWQ
+    experts repacked before they merge)"""
 
     load_serialized = False
     load_before_model_ops = True
@@ -85,10 +76,8 @@ class VllmLayoutQuantizer(VllmFormatQuantizer):
 
 
 class QuantizeOnLoad(ConversionOps):
-    """A full precision tensor quantized as it loads (an online quantization): its
-    quantizer's function of the param, whose outputs fill the param and its scales
-    (or `{param name: tensor}` of the layer's params). Experts are stacked: one call
-    each, unless the function takes them stacked"""
+    """Online quantization: `quantize(tensor)` fills the param and its scales (or
+    returns `{param name: tensor}`); experts one at a time unless taken stacked"""
 
     def __init__(self, quantizer: "VllmQuantizeQuantizer"):
         self.quantizer = quantizer
@@ -118,8 +107,7 @@ class QuantizeOnLoad(ConversionOps):
 
 
 class VllmQuantizeQuantizer(VllmFormatQuantizer):
-    """Quantizes a full precision checkpoint as it loads: `targets` maps a param
-    name to `(quantize, its scales' names, takes stacked experts)`"""
+    """`targets`: param name -> `(quantize, scale names, takes stacked experts)`"""
 
     load_serialized = False
 
@@ -135,13 +123,11 @@ class VllmQuantizeQuantizer(VllmFormatQuantizer):
 
 
 class DequantizeOnLoad(ConversionOps):
-    """A quantized checkpoint tensor to full precision as it loads, before the
-    model's ops (e.g. the experts' merge): each weight with its scales, read along
-    (`ReadAlong`), by its quantizer's `dequantize_tensor(weight, *scales)`. The
-    scales, and the tensors its quantizer drops (e.g. static input scales), go"""
+    """Each weight dequantized with its scales (read along by `ReadAlong`) before the
+    model's ops; the scales and `dropped_names` are consumed"""
 
     def __init__(self, hf_quantizer: "VllmRequantizeQuantizer"):
-        self.hf_quantizer = hf_quantizer  # its tensors are read as stored
+        self.hf_quantizer = hf_quantizer
 
     @torch.no_grad
     def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
@@ -166,10 +152,8 @@ class DequantizeOnLoad(ConversionOps):
 
 
 class VllmRequantizeQuantizer(VllmQuantizeQuantizer):
-    """A quantized checkpoint requantized as it loads: `dequantize(weight, *scales)`
-    on each checkpoint weight before the model's ops (`names`: the weight's, then
-    its scales'; `dropped`: other tensors of it read along and dropped, if stored),
-    `targets` quantizing the params after them"""
+    """`dequantize(weight, *scales)` before the model's ops (`names`: weight, then
+    scales; `dropped`: read along and dropped), then `targets` requantize"""
 
     requantize = True
     load_before_model_ops = True  # the scales are read along by `ReadAlong`
@@ -192,11 +176,8 @@ class VllmRequantizeQuantizer(VllmQuantizeQuantizer):
 
 
 class ReadAlong(WeightConverter):
-    """A model converter widened to read each weight's checkpoint tensors along
-    (`along` of them a source: the weight's, its scales', ...) into the weight's
-    target, for the requantized layers `modules` only: a fused `qkv_proj`
-    dequantizes q, k and v each with its own scales before their concat. Another
-    layer's key falls through to the model's own converter"""
+    """A converter reading each weight's scales along, for the requantized `modules`
+    only (q, k, v each dequantized before their concat); other keys fall through"""
 
     __slots__ = ("modules", "along", "shards")
 
@@ -208,17 +189,9 @@ class ReadAlong(WeightConverter):
 
 
 def read_scales_along(conversions: list, hf_quantizer) -> list:
-    """The model's converters, each widened to read a weight's scales along
-    (`ReadAlong`) for the layers requantized as they load, first; and one for such
-    a layer without a converter (its weight renamed only, e.g. an `o_proj`)::
-
-        self_attn.q_proj (fused)      -> qkv_proj.weight  [q.weight, q.weight_scale,
-                                                            k.weight, ...] -> concat
-        o_proj.weight, .weight_scale  -> o_proj.weight    dequantized alone
-        experts.*.gate_proj.weight    -> w13_weight       each expert with its scales
-
-    The sources start with `(?:)`: Transformers finds a converter by its source
-    strings, which must not be the model converter's own."""
+    """`ReadAlong` copies of the model's converters, plus one for unconverted layers
+    (e.g. `o_proj`), first. Sources start with `(?:)`: Transformers finds a converter
+    by its source strings, which must differ from the model converter's."""
     from vllm.model_executor.model_loader.conversion_mapping import Fused
 
     along: dict[str, None] = {}  # every requantizing format's names, in order
@@ -269,8 +242,7 @@ def read_scales_along(conversions: list, hf_quantizer) -> list:
 
 
 def checkpoint_plan(model) -> HfQuantizer | None:
-    """The layers whose quant method loads its own layout (`checkpoint_quantizer`),
-    each with its quantizer; the others take the checkpoint's tensors as they are"""
+    """A plan of the layers whose quant method has a `checkpoint_quantizer`"""
     from transformers.quantizers.auto import QuantizationPlanHfQuantizer
 
     plan = {
@@ -313,11 +285,7 @@ def dequantizable(quant_cfg: dict) -> bool:
 
 
 def quantization_plan(quant_cfg: dict | None, serialized: bool) -> HfQuantizer | None:
-    """Transformers' quantizer of the checkpoint, one per layer.
-
-    `serialized`: vLLM has the kernels, which take the tensors as they are. Else
-    Transformers' ops dequantize them.
-    """
+    """Per-layer quantizers; not `serialized`: Transformers' ops dequantize"""
     if not quant_cfg:
         return None
     register_vllm_formats()

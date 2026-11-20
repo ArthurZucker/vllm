@@ -254,24 +254,12 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
     def per_token_activation(self) -> bool:
         return self.activation_quant_key == kNvfp4DynamicToken
 
-    def quantized_params(
-        self, num_experts: int, w13_rows: int, intermediate: int, hidden: int
-    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
-        params = []
-        for prefix, rows, cols in (
-            ("w13_", w13_rows, hidden),
-            ("w2_", hidden, intermediate),
-        ):
-            params += [
-                (f"{prefix}weight", (num_experts, rows, cols // 2), torch.uint8),
-                (
-                    f"{prefix}weight_scale",
-                    (num_experts, rows, cols // NVFP4_BLOCK_SIZE),
-                    torch.float8_e4m3fn,
-                ),
-                (f"{prefix}weight_scale_2", (num_experts,), torch.float32),
-            ]
-        return params
+    def expert_params(self, rows: int, cols: int) -> list[tuple]:
+        return [
+            ("weight", (rows, cols // 2), torch.uint8),
+            ("weight_scale", (rows, cols // NVFP4_BLOCK_SIZE), torch.float8_e4m3fn),
+            ("weight_scale_2", (), torch.float32),
+        ]
 
     def expert_scale_names(self, prefix: str) -> list[str]:
         return [f"{prefix}weight_scale", f"{prefix}weight_scale_2"]
@@ -285,18 +273,12 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        quantized = self.quantized_weights(layer)
-        names = [
-            name
-            for prefix in ("w13_", "w2_")
-            for name in (f"{prefix}weight", *self.expert_scale_names(prefix))
-        ]
-        for name, tensor in zip(names, quantized):
-            replace_parameter(layer, name, tensor)
+        for name in self.quantized_names():
+            replace_parameter(layer, name, getattr(layer, name))
         # Neutral (1.0) activation global scales: the kernel derives per-token
         # scales at runtime, so the output scalars reduce to the weight scales.
         ones = torch.ones(
-            layer.num_experts, device=quantized[0].device, dtype=torch.float32
+            layer.num_experts, device=layer.w13_weight.device, dtype=torch.float32
         )
         replace_parameter(layer, "w13_input_scale", ones)
         replace_parameter(layer, "w2_input_scale", ones.clone())

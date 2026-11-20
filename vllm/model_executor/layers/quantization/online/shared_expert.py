@@ -224,27 +224,3 @@ class OnlineSharedExpertLoader:
                     rows, cols = tensor.shape
                     getattr(layer, name).data[expert_id, :rows, :cols].copy_(tensor)
         self.release_staging(layer)
-
-    def is_fused_shared_expert(self, global_expert_id: int) -> bool:
-        return (
-            self.num_logical_experts
-            <= global_expert_id
-            < self.num_logical_experts + self.num_fused_shared_experts
-        )
-
-    def redirect_mapping(
-        self, mapping: list[tuple[str, str, int, str]]
-    ) -> list[tuple[str, str, int, str]]:
-        """Point the expert params mapping of the shared experts to the staging
-        parameters, as e.g. `w13_` -> `online_w13_`."""
-        if not self.staging_parameters:
-            return mapping
-        redirected = []
-        for param_name, weight_name, expert_id, shard_id in mapping:
-            if self.is_fused_shared_expert(expert_id) and weight_name.startswith(
-                f"experts.{expert_id}."
-            ):
-                stem = "w2_" if param_name.endswith("w2_") else "w13_"
-                param_name = f"{param_name.removesuffix(stem)}online_{stem}"
-            redirected.append((param_name, weight_name, expert_id, shard_id))
-        return redirected

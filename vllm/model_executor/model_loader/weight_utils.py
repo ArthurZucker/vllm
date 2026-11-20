@@ -1083,6 +1083,13 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def tensor_shape(source) -> list[int]:
+    """Shape of a tensor or of a lazy slice (`LazySlice`)"""
+    return (
+        list(source.shape) if isinstance(source, torch.Tensor) else source.get_shape()
+    )
+
+
 class LazySlice:
     """A checkpoint tensor read on demand: only the slice indexed, e.g. this rank's
     shard (`ops_loader`). Like safetensors' own slice, it keeps its file open."""

@@ -486,24 +486,3 @@ def FusedMoEFactory(
     )
 
     return runner
-
-
-def fused_moe_make_expert_params_mapping(
-    model: torch.nn.Module,
-    ckpt_gate_proj_name: str,
-    ckpt_down_proj_name: str,
-    ckpt_up_proj_name: str | None,
-    num_experts: int,
-    num_redundant_experts: int = 0,
-    routed_experts_prefix: str = "routed_experts",
-) -> list[tuple[str, str, int, str]]:
-    """Delegate to EPLB manager."""
-    return RoutedExperts.make_expert_params_mapping(
-        model,
-        ckpt_gate_proj_name,
-        ckpt_down_proj_name,
-        ckpt_up_proj_name,
-        num_experts,
-        num_redundant_experts,
-        routed_experts_prefix,
-    )

@@ -30,10 +30,8 @@ def load_online_quantized(
     tensors: dict[str, torch.Tensor],
     method: Any = None,
 ) -> None:
-    """Load this rank's full-precision `tensors` (param name -> converted tensor,
-    e.g. merged `[E, N, K]` experts) into an online-quantized `layer` as the
-    loader does: the plan's quantize op, each output into its param. Then
-    post-load processing."""
+    """Full-precision `{param: tensor}` through the plan's quantize op into `layer`,
+    then post-load processing."""
     from vllm.model_executor.model_loader.ops_loader import copy_into
 
     method = layer.quant_method if method is None else method
