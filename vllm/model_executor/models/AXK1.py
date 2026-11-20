@@ -652,7 +652,10 @@ class AXK1DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.is_layer_sparse:  # the dense layers' (in the checkpoint) are unused
+            self.post_mlp_layernorm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         self.routed_scaling_factor = config.routed_scaling_factor
 
     def _is_layer_sparse(self) -> bool:
